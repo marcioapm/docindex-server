@@ -1,0 +1,15 @@
+[project]
+name = "docindex-tests"
+version = "0.0.0"
+description = "End-to-end pytest harness for docindex-server."
+requires-python = ">=3.11"
+dependencies = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["suites"]
+addopts = "-ra"
+markers = [
+    "smoke: phase 1 startup smoke tests",
+]
