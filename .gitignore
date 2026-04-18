@@ -1,10 +1,6 @@
+/target/
 /docindex-server
-/bin/
 *.exe
-/vendor/
-*.test
-*.out
-coverage.*
 *.db
 *.db-journal
 *.db-wal
@@ -14,3 +10,10 @@ coverage.*
 .idea/
 .vscode/
 .DS_Store
+
+# Python test harness
+tests/.venv/
+tests/__pycache__/
+tests/suites/__pycache__/
+.pytest_cache/
+*.pyc

@@ -1,0 +1,40 @@
+[package]
+name = "docindex"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Semantic + BM25 search server for a markdown vault."
+license = "MIT"
+publish = false
+
+[lib]
+name = "docindex"
+path = "src/lib.rs"
+
+[[bin]]
+name = "docindex"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.34", features = ["bundled", "load_extension"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlite-vec = "0.1.6"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
