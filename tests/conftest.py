@@ -1,11 +1,16 @@
 """Shared fixtures for the docindex pytest harness."""
 from __future__ import annotations
 
+import contextlib
 import os
 import pathlib
 import shutil
+import socket
 import subprocess
+import time
+from typing import Iterator
 
+import httpx
 import pytest
 
 
@@ -82,3 +87,157 @@ def run_bin():
 
 def have_sqlite3() -> bool:
     return shutil.which("sqlite3") is not None
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class SpawnedServer:
+    def __init__(self, proc: subprocess.Popen[str], base_url: str, bearer: str, log_path: pathlib.Path):
+        self.proc = proc
+        self.base_url = base_url
+        self.bearer = bearer
+        self.log_path = log_path
+
+    def headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.bearer}"}
+
+    def get(self, path: str, **kwargs) -> httpx.Response:
+        return httpx.get(f"{self.base_url}{path}", timeout=10.0, **kwargs)
+
+    def post(self, path: str, json: dict, auth: bool = True) -> httpx.Response:
+        headers = self.headers() if auth else {}
+        return httpx.post(
+            f"{self.base_url}{path}", json=json, headers=headers, timeout=10.0
+        )
+
+    def wait_for_chunks(self, n: int, timeout: float = 15.0) -> int:
+        """Poll /health.indexed_chunks until it reaches `n`. Return observed count."""
+        deadline = time.monotonic() + timeout
+        last = -1
+        while time.monotonic() < deadline:
+            try:
+                r = self.get("/health")
+                if r.status_code == 200:
+                    last = r.json().get("indexed_chunks", -1)
+                    if last >= n:
+                        return last
+            except httpx.RequestError:
+                pass
+            time.sleep(0.2)
+        raise AssertionError(
+            f"indexed_chunks did not reach {n} within {timeout}s (last={last})"
+        )
+
+
+@contextlib.contextmanager
+def _spawn_server(
+    docindex_bin: pathlib.Path,
+    vault: pathlib.Path,
+    db_path: pathlib.Path,
+    bearer: str,
+    log_path: pathlib.Path,
+    env_overrides: dict[str, str] | None = None,
+) -> Iterator[SpawnedServer]:
+    port = _free_port()
+    env = os.environ.copy()
+    env.update(
+        {
+            "DOCINDEX_VAULT_DIR": str(vault),
+            "DOCINDEX_DB_PATH": str(db_path),
+            "DOCINDEX_LISTEN": f"127.0.0.1:{port}",
+            "DOCINDEX_ALLOW_LOOPBACK": "true",
+            "DOCINDEX_BEARER": bearer,
+            "DOCINDEX_EMBED": "fake",
+            "DOCINDEX_EMBED_MODEL": "gemini-embedding-001",
+            "DOCINDEX_EMBED_DIM": "768",
+            "DOCINDEX_LOG_FORMAT": "text",
+            "DOCINDEX_DEBOUNCE_MS": "500",
+        }
+    )
+    if env_overrides:
+        env.update(env_overrides)
+
+    log_f = open(log_path, "w")
+    proc = subprocess.Popen(
+        [str(docindex_bin)],
+        env=env,
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    base_url = f"http://127.0.0.1:{port}"
+    server = SpawnedServer(proc, base_url, bearer, log_path)
+    try:
+        _wait_for_ready(server, timeout=10.0)
+        yield server
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
+        log_f.close()
+
+
+def _wait_for_ready(server: SpawnedServer, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        if server.proc.poll() is not None:
+            raise RuntimeError(
+                f"server exited early with code {server.proc.returncode}\n"
+                f"log:\n{server.log_path.read_text()}"
+            )
+        try:
+            r = httpx.get(f"{server.base_url}/health", timeout=2.0)
+            if r.status_code == 200 and r.json().get("ok") is True:
+                return
+        except httpx.RequestError as e:
+            last_err = e
+        time.sleep(0.1)
+    raise RuntimeError(
+        f"server did not become ready within {timeout}s: {last_err}\n"
+        f"log:\n{server.log_path.read_text()}"
+    )
+
+
+@pytest.fixture
+def spawn_server(docindex_bin, tmp_path):
+    """Yield a callable that spawns the docindex binary and returns a SpawnedServer."""
+    active: list[contextlib.AbstractContextManager] = []
+
+    def _factory(
+        vault: pathlib.Path,
+        bearer: str = "test-bearer",
+        env_overrides: dict[str, str] | None = None,
+        db: pathlib.Path | None = None,
+    ) -> SpawnedServer:
+        idx = len(active)
+        db_p = db or (tmp_path / f"index_{idx}.db")
+        log_p = tmp_path / f"server_{idx}.log"
+        cm = _spawn_server(
+            docindex_bin=docindex_bin,
+            vault=vault,
+            db_path=db_p,
+            bearer=bearer,
+            log_path=log_p,
+            env_overrides=env_overrides,
+        )
+        server = cm.__enter__()
+        active.append(cm)
+        return server
+
+    try:
+        yield _factory
+    finally:
+        for cm in reversed(active):
+            try:
+                cm.__exit__(None, None, None)
+            except Exception:
+                pass
