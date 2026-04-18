@@ -15,7 +15,7 @@ pub use self::vec::{decode_f32, encode_f32};
 const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// Current schema version, written to meta on open.
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "2";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -237,6 +237,177 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Per-file state snapshot (content hash + mtime) from the last successful
+    /// reindex. Used by the indexer's initial-scan diff.
+    pub fn get_file_state(&self, path: &str) -> Result<Option<(String, i64)>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT content_hash, mtime_ns FROM files WHERE path = ?1",
+                params![path],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Record that `path` was fully reindexed at mtime=`mtime_ns`, hash=`hash`.
+    pub fn set_file_state(
+        &self,
+        path: &str,
+        content_hash: &str,
+        mtime_ns: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO files(path, content_hash, mtime_ns, indexed_at)
+             VALUES (?1, ?2, ?3, strftime('%s','now'))
+             ON CONFLICT(path) DO UPDATE SET
+               content_hash = excluded.content_hash,
+               mtime_ns = excluded.mtime_ns,
+               indexed_at = excluded.indexed_at",
+            params![path, content_hash, mtime_ns],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the `files` bookkeeping row (used after deleting a path).
+    pub fn delete_file_state(&self, path: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM files WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    /// Every path we've fully indexed (used by the startup diff to detect
+    /// files that disappeared from disk and must be pruned).
+    pub fn list_indexed_paths(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+        let mapped = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in mapped {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Total number of chunks currently indexed.
+    pub fn count_chunks(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?)
+    }
+
+    /// Top-`k` chunk rowids by cosine distance to `query` (ascending
+    /// distance). Uses `sqlite-vec`'s kNN MATCH operator against `vec0`.
+    pub fn search_vec(&self, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>, StoreError> {
+        let blob = encode_f32(query);
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, distance FROM chunks_vec
+             WHERE embedding MATCH ?1 AND k = ?2
+             ORDER BY distance",
+        )?;
+        let rows = stmt.query_map(params![blob, k as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)? as f32))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Top-`k` chunk rowids by BM25 over `chunks_fts` for the raw FTS5
+    /// query string (ascending bm25 score — smaller is better per FTS5).
+    pub fn search_fts(&self, query: &str, k: usize) -> Result<Vec<(i64, f64)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, bm25(chunks_fts) AS score FROM chunks_fts
+             WHERE chunks_fts MATCH ?1
+             ORDER BY score
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![query, k as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Load a chunk's display fields for hit hydration.
+    pub fn chunk_for_hit(&self, id: i64) -> Result<Option<HitRow>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, path, heading, heading_path, content FROM chunks WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(HitRow {
+                        id: r.get::<_, i64>(0)?,
+                        path: r.get::<_, String>(1)?,
+                        heading: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        heading_path: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        content: r.get::<_, String>(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// All chunks for `path` (id, content). Used by /similar to build a
+    /// pseudo-query from the bag-of-words + average of stored vectors.
+    pub fn chunks_for_path(&self, path: &str) -> Result<Vec<(i64, String)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content FROM chunks WHERE path = ?1 ORDER BY chunk_idx")?;
+        let rows = stmt.query_map(params![path], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Stored vectors for a set of chunk ids. Order is not guaranteed to
+    /// match the input — callers handle that.
+    pub fn vectors_for_chunks(&self, ids: &[i64]) -> Result<Vec<(i64, Vec<f32>)>, StoreError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql =
+            format!("SELECT rowid, embedding FROM chunks_vec WHERE rowid IN ({placeholders})");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_vec: Vec<rusqlite::types::Value> = ids
+            .iter()
+            .map(|i| rusqlite::types::Value::Integer(*i))
+            .collect();
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, blob) = r?;
+            let v = decode_f32(&blob).map_err(|e| StoreError::Msg(format!("decode vec: {e}")))?;
+            out.push((id, v));
+        }
+        Ok(out)
+    }
+}
+
+/// Minimal row projection used to hydrate a search hit. Kept in the store
+/// module so SQL column order stays colocated with the schema.
+#[derive(Debug, Clone)]
+pub struct HitRow {
+    pub id: i64,
+    pub path: String,
+    pub heading: String,
+    pub heading_path: String,
+    pub content: String,
 }
 
 fn null_if_empty(s: &str) -> Option<&str> {

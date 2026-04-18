@@ -1,4 +1,4 @@
--- schema_version = 1
+-- schema_version = 2
 -- Storage schema for docindex-server. Applied with CREATE IF NOT EXISTS so
 -- repeated opens are idempotent.
 
@@ -27,9 +27,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   tokenize='porter unicode61'
 );
 
--- sqlite-vec vec0 virtual table: packed little-endian float32, 768-dim.
+-- sqlite-vec vec0 virtual table: packed little-endian float32, 768-dim,
+-- cosine distance so the kNN MATCH operator ranks by semantic similarity
+-- directly (no extra cosine pass on top of an L2 index).
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
-  embedding FLOAT[768]
+  embedding FLOAT[768] distance_metric=cosine
 );
 
 CREATE TABLE IF NOT EXISTS embedding_cache (
@@ -39,6 +41,16 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
   dim          INTEGER NOT NULL,
   embedding    BLOB    NOT NULL,
   created_at   INTEGER NOT NULL
+);
+
+-- Per-file bookkeeping for the initial-scan diff. A file is "dirty" iff its
+-- current content hash differs from `files.content_hash` (or the row is
+-- absent). Written at the end of a successful reindex.
+CREATE TABLE IF NOT EXISTS files (
+  path         TEXT PRIMARY KEY,
+  content_hash TEXT    NOT NULL,
+  mtime_ns     INTEGER NOT NULL,
+  indexed_at   INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS meta (
