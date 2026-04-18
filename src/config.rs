@@ -25,6 +25,12 @@ pub struct Config {
     pub debounce: Duration,
     pub log_format: String,
     pub http_timeout: Duration,
+    /// Dev/test-only: when true, `127.0.0.1` binds are allowed. MUST stay
+    /// false in production (Tailscale is the perimeter).
+    pub allow_loopback: bool,
+    /// Which embedder to build. "gemini" in prod, "fake" in tests / when
+    /// `GEMINI_API_KEY` is unset.
+    pub embed_backend: String,
 }
 
 #[derive(Debug, Error)]
@@ -53,6 +59,17 @@ impl Config {
         let gemini_key = get_or_default(lookup, "GEMINI_API_KEY", "");
         let embed_model = get_or_default(lookup, "DOCINDEX_EMBED_MODEL", "gemini-embedding-001");
         let log_format = get_or_default(lookup, "DOCINDEX_LOG_FORMAT", "json").to_ascii_lowercase();
+        let allow_loopback_raw =
+            get_or_default(lookup, "DOCINDEX_ALLOW_LOOPBACK", "false").to_ascii_lowercase();
+        let allow_loopback = matches!(allow_loopback_raw.as_str(), "1" | "true" | "yes" | "on");
+        let embed_backend_raw = get_or_default(lookup, "DOCINDEX_EMBED", "").to_ascii_lowercase();
+        let embed_backend = if !embed_backend_raw.is_empty() {
+            embed_backend_raw
+        } else if !gemini_key.is_empty() {
+            "gemini".to_string()
+        } else {
+            "fake".to_string()
+        };
 
         let embed_dim = parse_int_default(lookup, "DOCINDEX_EMBED_DIM", 768, &mut errs);
         let debounce_ms = parse_int_default(lookup, "DOCINDEX_DEBOUNCE_MS", 5000, &mut errs);
@@ -64,14 +81,19 @@ impl Config {
 
         if listen.is_empty() {
             errs.push("DOCINDEX_LISTEN is required".into());
-        } else if let Err(e) = validate_listen(&listen) {
+        } else if let Err(e) = validate_listen(&listen, allow_loopback) {
             errs.push(e);
         }
         if bearer.is_empty() {
             errs.push("DOCINDEX_BEARER is required".into());
         }
-        if gemini_key.is_empty() {
-            errs.push("GEMINI_API_KEY is required".into());
+        if embed_backend == "gemini" && gemini_key.is_empty() {
+            errs.push("GEMINI_API_KEY is required when DOCINDEX_EMBED=gemini".into());
+        }
+        if embed_backend != "gemini" && embed_backend != "fake" {
+            errs.push(format!(
+                "DOCINDEX_EMBED {embed_backend:?}: must be 'gemini' or 'fake'"
+            ));
         }
         if embed_dim == 0 {
             errs.push("DOCINDEX_EMBED_DIM must be > 0".into());
@@ -97,6 +119,8 @@ impl Config {
             debounce: Duration::from_millis(debounce_ms as u64),
             log_format,
             http_timeout: Duration::from_millis(http_timeout_ms as u64),
+            allow_loopback,
+            embed_backend,
         })
     }
 }
@@ -185,7 +209,10 @@ fn validate_db_path(raw: &str, errs: &mut Vec<String>) -> Option<PathBuf> {
 /// Accept "host:port" where host is not the unspecified / all-interfaces IP.
 /// Operators can still supply any specific IP (Tailscale or otherwise);
 /// this is a belt-and-suspenders check against the obvious footgun.
-fn validate_listen(addr: &str) -> Result<(), String> {
+///
+/// `allow_loopback` permits `127.0.0.1` / `::1` binds for local dev + tests.
+/// Production MUST leave it false.
+fn validate_listen(addr: &str, allow_loopback: bool) -> Result<(), String> {
     // Support bracketed v6 "[::1]:7777" and bare "1.2.3.4:7777".
     let (host, port) = split_host_port(addr)
         .ok_or_else(|| format!("DOCINDEX_LISTEN {addr:?}: expected host:port"))?;
@@ -205,12 +232,17 @@ fn validate_listen(addr: &str) -> Result<(), String> {
             "DOCINDEX_LISTEN {addr:?}: binding to all interfaces is not allowed; use a Tailscale IP"
         ));
     }
-    if let Ok(ip) = host.parse::<IpAddr>()
-        && ip.is_unspecified()
-    {
-        return Err(format!(
-            "DOCINDEX_LISTEN {addr:?}: unspecified IP is not allowed"
-        ));
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip.is_unspecified() {
+            return Err(format!(
+                "DOCINDEX_LISTEN {addr:?}: unspecified IP is not allowed"
+            ));
+        }
+        if ip.is_loopback() && !allow_loopback {
+            return Err(format!(
+                "DOCINDEX_LISTEN {addr:?}: loopback bind requires DOCINDEX_ALLOW_LOOPBACK=true"
+            ));
+        }
     }
     Ok(())
 }
@@ -282,7 +314,6 @@ mod tests {
             "DOCINDEX_DB_PATH",
             "DOCINDEX_LISTEN",
             "DOCINDEX_BEARER",
-            "GEMINI_API_KEY",
         ] {
             let dir = TempDir::new().unwrap();
             let mut env = base_env(&dir);
@@ -290,6 +321,16 @@ mod tests {
             let err = Config::from_lookup(&lookup(&env)).expect_err("err");
             assert!(format!("{err}").contains(key), "want {key} in {err}");
         }
+    }
+
+    #[test]
+    fn gemini_key_required_when_backend_gemini() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.remove("GEMINI_API_KEY");
+        env.insert("DOCINDEX_EMBED".into(), "gemini".into());
+        let err = Config::from_lookup(&lookup(&env)).expect_err("err");
+        assert!(format!("{err}").contains("GEMINI_API_KEY"), "{err}");
     }
 
     #[test]
@@ -361,6 +402,63 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut env = base_env(&dir);
         env.insert("DOCINDEX_LISTEN".into(), "100.83.46.59".into());
+        assert!(Config::from_lookup(&lookup(&env)).is_err());
+    }
+
+    #[test]
+    fn loopback_requires_bypass() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.insert("DOCINDEX_LISTEN".into(), "127.0.0.1:7777".into());
+        let err = Config::from_lookup(&lookup(&env)).expect_err("err");
+        assert!(
+            format!("{err}").contains("DOCINDEX_ALLOW_LOOPBACK"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn loopback_allowed_with_bypass() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.insert("DOCINDEX_LISTEN".into(), "127.0.0.1:0".into());
+        env.insert("DOCINDEX_ALLOW_LOOPBACK".into(), "true".into());
+        let c = Config::from_lookup(&lookup(&env)).expect("valid");
+        assert!(c.allow_loopback);
+    }
+
+    #[test]
+    fn embed_backend_defaults_to_fake_without_key() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.remove("GEMINI_API_KEY");
+        let c = Config::from_lookup(&lookup(&env)).expect("valid");
+        assert_eq!(c.embed_backend, "fake");
+    }
+
+    #[test]
+    fn embed_backend_defaults_to_gemini_with_key() {
+        let dir = TempDir::new().unwrap();
+        let env = base_env(&dir);
+        let c = Config::from_lookup(&lookup(&env)).expect("valid");
+        assert_eq!(c.embed_backend, "gemini");
+    }
+
+    #[test]
+    fn embed_backend_explicit_fake_does_not_require_key() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.remove("GEMINI_API_KEY");
+        env.insert("DOCINDEX_EMBED".into(), "fake".into());
+        let c = Config::from_lookup(&lookup(&env)).expect("valid");
+        assert_eq!(c.embed_backend, "fake");
+    }
+
+    #[test]
+    fn embed_backend_invalid_errors() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.insert("DOCINDEX_EMBED".into(), "bogus".into());
         assert!(Config::from_lookup(&lookup(&env)).is_err());
     }
 }
