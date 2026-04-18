@@ -10,6 +10,7 @@ pub mod fake;
 pub mod gemini;
 
 use std::future::Future;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -46,4 +47,30 @@ pub trait Embedder: Send + Sync {
     ) -> impl Future<Output = Result<Vec<Vec<f32>>, EmbedError>> + Send;
 
     fn embed_query(&self, text: &str) -> impl Future<Output = Result<Vec<f32>, EmbedError>> + Send;
+}
+
+/// Erased embedder for runtime selection. Native `async fn` in traits is not
+/// dyn-compatible, so we enumerate the known implementations and static-
+/// dispatch in a match — callers get `Clone + Send + Sync` without pulling
+/// in `async_trait`.
+#[derive(Clone)]
+pub enum AnyEmbedder {
+    Gemini(Arc<Gemini>),
+    Fake(Arc<Fake>),
+}
+
+impl AnyEmbedder {
+    pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        match self {
+            Self::Gemini(g) => g.embed_documents(texts).await,
+            Self::Fake(f) => f.embed_documents(texts).await,
+        }
+    }
+
+    pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        match self {
+            Self::Gemini(g) => g.embed_query(text).await,
+            Self::Fake(f) => f.embed_query(text).await,
+        }
+    }
 }

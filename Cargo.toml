@@ -17,7 +17,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
+futures = "0.3"
 hex = "0.4"
+notify = "8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.34", features = ["bundled", "load_extension"] }
 serde = { version = "1", features = ["derive"] }
@@ -26,6 +29,8 @@ sha2 = "0.10"
 sqlite-vec = "0.1.6"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 walkdir = "2"
