@@ -1,10 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Bash(go *)",
-      "Bash(gofmt *)",
-      "Bash(golangci-lint *)",
+      "Bash(cargo *)",
+      "Bash(rustc *)",
+      "Bash(rustup *)",
       "Bash(make *)",
+      "Bash(python3 *)",
+      "Bash(python *)",
+      "Bash(uv *)",
+      "Bash(pytest *)",
       "Bash(git *)",
       "Bash(gh *)",
       "Bash(cat *)",
@@ -25,7 +29,11 @@
       "Bash(uniq *)",
       "Bash(diff *)",
       "Bash(curl *)",
-      "Bash(sqlite3 *)"
+      "Bash(sqlite3 *)",
+      "Bash(otool *)",
+      "Bash(ldd *)",
+      "Bash(file *)",
+      "Bash(tar *)"
     ],
     "deny": []
   }
