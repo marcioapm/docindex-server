@@ -4,39 +4,38 @@ Semantic + BM25 search server for personal docs/notes. Indexes a folder of markd
 
 ## Stack
 - **Language:** Rust (edition 2024, MSRV 1.90)
-- **Storage:** SQLite (`rusqlite`, bundled) + [sqlite-vec](https://github.com/asg017/sqlite-vec) (vectors, `vec0`) + FTS5 (BM25)
-- **Embeddings:** Google `gemini-embedding-001` (Matryoshka, dim 768)
-- **Async runtime:** `tokio` (current-thread)
+- **Storage:** SQLite (`rusqlite`, bundled) + [sqlite-vec](https://github.com/asg017/sqlite-vec) (vectors, `vec0` cosine) + FTS5 (BM25)
+- **Embeddings:** Google `gemini-embedding-001` (Matryoshka, dim 768) — or deterministic `fake` backend for tests
+- **Async runtime:** `tokio` (multi-thread)
+- **HTTP server:** `axum` 0.8
 - **HTTP client:** `reqwest` + rustls
-- **Watcher (Phase 2):** `notify` with 5s debounce
-- **Transport (Phase 2):** Tailscale-only bind, bearer-token auth
+- **Watcher:** `notify` with a debounced dirty-set (default 5s, configurable)
+- **Transport:** Tailscale-only bind (config rejects `0.0.0.0` / `[::]`), bearer-token auth
 
-## Endpoints (Phase 2)
+## Endpoints
 ```
-GET  /health                          -> { ok, indexedChunks, lastReindex, embeddingModel, dim }
-POST /search   { query, limit=10 }    -> { hits: [{ path, title, headingPath, snippet, score, chunkId }] }
+GET  /health                          -> { ok, indexed_chunks, last_reindex_ms, embedding_model, dim }
+POST /search   { query, limit=10 }    -> { hits: [{ path, title, heading_path, snippet, score, chunk_id }] }
 POST /similar  { path,  limit=10 }    -> same shape
 ```
+`/search` and `/similar` require `Authorization: Bearer $DOCINDEX_BEARER`. `limit` is clamped to [1, 50]. Errors return `{error, code}` JSON.
 
 ## Ranking
-Hybrid: top-30 cosine (sqlite-vec `vec_distance_cosine`) + top-30 BM25 (FTS5), fused with Reciprocal Rank Fusion (k=60), top-10 returned.
+Hybrid: top-30 cosine (sqlite-vec `chunks_vec` cosine) + top-30 BM25 (FTS5), fused with Reciprocal Rank Fusion (k=60).
 
 ## Chunking
-Heading-aware (H1/H2/H3), ~500-token fallback, 50-token overlap.
-Stored per chunk: `(path, chunk_idx, heading_path, content, content_hash, mtime_ns)`.
+Heading-aware (H1/H2/H3), ~500-token fallback, 50-token overlap. Stored per chunk: `(path, chunk_idx, heading_path, content, content_hash, mtime_ns)`.
 
 ## Reindex
-- Startup: full walk, diff against stored `content_hash`.
-- Live (Phase 2): `notify` + 5s debounce, batch dirty files.
+- Startup: full walk, diff against `files.content_hash`.
+- Live: `notify` + debounce (default 5s, `DOCINDEX_DEBOUNCE_MS`), batch dirty files.
 - Embedding cache keyed by `content_hash` (survives renames/moves).
 
 ## Deployment
 - Host: Hetzner VPS, bound to Tailscale interface.
 - Process: systemd user service.
 - Config: env vars (see `.env.example`).
-
-## Status
-Phase 1 (scaffolding): config parsing, walker, chunker, embedder (Gemini + Fake), store (rusqlite + **real sqlite-vec `vec0`** + FTS5). HTTP, watcher, and hybrid search land in Phase 2.
+- Full guide: [`docs/deployment.md`](docs/deployment.md).
 
 ## Quick start
 
@@ -45,7 +44,17 @@ cp .env.example .env          # then edit values
 make test                     # cargo test --all
 make build-release            # -> target/release/docindex
 set -a; source .env; set +a   # export env vars
-./target/release/docindex     # logs "ready" on stderr and exits 0 (Phase 1)
+./target/release/docindex     # serves HTTP until SIGINT/SIGTERM
+```
+
+Local dev without a Gemini key:
+```sh
+export DOCINDEX_VAULT_DIR=/tmp/vault DOCINDEX_DB_PATH=/tmp/index.db \
+       DOCINDEX_LISTEN=127.0.0.1:7777 DOCINDEX_ALLOW_LOOPBACK=true \
+       DOCINDEX_BEARER=dev DOCINDEX_EMBED=fake
+./target/release/docindex
+curl -H 'Authorization: Bearer dev' -X POST http://127.0.0.1:7777/search \
+     -H 'Content-Type: application/json' -d '{"query":"hello"}'
 ```
 
 Run the Python end-to-end harness:
@@ -53,7 +62,7 @@ Run the Python end-to-end harness:
 make pytest
 ```
 
-See `docs/ARCHITECTURE.md` for the full plan and `CLAUDE.md` for coding standards.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and [`CLAUDE.md`](CLAUDE.md) for coding standards.
 
 ## License
 Private — for personal use.
