@@ -34,7 +34,19 @@ Stored per chunk: `(path, chunk_idx, heading_path, content, content_hash, mtime_
 - Config: env vars (see `.env.example`).
 
 ## Status
-Scaffolding. See `docs/ARCHITECTURE.md` for the full plan.
+Phase 1 (scaffolding): config parsing, walker, chunker, embedder (Gemini + Fake), store (modernc SQLite + FTS5). HTTP, watcher, and hybrid search land in Phase 2.
+
+## Quick start
+
+```sh
+cp .env.example .env          # then edit values
+make test                     # go test ./... -race -cover
+make build                    # -> ./bin/docindex
+set -a; source .env; set +a   # export env vars
+./bin/docindex                # logs "ready" on stderr and exits 0 (Phase 1)
+```
+
+See `docs/ARCHITECTURE.md` for the full plan.
 
 ## License
 Private — for personal use.

@@ -59,7 +59,8 @@ Obsidian mobile ──Tailscale──►  docindex-server  ──►  SQLite (in
 
 - **Language:** Go (1.22+)
 - **HTTP:** `net/http` + `chi` router (small, idiomatic)
-- **SQLite:** `modernc.org/sqlite` (pure-Go, no CGo) + [`sqlite-vec`](https://github.com/asg017/sqlite-vec) extension + FTS5
+- **SQLite:** `modernc.org/sqlite` (pure-Go, transpiled C, no CGo) with built-in FTS5.
+  - **Phase 1 deviation — sqlite-vec is deferred:** The original spec paired modernc with `sqlite-vec`. modernc cannot load compiled C extensions (ABI mismatch — modernc is transpiled Go). The pure-Go alternative (`ncruces/go-sqlite3` + `sqlite-vec-go-bindings/ncruces`) works in principle but the published binding pins an ancient `ncruces/go-sqlite3` whose bundled WASM requires wazero atomic features that the matching wazero release has disabled, so it cannot execute on current toolchains. For Phase 1 we use modernc and store embeddings in a plain `chunks_vec(rowid, embedding BLOB)` table. The little-endian float32 byte layout matches what `vec0` will consume later, so Phase 2 (hybrid search + RRF) will swap the table and rebuild without touching the rest of the store API. **If/when that swap happens, delete this bullet and update the Tech Stack + pitfalls accordingly.**
 - **File watcher:** `fsnotify`
 - **Embeddings:** Google `gemini-embedding-001`, Matryoshka dim 768, task-asymmetric (doc/query)
 - **Logging:** `log/slog` (structured, JSON in prod, text in dev)
@@ -212,7 +213,7 @@ The bind address is validated at startup: if `DOCINDEX_LISTEN` is `0.0.0.0:*` or
 ## Common Pitfalls
 
 - **CGo:** We deliberately use `modernc.org/sqlite` (pure Go) so the binary is static. Don't add `mattn/go-sqlite3` — it re-introduces CGo + a cross-compile toolchain.
-- **sqlite-vec loading:** The extension must be loaded per-connection. Use a connection pool of size 1 or load on every `*sql.Conn` via `Raw(...)`.
+- **sqlite-vec loading (Phase 2):** Loading sqlite-vec into modernc requires extension support that modernc lacks. Plan for Phase 2 is either (a) migrate to ncruces once a working binding exists, or (b) compute cosine similarity in Go against the stored BLOBs for small vaults.
 - **FTS5 sync:** `chunks_fts` is a contentless FTS5 table indexed on `chunks`. You must manually `INSERT`/`DELETE` into the FTS table when `chunks` changes — it doesn't auto-sync in SQLite.
 - **Gemini task types:** `RETRIEVAL_DOCUMENT` for indexing, `RETRIEVAL_QUERY` for search. Getting this wrong silently degrades quality — the vectors still work, they're just mis-calibrated.
 - **Matryoshka dim:** Request dim=768 at embed time. Storing 3072 "just in case" quadruples disk and slows ANN for zero recall gain at this scale.
