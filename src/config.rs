@@ -31,6 +31,14 @@ pub struct Config {
     /// Which embedder to build. "gemini" in prod, "fake" in tests / when
     /// `GEMINI_API_KEY` is unset.
     pub embed_backend: String,
+    /// Display-side smoothing constant for `score_normalized`. NOT the RRF
+    /// constant (ranking is always k=60). Smaller = faster decay past rank-1.
+    pub display_k: f64,
+    /// Weight of the semantic branch in `score_normalized`.
+    pub weight_vec: f64,
+    /// Weight of the BM25 branch in `score_normalized`. `weight_vec + weight_bm25`
+    /// is validated to sum to 1.0 (± 0.01).
+    pub weight_bm25: f64,
 }
 
 #[derive(Debug, Error)]
@@ -75,6 +83,51 @@ impl Config {
         let debounce_ms = parse_int_default(lookup, "DOCINDEX_DEBOUNCE_MS", 5000, &mut errs);
         let http_timeout_ms =
             parse_int_default(lookup, "DOCINDEX_HTTP_TIMEOUT_MS", 30000, &mut errs);
+
+        let display_k = parse_float_default(
+            lookup,
+            "DOCINDEX_DISPLAY_K",
+            crate::search::DEFAULT_DISPLAY_K,
+            &mut errs,
+        );
+        if display_k <= 0.0 {
+            errs.push(format!("DOCINDEX_DISPLAY_K {display_k}: must be > 0"));
+        }
+        let weight_vec = parse_float_default(
+            lookup,
+            "DOCINDEX_WEIGHT_VEC",
+            crate::search::DEFAULT_WEIGHT_VEC,
+            &mut errs,
+        );
+        // If BM25 weight is unset, derive it as (1 - weight_vec). This keeps
+        // the common case (operator only tunes the vec weight) one-knob
+        // simple while still allowing explicit overrides for experiments.
+        let weight_bm25 = match lookup("DOCINDEX_WEIGHT_BM25") {
+            Some(v) if !v.is_empty() => match v.parse::<f64>() {
+                Ok(n) => n,
+                Err(e) => {
+                    errs.push(format!("DOCINDEX_WEIGHT_BM25 {v:?}: must be a float: {e}"));
+                    crate::search::DEFAULT_WEIGHT_BM25
+                }
+            },
+            _ => 1.0 - weight_vec,
+        };
+        let weight_sum = weight_vec + weight_bm25;
+        if !(0.99..=1.01).contains(&weight_sum) {
+            errs.push(format!(
+                "DOCINDEX_WEIGHT_VEC ({weight_vec}) + DOCINDEX_WEIGHT_BM25 ({weight_bm25}) = {weight_sum}; must sum to 1.0 (± 0.01)"
+            ));
+        }
+        if !(0.0..=1.0).contains(&weight_vec) {
+            errs.push(format!(
+                "DOCINDEX_WEIGHT_VEC {weight_vec}: must be in [0.0, 1.0]"
+            ));
+        }
+        if !(0.0..=1.0).contains(&weight_bm25) {
+            errs.push(format!(
+                "DOCINDEX_WEIGHT_BM25 {weight_bm25}: must be in [0.0, 1.0]"
+            ));
+        }
 
         let vault_dir = validate_vault_dir(&vault_dir_raw, &mut errs);
         let db_path = validate_db_path(&db_path_raw, &mut errs);
@@ -121,6 +174,9 @@ impl Config {
             http_timeout: Duration::from_millis(http_timeout_ms as u64),
             allow_loopback,
             embed_backend,
+            display_k,
+            weight_vec,
+            weight_bm25,
         })
     }
 }
@@ -146,6 +202,19 @@ fn parse_int_default(lookup: &Lookup<'_>, key: &str, def: i64, errs: &mut Vec<St
             }
         },
         _ => def as usize,
+    }
+}
+
+fn parse_float_default(lookup: &Lookup<'_>, key: &str, def: f64, errs: &mut Vec<String>) -> f64 {
+    match lookup(key) {
+        Some(v) if !v.is_empty() => match v.parse::<f64>() {
+            Ok(n) => n,
+            Err(e) => {
+                errs.push(format!("{key} {v:?}: must be a float: {e}"));
+                def
+            }
+        },
+        _ => def,
     }
 }
 
@@ -460,5 +529,74 @@ mod tests {
         let mut env = base_env(&dir);
         env.insert("DOCINDEX_EMBED".into(), "bogus".into());
         assert!(Config::from_lookup(&lookup(&env)).is_err());
+    }
+
+    #[test]
+    fn display_defaults_are_035_weights_sum_to_one() {
+        let dir = TempDir::new().unwrap();
+        let env = base_env(&dir);
+        let c = Config::from_lookup(&lookup(&env)).expect("valid");
+        assert_eq!(c.display_k, crate::search::DEFAULT_DISPLAY_K);
+        assert_eq!(c.weight_vec, crate::search::DEFAULT_WEIGHT_VEC);
+        assert!((c.weight_bm25 - crate::search::DEFAULT_WEIGHT_BM25).abs() < 1e-9);
+        assert!((c.weight_vec + c.weight_bm25 - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn weight_bm25_derived_from_vec_when_unset() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.insert("DOCINDEX_WEIGHT_VEC".into(), "0.7".into());
+        let c = Config::from_lookup(&lookup(&env)).expect("valid");
+        assert!((c.weight_vec - 0.7).abs() < 1e-9);
+        assert!((c.weight_bm25 - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn explicit_weights_that_dont_sum_to_one_error() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.insert("DOCINDEX_WEIGHT_VEC".into(), "0.7".into());
+        env.insert("DOCINDEX_WEIGHT_BM25".into(), "0.2".into());
+        let err = Config::from_lookup(&lookup(&env)).expect_err("err");
+        let msg = format!("{err}");
+        assert!(msg.contains("must sum to 1.0"), "{msg}");
+    }
+
+    #[test]
+    fn explicit_weights_sum_to_one_ok() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.insert("DOCINDEX_WEIGHT_VEC".into(), "0.6".into());
+        env.insert("DOCINDEX_WEIGHT_BM25".into(), "0.4".into());
+        let c = Config::from_lookup(&lookup(&env)).expect("valid");
+        assert!((c.weight_vec - 0.6).abs() < 1e-9);
+        assert!((c.weight_bm25 - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn weight_vec_outside_unit_interval_errors() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.insert("DOCINDEX_WEIGHT_VEC".into(), "1.5".into());
+        env.insert("DOCINDEX_WEIGHT_BM25".into(), "-0.5".into());
+        assert!(Config::from_lookup(&lookup(&env)).is_err());
+    }
+
+    #[test]
+    fn display_k_must_be_positive() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.insert("DOCINDEX_DISPLAY_K".into(), "0".into());
+        assert!(Config::from_lookup(&lookup(&env)).is_err());
+    }
+
+    #[test]
+    fn display_k_overridable() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.insert("DOCINDEX_DISPLAY_K".into(), "20".into());
+        let c = Config::from_lookup(&lookup(&env)).expect("valid");
+        assert_eq!(c.display_k, 20.0);
     }
 }
