@@ -5,12 +5,10 @@ import pathlib
 
 import pytest
 
+from conftest import DEFAULT_E2E_EMBED_DIM
+
 
 pytestmark = pytest.mark.e2e
-
-
-# Must match tests/conftest.py::_spawn_server's DOCINDEX_EMBED_DIM default.
-EXPECTED_DIM = 128
 
 
 def test_health_ok(spawn_server, tmp_path: pathlib.Path):
@@ -24,7 +22,7 @@ def test_health_ok(spawn_server, tmp_path: pathlib.Path):
     body = r.json()
     assert body["ok"] is True
     assert body["embedding_model"] == "gemini-embedding-001"
-    assert body["dim"] == EXPECTED_DIM
+    assert body["dim"] == DEFAULT_E2E_EMBED_DIM
     assert "indexed_chunks" in body
     assert "last_reindex_ms" in body
 

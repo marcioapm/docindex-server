@@ -16,6 +16,12 @@ import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
+# E2E tests run the fake embedder — a small dim keeps index.db tiny and
+# vector ops fast. The fake embedder is deterministic at any size.
+# Production default is 3072. Tests that pin an explicit /health.dim
+# expectation should reference this constant.
+DEFAULT_E2E_EMBED_DIM = 128
+
 
 @pytest.fixture(scope="session")
 def docindex_bin() -> pathlib.Path:
@@ -61,7 +67,7 @@ def base_env(vault_dir: pathlib.Path, db_path: pathlib.Path) -> dict[str, str]:
             "DOCINDEX_EMBED_MODEL": "gemini-embedding-001",
             # E2E tests run the fake embedder — a small dim keeps index.db
             # tiny and vector ops fast. Production default is 3072.
-            "DOCINDEX_EMBED_DIM": "128",
+            "DOCINDEX_EMBED_DIM": str(DEFAULT_E2E_EMBED_DIM),
             "DOCINDEX_LOG_FORMAT": "text",
         }
     )
@@ -157,7 +163,7 @@ def _spawn_server(
             "DOCINDEX_EMBED_MODEL": "gemini-embedding-001",
             # Small dim for E2E — the fake embedder is deterministic at any
             # size; keeping it small makes index.db and vec math cheap.
-            "DOCINDEX_EMBED_DIM": "128",
+            "DOCINDEX_EMBED_DIM": str(DEFAULT_E2E_EMBED_DIM),
             "DOCINDEX_LOG_FORMAT": "text",
             "DOCINDEX_DEBOUNCE_MS": "500",
         }
