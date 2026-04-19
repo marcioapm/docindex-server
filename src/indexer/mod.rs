@@ -54,6 +54,9 @@ pub struct IndexerCtx {
 
 /// Background task: drain `rx` and reindex each dirty path. Returns when
 /// the channel is closed (i.e. every sender has been dropped).
+///
+/// Paths on the channel are **vault-relative** — both the walker and the
+/// watcher strip `vault_dir` before sending.
 pub async fn run(ctx: IndexerCtx, mut rx: mpsc::UnboundedReceiver<PathBuf>) {
     info!("indexer task started");
     while let Some(path) = rx.recv().await {
@@ -102,7 +105,7 @@ pub async fn initial_scan(
 
     let seen: HashSet<String> = files
         .iter()
-        .map(|f| f.path.to_string_lossy().into_owned())
+        .map(|f| f.rel_path.to_string_lossy().into_owned())
         .collect();
 
     // Prune paths that vanished from disk.
@@ -130,7 +133,7 @@ pub async fn initial_scan(
     let scanned = files.len();
     let mut dirty = 0usize;
     for fs in files {
-        let path_str = fs.path.to_string_lossy().into_owned();
+        let path_str = fs.rel_path.to_string_lossy().into_owned();
         match known.get(&path_str) {
             Some(h) if h == &fs.content_hash => {
                 debug!(path = %path_str, "unchanged; skipping");
@@ -138,7 +141,7 @@ pub async fn initial_scan(
             }
             _ => {
                 dirty += 1;
-                if tx.send(fs.path.clone()).is_err() {
+                if tx.send(fs.rel_path.clone()).is_err() {
                     warn!("indexer channel closed during initial scan");
                     break;
                 }
@@ -149,14 +152,25 @@ pub async fn initial_scan(
     Ok((scanned, dirty, pruned))
 }
 
-/// Reindex one path. Resolves to a no-op if the file vanished since the
-/// event was queued (self-heals via the prune phase on next startup).
-async fn reindex_one(ctx: &IndexerCtx, path: &Path) -> Result<(), IndexerError> {
-    let meta = match std::fs::metadata(path) {
+/// Reindex one path. `rel_path` is relative to `ctx.vault_dir`; the file is
+/// read from `ctx.vault_dir.join(rel_path)` but stored in the DB under the
+/// relative form. Resolves to a no-op if the file vanished since the event
+/// was queued (self-heals via the prune phase on next startup).
+async fn reindex_one(ctx: &IndexerCtx, rel_path: &Path) -> Result<(), IndexerError> {
+    // Defensive: channel contract says relative, but if something ever hands
+    // us an absolute path we'd silently end up storing absolute paths again.
+    if rel_path.is_absolute() {
+        return Err(IndexerError::Msg(format!(
+            "reindex_one called with absolute path {}",
+            rel_path.display()
+        )));
+    }
+    let abs_path = ctx.vault_dir.join(rel_path);
+    let meta = match std::fs::metadata(&abs_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Deleted — drop it from the index.
-            let path_str = path.to_string_lossy().into_owned();
+            let path_str = rel_path.to_string_lossy().into_owned();
             let store = ctx.store.clone();
             let p = path_str.clone();
             tokio::task::spawn_blocking(move || -> Result<(), IndexerError> {
@@ -177,7 +191,7 @@ async fn reindex_one(ctx: &IndexerCtx, path: &Path) -> Result<(), IndexerError> 
     if !meta.is_file() {
         return Ok(());
     }
-    let path_str = path.to_string_lossy().into_owned();
+    let path_str = rel_path.to_string_lossy().into_owned();
     let mtime_ns = meta
         .modified()
         .ok()
@@ -185,7 +199,7 @@ async fn reindex_one(ctx: &IndexerCtx, path: &Path) -> Result<(), IndexerError> 
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
 
-    let bytes = std::fs::read(path)?;
+    let bytes = std::fs::read(&abs_path)?;
     let file_hash = {
         let mut h = Sha256::new();
         h.update(&bytes);
@@ -457,5 +471,55 @@ mod tests {
         let (_, _, pruned) = initial_scan(&ctx, &tx2).await.unwrap();
         assert_eq!(pruned, 1);
         assert_eq!(ctx.store.lock().unwrap().count_chunks().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn stores_relative_paths_in_db() {
+        // Indexing a nested file must persist the vault-relative path in
+        // both `chunks.path` and `files.path` — never the absolute path.
+        let dir = TempDir::new().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("notes")).unwrap();
+        std::fs::write(vault.join("notes/a.md"), b"# A\n\nalpha\n").unwrap();
+        let ctx = mk_ctx(dir.path());
+        let (tx, rx) = mpsc::unbounded_channel();
+        initial_scan(&ctx, &tx).await.unwrap();
+        drop(tx);
+        run(ctx.clone(), rx).await;
+
+        let guard = ctx.store.lock().unwrap();
+        let chunk_paths: Vec<String> = guard
+            .conn()
+            .prepare("SELECT DISTINCT path FROM chunks")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(chunk_paths, vec!["notes/a.md".to_string()]);
+        let file_paths = guard.list_indexed_paths().unwrap();
+        assert_eq!(file_paths, vec!["notes/a.md".to_string()]);
+        for p in chunk_paths.iter().chain(file_paths.iter()) {
+            assert!(
+                !p.starts_with('/'),
+                "stored path must be relative, got {p:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_absolute_paths_in_reindex() {
+        // The channel contract says relative; if an absolute path ever slips
+        // through we fail loudly instead of silently re-introducing the bug.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("vault")).unwrap();
+        let abs = dir.path().join("vault/anything.md");
+        std::fs::write(&abs, b"x").unwrap();
+        let ctx = mk_ctx(dir.path());
+        let err = reindex_one(&ctx, &abs).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("absolute"),
+            "unexpected error: {err}"
+        );
     }
 }

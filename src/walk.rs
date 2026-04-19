@@ -16,8 +16,9 @@ use walkdir::WalkDir;
 /// One markdown file's snapshot at scan time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileState {
-    /// Absolute path to the file.
-    pub path: PathBuf,
+    /// Path relative to the vault root. Always forward-slash, no leading `/`,
+    /// never contains `..`.
+    pub rel_path: PathBuf,
     /// File mtime in nanoseconds since the UNIX epoch.
     pub mtime_ns: i64,
     /// Hex sha256 of the file's bytes.
@@ -62,13 +63,18 @@ pub fn is_indexable_extension(ext: &str) -> bool {
 
 /// Recursively scan `root` and return one `FileState` per indexable file.
 ///
+/// Returned paths are **relative to `root`** (canonicalized). They never
+/// start with `/`, never contain `..`, and are sorted lexicographically for
+/// determinism.
+///
 /// Rules:
 /// * Only files whose extension is in [`INDEXABLE_EXTENSIONS`]
 ///   (case-insensitive) are returned.
 /// * Directories named in [`SKIPPED_DIRS`] are skipped, as is any directory
 ///   whose name starts with `.`.
 /// * Files whose names start with `.` are skipped.
-/// * Results are sorted by path for determinism.
+/// * Files whose canonicalized path escapes the canonicalized `root`
+///   (e.g. via a symlink pointing outside the vault) are logged and skipped.
 pub fn scan(root: &Path) -> Result<Vec<FileState>, WalkError> {
     let abs_root = root
         .canonicalize()
@@ -113,14 +119,42 @@ pub fn scan(root: &Path) -> Result<Vec<FileState>, WalkError> {
         if !is_indexable_extension(ext) {
             continue;
         }
-        out.push(hash_file(path)?);
+        let rel = match relativize_inside(&abs_root, path) {
+            Some(r) => r,
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    root = %abs_root.display(),
+                    "skipping file whose canonical path escapes the vault"
+                );
+                continue;
+            }
+        };
+        out.push(hash_file(path, rel)?);
     }
 
-    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     Ok(out)
 }
 
-fn hash_file(path: &Path) -> Result<FileState, WalkError> {
+/// Canonicalize `candidate`, ensure it lives under `canonical_root`, and
+/// return the path relative to `canonical_root`. Returns `None` on any
+/// canonicalize error or if the canonical path escapes the root.
+fn relativize_inside(canonical_root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let canon = candidate.canonicalize().ok()?;
+    let rel = canon.strip_prefix(canonical_root).ok()?;
+    if rel.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        return None;
+    }
+    Some(rel.to_path_buf())
+}
+
+fn hash_file(path: &Path, rel_path: PathBuf) -> Result<FileState, WalkError> {
     let md = std::fs::metadata(path)
         .map_err(|e| WalkError::io(format!("metadata({})", path.display()), e))?;
     let mtime_ns = md
@@ -135,7 +169,7 @@ fn hash_file(path: &Path) -> Result<FileState, WalkError> {
     hasher.update(&bytes);
     let digest = hasher.finalize();
     Ok(FileState {
-        path: path.to_path_buf(),
+        rel_path,
         mtime_ns,
         content_hash: hex::encode(digest),
     })
@@ -177,26 +211,28 @@ mod tests {
 
         let got = scan(root).unwrap();
         assert_eq!(got.len(), 3, "{got:?}");
-        assert!(got.windows(2).all(|w| w[0].path <= w[1].path));
-        let paths: Vec<_> = got
+        assert!(got.windows(2).all(|w| w[0].rel_path <= w[1].rel_path));
+        let rels: Vec<_> = got
             .iter()
-            .map(|fs| fs.path.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|fs| fs.rel_path.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(paths, vec!["a.md", "b.md", "c.md"]);
-        let by_name: std::collections::HashMap<_, _> = got
-            .iter()
-            .map(|fs| {
-                (
-                    fs.path.file_name().unwrap().to_string_lossy().into_owned(),
-                    fs,
-                )
-            })
-            .collect();
-        assert_eq!(by_name["a.md"].content_hash, sha("alpha"));
-        assert_eq!(by_name["b.md"].content_hash, sha("beta"));
-        assert_eq!(by_name["c.md"].content_hash, sha("gamma"));
+        assert_eq!(rels, vec!["a.md", "b.md", "notes/c.md"]);
         for fs in &got {
-            assert!(fs.mtime_ns != 0, "mtime zero for {}", fs.path.display());
+            assert!(
+                !fs.rel_path.is_absolute(),
+                "rel_path must not be absolute: {}",
+                fs.rel_path.display()
+            );
+        }
+        let by_rel: std::collections::HashMap<_, _> = got
+            .iter()
+            .map(|fs| (fs.rel_path.to_string_lossy().into_owned(), fs))
+            .collect();
+        assert_eq!(by_rel["a.md"].content_hash, sha("alpha"));
+        assert_eq!(by_rel["b.md"].content_hash, sha("beta"));
+        assert_eq!(by_rel["notes/c.md"].content_hash, sha("gamma"));
+        for fs in &got {
+            assert!(fs.mtime_ns != 0, "mtime zero for {}", fs.rel_path.display());
         }
     }
 
@@ -211,12 +247,12 @@ mod tests {
         write(root, "image.png", "skip");
 
         let got = scan(root).unwrap();
-        let names: Vec<_> = got
+        let rels: Vec<_> = got
             .iter()
-            .map(|fs| fs.path.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|fs| fs.rel_path.to_string_lossy().into_owned())
             .collect();
         // Path-sorted; .rtf and .png rejected; case-insensitive .TXT kept.
-        assert_eq!(names, vec!["a.TXT", "notes.txt", "readme.md"]);
+        assert_eq!(rels, vec!["a.TXT", "notes.txt", "readme.md"]);
     }
 
     #[test]

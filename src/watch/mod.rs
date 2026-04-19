@@ -7,6 +7,10 @@
 //! Entries younger than `debounce` stay for the next tick. This gives
 //! coalesced-but-not-delayed behavior: a burst of writes to the same file
 //! (an editor save + lockfile dance) collapses to a single emit.
+//!
+//! Paths pushed into the indexer channel are **vault-relative** — the raw
+//! absolute paths from `notify` are stripped against the canonicalized
+//! `vault_dir` before being stamped into the pending map.
 
 use std::{
     collections::HashMap,
@@ -33,7 +37,7 @@ const SKIPPED_DIR_SEGMENTS: &[&str] = &[".git", ".obsidian", "node_modules"];
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Watch `vault_dir` recursively and push any indexable path that changes
-/// into `tx`. Returns once `cancel` resolves.
+/// into `tx`, **relative to `vault_dir`**. Returns once `cancel` resolves.
 ///
 /// The task owns the watcher for its lifetime — dropping the returned
 /// future releases the underlying OS resources.
@@ -43,6 +47,17 @@ pub async fn run(
     debounce: Duration,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), WatchError> {
+    // Canonicalize once so strip_prefix works even when the operator passes a
+    // vault dir with a trailing slash or via a symlink.
+    let canonical_vault = vault_dir.canonicalize().unwrap_or_else(|e| {
+        warn!(
+            path = %vault_dir.display(),
+            error = %e,
+            "could not canonicalize vault_dir; falling back to raw path"
+        );
+        vault_dir.clone()
+    });
+
     let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<notify::Event>();
 
     // The notify callback runs on a notify-owned thread; it must not block.
@@ -57,8 +72,8 @@ pub async fn run(
             Err(e) => error!(error = %e, "notify error"),
         }
     })?;
-    watcher.watch(&vault_dir, RecursiveMode::Recursive)?;
-    info!(vault = %vault_dir.display(), "watcher started");
+    watcher.watch(&canonical_vault, RecursiveMode::Recursive)?;
+    info!(vault = %canonical_vault.display(), "watcher started");
     drop(raw_tx);
 
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
@@ -75,7 +90,7 @@ pub async fn run(
             }
             ev = raw_rx.recv() => {
                 match ev {
-                    Some(ev) => record(&mut pending, &ev, &vault_dir),
+                    Some(ev) => record(&mut pending, &ev, &canonical_vault),
                     None => {
                         warn!("notify sender closed; stopping watcher");
                         break;
@@ -105,8 +120,43 @@ fn record(pending: &mut HashMap<PathBuf, Instant>, ev: &notify::Event, root: &Pa
         if !is_relevant(&abs) {
             continue;
         }
-        pending.insert(abs, now);
+        let Some(rel) = strip_vault_prefix(root, &abs) else {
+            debug!(
+                path = %abs.display(),
+                root = %root.display(),
+                "watch event path outside vault; skipping"
+            );
+            continue;
+        };
+        pending.insert(rel, now);
     }
+}
+
+/// Return `abs` relative to `root`, or `None` if it's not under `root` or
+/// would require traversing `..`. Falls back to canonicalizing `abs` when
+/// the raw prefix check fails (handles symlinks to files inside the vault).
+fn strip_vault_prefix(root: &Path, abs: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = abs.strip_prefix(root) {
+        return relative_inside(rel);
+    }
+    let canon = abs.canonicalize().ok()?;
+    let rel = canon.strip_prefix(root).ok()?;
+    relative_inside(rel)
+}
+
+fn relative_inside(rel: &Path) -> Option<PathBuf> {
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    if rel.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        return None;
+    }
+    Some(rel.to_path_buf())
 }
 
 fn flush(
@@ -193,5 +243,39 @@ mod tests {
         flush(&mut pending, &tx, Duration::from_secs(5));
         assert_eq!(rx.try_recv().unwrap(), PathBuf::from("/a.md"));
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn strip_vault_prefix_strips_root() {
+        let root = Path::new("/vault");
+        assert_eq!(
+            strip_vault_prefix(root, Path::new("/vault/note.md")),
+            Some(PathBuf::from("note.md"))
+        );
+        assert_eq!(
+            strip_vault_prefix(root, Path::new("/vault/sub/note.md")),
+            Some(PathBuf::from("sub/note.md"))
+        );
+    }
+
+    #[test]
+    fn strip_vault_prefix_rejects_escape() {
+        let root = Path::new("/vault");
+        // Same prefix, different vault ("/vaults/..." is not under "/vault").
+        assert_eq!(
+            strip_vault_prefix(root, Path::new("/other/note.md")),
+            None,
+            "path outside vault must not be stripped"
+        );
+    }
+
+    #[test]
+    fn strip_vault_prefix_rejects_root_itself() {
+        let root = Path::new("/vault");
+        assert_eq!(
+            strip_vault_prefix(root, Path::new("/vault")),
+            None,
+            "the vault root itself has no relative form"
+        );
     }
 }
