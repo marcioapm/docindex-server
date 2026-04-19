@@ -30,7 +30,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 -- chunks_vec (sqlite-vec vec0 virtual table) is created from Rust with the
 -- configured embedding dim baked into the DDL — vec0 requires the dimension
 -- as a SQL literal, so we can't template it from a parameter here. See
--- `Store::open` in `src/store/mod.rs` for the render.
+-- `store::vec::vec_schema_ddl` for the render; applied in `Store::open`.
 
 CREATE TABLE IF NOT EXISTS embedding_cache (
   content_hash TEXT PRIMARY KEY,

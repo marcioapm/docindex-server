@@ -30,6 +30,17 @@ pub fn decode_f32(b: &[u8]) -> Result<Vec<f32>, String> {
     Ok(out)
 }
 
+/// Render the DDL for the `chunks_vec` virtual table with `embed_dim` baked
+/// in. `vec0` requires the dimension as a SQL literal, so we can't template
+/// it from a bound parameter — we have to splice it into the text. Wrapped
+/// in `IF NOT EXISTS` so opening an existing DB is idempotent; the
+/// schema/config match is enforced separately via `meta.embedding_dim`.
+pub fn vec_schema_ddl(embed_dim: usize) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding FLOAT[{embed_dim}] distance_metric=cosine)"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,5 +56,22 @@ mod tests {
     #[test]
     fn bad_length() {
         assert!(decode_f32(&[0u8; 3]).is_err());
+    }
+
+    #[test]
+    fn vec_schema_ddl_embeds_dim() {
+        let ddl = vec_schema_ddl(3072);
+        assert!(
+            ddl.contains("FLOAT[3072]"),
+            "expected FLOAT[3072] literal in DDL: {ddl}"
+        );
+        assert!(ddl.contains("distance_metric=cosine"));
+        assert!(ddl.contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn vec_schema_ddl_tracks_dim() {
+        assert!(vec_schema_ddl(8).contains("FLOAT[8]"));
+        assert!(vec_schema_ddl(768).contains("FLOAT[768]"));
     }
 }

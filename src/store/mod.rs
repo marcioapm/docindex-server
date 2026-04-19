@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::chunk::Chunk;
 
-pub use self::vec::{decode_f32, encode_f32};
+pub use self::vec::{decode_f32, encode_f32, vec_schema_ddl};
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
 
@@ -59,9 +59,7 @@ impl Store {
         // DDL here from config. `IF NOT EXISTS` makes the open idempotent.
         // A pre-existing table at a different dim will silently stay, but
         // the meta check below will catch it and refuse.
-        let vec_ddl = format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding FLOAT[{embed_dim}] distance_metric=cosine)"
-        );
+        let vec_ddl = vec_schema_ddl(embed_dim);
         conn.execute_batch(&vec_ddl)
             .map_err(|e| StoreError::Msg(format!("apply vec schema: {e}")))?;
         let s = Self { conn };
