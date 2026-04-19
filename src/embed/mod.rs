@@ -34,6 +34,8 @@ pub enum EmbedError {
     Api { status: u16, message: String },
     #[error("embed: decode: {0}")]
     Decode(String),
+    #[error("embed: response dim mismatch: got {got}, want {want}")]
+    DimMismatch { got: usize, want: usize },
     #[error("embed: retries exhausted: {0}")]
     RetriesExhausted(String),
 }

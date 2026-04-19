@@ -103,11 +103,10 @@ impl Gemini {
                     return Err(EmbedError::Decode("empty embedding values".into()));
                 }
                 if parsed.embedding.values.len() != self.dim {
-                    return Err(EmbedError::Decode(format!(
-                        "response dim {} != requested {}",
-                        parsed.embedding.values.len(),
-                        self.dim
-                    )));
+                    return Err(EmbedError::DimMismatch {
+                        got: parsed.embedding.values.len(),
+                        want: self.dim,
+                    });
                 }
                 return Ok(parsed.embedding.values);
             }
