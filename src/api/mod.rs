@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, atomic::AtomicI64};
 
 use axum::{Router, middleware, routing::post};
 
-use crate::{embed::AnyEmbedder, store::Store};
+use crate::{embed::AnyEmbedder, search::DisplayScoring, store::Store};
 
 /// State shared by every handler. Clone is cheap (reference counted).
 #[derive(Clone)]
@@ -23,6 +23,7 @@ pub struct AppState {
     pub embed_model: Arc<String>,
     pub embed_dim: usize,
     pub last_reindex_ms: Arc<AtomicI64>,
+    pub display_scoring: DisplayScoring,
 }
 
 /// Compose the full HTTP router. `/health` is public; `/search` and

@@ -107,6 +107,7 @@ pub async fn search(
     embed_dim: usize,
     query: &str,
     limit: usize,
+    display: DisplayScoring,
 ) -> Result<Vec<Hit>, SearchError> {
     if query.trim().is_empty() {
         return Ok(Vec::new());
@@ -121,14 +122,7 @@ pub async fn search(
     let fts_query = fts_query_from_user(query);
     let (vec_hits, fts_hits) = run_candidate_queries(store.clone(), q_vec, fts_query).await?;
     let fused = fuse_rrf_ranked(&rank_ids(&vec_hits), &rank_ids(&fts_hits), RRF_K);
-    hydrate(
-        store,
-        &fused,
-        clamp_limit(limit),
-        None,
-        DisplayScoring::default(),
-    )
-    .await
+    hydrate(store, &fused, clamp_limit(limit), None, display).await
 }
 
 /// Find chunks similar to the stored content at `path`.
@@ -141,6 +135,7 @@ pub async fn similar(
     embed_dim: usize,
     path: &str,
     limit: usize,
+    display: DisplayScoring,
 ) -> Result<Vec<Hit>, SearchError> {
     let path_owned = path.to_string();
     let (q_vec, bag) = {
@@ -200,7 +195,7 @@ pub async fn similar(
         &fused,
         clamp_limit(limit),
         Some(path.to_string()),
-        DisplayScoring::default(),
+        display,
     )
     .await
 }

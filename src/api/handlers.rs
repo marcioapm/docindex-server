@@ -69,6 +69,7 @@ pub async fn search(
         state.embed_dim,
         &req.query,
         req.limit,
+        state.display_scoring,
     )
     .await?;
     Ok(Json(SearchResponse { hits }))
@@ -89,6 +90,13 @@ pub async fn similar(
     if req.path.trim().is_empty() {
         return Err(ApiError::BadRequest("path must not be empty".into()));
     }
-    let hits = search::similar(state.store.clone(), state.embed_dim, &req.path, req.limit).await?;
+    let hits = search::similar(
+        state.store.clone(),
+        state.embed_dim,
+        &req.path,
+        req.limit,
+        state.display_scoring,
+    )
+    .await?;
     Ok(Json(SearchResponse { hits }))
 }

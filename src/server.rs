@@ -47,6 +47,11 @@ pub async fn run(cfg: Config) -> Result<()> {
         embed_model: Arc::new(cfg.embed_model.clone()),
         embed_dim: cfg.embed_dim,
         last_reindex_ms: last_reindex_ms.clone(),
+        display_scoring: crate::search::DisplayScoring {
+            k: cfg.display_k,
+            w_vec: cfg.weight_vec,
+            w_bm25: cfg.weight_bm25,
+        },
     };
 
     let (dirty_tx, dirty_rx) = mpsc::unbounded_channel::<std::path::PathBuf>();
