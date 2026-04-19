@@ -9,6 +9,10 @@ import pytest
 pytestmark = pytest.mark.e2e
 
 
+# Must match tests/conftest.py::_spawn_server's DOCINDEX_EMBED_DIM default.
+EXPECTED_DIM = 128
+
+
 def test_health_ok(spawn_server, tmp_path: pathlib.Path):
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -20,7 +24,7 @@ def test_health_ok(spawn_server, tmp_path: pathlib.Path):
     body = r.json()
     assert body["ok"] is True
     assert body["embedding_model"] == "gemini-embedding-001"
-    assert body["dim"] == 768
+    assert body["dim"] == EXPECTED_DIM
     assert "indexed_chunks" in body
     assert "last_reindex_ms" in body
 
@@ -42,3 +46,14 @@ def test_health_reports_indexed_chunks_after_scan(spawn_server, tmp_path: pathli
     server = spawn_server(vault)
     got = server.wait_for_chunks(3, timeout=15.0)
     assert got >= 3
+
+
+def test_health_dim_tracks_env(spawn_server, tmp_path: pathlib.Path):
+    """Explicit override: /health.dim must reflect DOCINDEX_EMBED_DIM."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "a.md").write_text("# A\n\nalpha\n")
+    server = spawn_server(vault, env_overrides={"DOCINDEX_EMBED_DIM": "64"})
+    r = server.get("/health")
+    assert r.status_code == 200
+    assert r.json()["dim"] == 64

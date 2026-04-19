@@ -59,7 +59,9 @@ def base_env(vault_dir: pathlib.Path, db_path: pathlib.Path) -> dict[str, str]:
             "DOCINDEX_BEARER": "test-bearer",
             "GEMINI_API_KEY": "test-key",
             "DOCINDEX_EMBED_MODEL": "gemini-embedding-001",
-            "DOCINDEX_EMBED_DIM": "768",
+            # E2E tests run the fake embedder — a small dim keeps index.db
+            # tiny and vector ops fast. Production default is 3072.
+            "DOCINDEX_EMBED_DIM": "128",
             "DOCINDEX_LOG_FORMAT": "text",
         }
     )
@@ -153,7 +155,9 @@ def _spawn_server(
             "DOCINDEX_BEARER": bearer,
             "DOCINDEX_EMBED": "fake",
             "DOCINDEX_EMBED_MODEL": "gemini-embedding-001",
-            "DOCINDEX_EMBED_DIM": "768",
+            # Small dim for E2E — the fake embedder is deterministic at any
+            # size; keeping it small makes index.db and vec math cheap.
+            "DOCINDEX_EMBED_DIM": "128",
             "DOCINDEX_LOG_FORMAT": "text",
             "DOCINDEX_DEBOUNCE_MS": "500",
         }
