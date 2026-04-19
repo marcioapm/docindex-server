@@ -215,7 +215,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 
 ### Error Handling
 
-- Wrap external errors with `#[from]` in the module's `thiserror` enum. Add variants for semantic failures (e.g. `StoreError::DimMismatch { got, want }`).
+- Wrap external errors with `#[from]` in the module's `thiserror` enum. Add variants for semantic failures (e.g. `StoreError::CacheDimMismatch { got, want }`).
 - HTTP handlers return structured JSON: `{ "error": "...", "code": "..." }`. `ApiError` owns this mapping.
 - Never expose internal error details or stack traces to clients.
 - Log at `error` for 5xx; `warn` for 4xx that indicates misconfiguration.

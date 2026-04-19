@@ -25,12 +25,12 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("store: sqlite-vec extension failed to load: {0}")]
     VecExtension(String),
-    #[error("store: dim mismatch: got {got}, want {want}")]
-    DimMismatch { got: usize, want: usize },
+    #[error("store: embedding_cache row dim mismatch: got {got}, want {want}")]
+    CacheDimMismatch { got: usize, want: usize },
     #[error(
         "store: embedding_dim on disk is {stored}, config says {config} — refusing to mix. Delete index.db to reindex at new dim."
     )]
-    DimMixed { stored: usize, config: usize },
+    SchemaDimMismatch { stored: usize, config: usize },
 }
 
 /// Wraps a `rusqlite::Connection` with the docindex schema applied and
@@ -73,7 +73,7 @@ impl Store {
                     .parse()
                     .map_err(|e| StoreError::Msg(format!("parse meta.embedding_dim {v:?}: {e}")))?;
                 if stored != embed_dim {
-                    return Err(StoreError::DimMixed {
+                    return Err(StoreError::SchemaDimMismatch {
                         stored,
                         config: embed_dim,
                     });
@@ -224,7 +224,7 @@ impl Store {
         embedding: &[f32],
     ) -> Result<(), StoreError> {
         if embedding.len() != dim {
-            return Err(StoreError::DimMismatch {
+            return Err(StoreError::CacheDimMismatch {
                 got: embedding.len(),
                 want: dim,
             });
@@ -662,7 +662,10 @@ mod tests {
         let err = s
             .put_embedding_cache("h", "m", "t", 4, &[1.0, 2.0, 3.0])
             .unwrap_err();
-        assert!(matches!(err, StoreError::DimMismatch { got: 3, want: 4 }));
+        assert!(matches!(
+            err,
+            StoreError::CacheDimMismatch { got: 3, want: 4 }
+        ));
     }
 
     #[test]
@@ -723,7 +726,7 @@ mod tests {
     #[test]
     fn rejects_mixed_dim_on_reopen() {
         // Open at one dim, close, reopen at another — must refuse with the
-        // DimMixed error so the operator has to explicitly nuke the DB.
+        // SchemaDimMismatch error so the operator has to explicitly nuke the DB.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("x.db");
         {
@@ -734,11 +737,11 @@ mod tests {
             Err(e) => e,
         };
         match err {
-            StoreError::DimMixed { stored, config } => {
+            StoreError::SchemaDimMismatch { stored, config } => {
                 assert_eq!(stored, 8);
                 assert_eq!(config, 16);
             }
-            other => panic!("expected DimMixed, got {other:?}"),
+            other => panic!("expected SchemaDimMismatch, got {other:?}"),
         }
     }
 
