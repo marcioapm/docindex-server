@@ -29,6 +29,13 @@ use crate::{
 pub async fn run(cfg: Config) -> Result<()> {
     let embedder = build_embedder(&cfg)?;
     let store = Store::open(&cfg.db_path, cfg.embed_dim).context("open store")?;
+    // Rewrite any pre-0.2.0 absolute paths to vault-relative form. Idempotent
+    // across restarts; a mismatch between the DB's paths and the configured
+    // vault_dir is surfaced as a refusal (logged, not fatal) so operators can
+    // reconcile before the indexer starts touching rows.
+    store
+        .migrate_paths_to_relative(&cfg.vault_dir)
+        .context("migrate paths to relative")?;
     let store = Arc::new(Mutex::new(store));
 
     let last_reindex_ms = Arc::new(AtomicI64::new(now_ms().checked_sub(1).unwrap_or(0)));

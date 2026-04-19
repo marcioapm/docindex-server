@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 
 use rusqlite::{Connection, OptionalExtension, ffi::sqlite3_auto_extension, params};
 use thiserror::Error;
+use tracing::{info, warn};
 
 use crate::chunk::Chunk;
 
@@ -16,6 +17,11 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// Current schema version, written to meta on open.
 pub const SCHEMA_VERSION: &str = "2";
+
+/// Version tag for the vault-relative-path normalization. Written to
+/// `meta.path_schema_version` after a successful in-place migration; used
+/// to make `migrate_paths_to_relative` idempotent across restarts.
+pub const PATH_SCHEMA_VERSION: &str = "1";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -443,6 +449,122 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Rewrite `chunks.path` and `files.path` from absolute (pre-0.2.0) to
+    /// vault-relative, in place. Idempotent: once
+    /// `meta.path_schema_version == PATH_SCHEMA_VERSION`, this is a no-op.
+    ///
+    /// Safety: if any row's `path` starts with `/` but does **not** fall
+    /// under `vault_dir`, we refuse the migration, log a warning with the
+    /// offending count, and leave `meta.path_schema_version` unset. This
+    /// leaves the DB readable in its old form but makes the operator decide
+    /// between wiping it or restoring the original vault dir — far safer
+    /// than silently mangling paths.
+    pub fn migrate_paths_to_relative(
+        &self,
+        vault_dir: &Path,
+    ) -> Result<MigrationOutcome, StoreError> {
+        if let Some(v) = self.get_meta("path_schema_version")?
+            && v == PATH_SCHEMA_VERSION
+        {
+            return Ok(MigrationOutcome::AlreadyCurrent);
+        }
+
+        // Canonicalize the vault dir so the prefix match survives trailing
+        // slashes and symlinks. If canonicalize fails (missing dir) we bail
+        // out without touching anything.
+        let canonical = vault_dir.canonicalize().map_err(|e| {
+            StoreError::Msg(format!(
+                "migrate_paths: canonicalize({}): {e}",
+                vault_dir.display()
+            ))
+        })?;
+        let vault_str = canonical.to_string_lossy().into_owned();
+        if !vault_str.starts_with('/') {
+            return Err(StoreError::Msg(format!(
+                "migrate_paths: vault_dir must be absolute, got {vault_str:?}"
+            )));
+        }
+        let prefix_match = format!("{vault_str}/%");
+
+        // Count offending rows: absolute paths that don't live under the
+        // vault. If the DB is already fully relative, this is also 0 (the
+        // second clause excludes them).
+        let offending: i64 = self.conn.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM chunks WHERE path LIKE '/%' AND path NOT LIKE ?1)
+             + (SELECT COUNT(*) FROM files  WHERE path LIKE '/%' AND path NOT LIKE ?1)",
+            params![prefix_match],
+            |r| r.get(0),
+        )?;
+        if offending > 0 {
+            warn!(
+                rows = offending,
+                vault = %vault_str,
+                "path migration: found rows with absolute paths outside the configured vault; refusing to migrate. Either restore DOCINDEX_VAULT_DIR to the original path or wipe index.db.",
+            );
+            return Ok(MigrationOutcome::Refused {
+                offending_rows: offending as u64,
+            });
+        }
+
+        // Safe to proceed. +2 on substr accounts for: +1 for 1-indexed SQL
+        // and +1 to skip the "/" immediately following vault_dir.
+        let tx = self.conn.unchecked_transaction()?;
+        let chunks_updated = tx.execute(
+            "UPDATE chunks
+               SET path = substr(path, length(?1) + 2)
+             WHERE path LIKE ?2",
+            params![vault_str, prefix_match],
+        )?;
+        let files_updated = tx.execute(
+            "UPDATE files
+               SET path = substr(path, length(?1) + 2)
+             WHERE path LIKE ?2",
+            params![vault_str, prefix_match],
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('path_schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![PATH_SCHEMA_VERSION],
+        )?;
+        tx.commit()?;
+
+        let total = (chunks_updated + files_updated) as u64;
+        if total > 0 {
+            info!(
+                chunks_rewritten = chunks_updated,
+                files_rewritten = files_updated,
+                vault = %vault_str,
+                "migrated {total} rows from absolute to relative paths"
+            );
+        } else {
+            info!(
+                vault = %vault_str,
+                "path migration: no absolute paths found; marking as current"
+            );
+        }
+        Ok(MigrationOutcome::Migrated {
+            chunks_rewritten: chunks_updated as u64,
+            files_rewritten: files_updated as u64,
+        })
+    }
+}
+
+/// Summary of a `migrate_paths_to_relative` call. Exposed so the caller (and
+/// tests) can distinguish a no-op from a real rewrite from a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    /// `meta.path_schema_version` already matches — nothing to do.
+    AlreadyCurrent,
+    /// Migration ran and updated these row counts.
+    Migrated {
+        chunks_rewritten: u64,
+        files_rewritten: u64,
+    },
+    /// Migration was refused because some rows lie outside `vault_dir`. The
+    /// DB is untouched; the operator must reconcile manually.
+    Refused { offending_rows: u64 },
 }
 
 /// Minimal row projection used to hydrate a search hit. Kept in the store
@@ -790,5 +912,151 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0, "stale cache row should be swept on open");
+    }
+
+    /// Seed a row with an absolute path into both chunks+files and vec, with
+    /// an FTS entry, so the migration has a realistic surface to rewrite.
+    fn seed_absolute_row(store: &Store, abs_path: &str, content: &str) -> i64 {
+        let c = Chunk {
+            idx: 0,
+            heading: String::new(),
+            heading_path: String::new(),
+            content: content.to_string(),
+            content_hash: format!("hash-{abs_path}"),
+            tokens: content.split_whitespace().count(),
+        };
+        let id = store.upsert_chunk(&c, abs_path, 100).unwrap();
+        store
+            .set_vector_for_chunk(id, &[0.0_f32; TEST_DIM])
+            .unwrap();
+        store
+            .set_file_state(abs_path, &c.content_hash, 100)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn migrate_rewrites_absolute_paths_to_relative() {
+        let dir = TempDir::new().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let canonical = vault.canonicalize().unwrap();
+        let vault_str = canonical.to_string_lossy().into_owned();
+        let db = dir.path().join("x.db");
+
+        {
+            let s = Store::open(&db, TEST_DIM).unwrap();
+            seed_absolute_row(&s, &format!("{vault_str}/a.md"), "body a");
+            seed_absolute_row(&s, &format!("{vault_str}/sub/b.md"), "body b");
+        }
+
+        let s = Store::open(&db, TEST_DIM).unwrap();
+        let outcome = s.migrate_paths_to_relative(&canonical).unwrap();
+        assert_eq!(
+            outcome,
+            MigrationOutcome::Migrated {
+                chunks_rewritten: 2,
+                files_rewritten: 2,
+            }
+        );
+
+        let chunk_paths: Vec<String> = s
+            .conn()
+            .prepare("SELECT path FROM chunks ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            chunk_paths,
+            vec!["a.md".to_string(), "sub/b.md".to_string()]
+        );
+        let file_paths: Vec<String> = s
+            .conn()
+            .prepare("SELECT path FROM files ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(file_paths, vec!["a.md".to_string(), "sub/b.md".to_string()]);
+        assert_eq!(
+            s.get_meta("path_schema_version").unwrap().as_deref(),
+            Some(PATH_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let canonical = vault.canonicalize().unwrap();
+        let vault_str = canonical.to_string_lossy().into_owned();
+        let db = dir.path().join("x.db");
+
+        {
+            let s = Store::open(&db, TEST_DIM).unwrap();
+            seed_absolute_row(&s, &format!("{vault_str}/a.md"), "body a");
+        }
+        let s = Store::open(&db, TEST_DIM).unwrap();
+        let first = s.migrate_paths_to_relative(&canonical).unwrap();
+        assert!(matches!(first, MigrationOutcome::Migrated { .. }));
+        let second = s.migrate_paths_to_relative(&canonical).unwrap();
+        assert_eq!(second, MigrationOutcome::AlreadyCurrent);
+        // Paths still relative after the second call.
+        let p: String = s
+            .conn()
+            .query_row("SELECT path FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(p, "a.md");
+    }
+
+    #[test]
+    fn migrate_refuses_when_rows_outside_vault() {
+        let dir = TempDir::new().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let canonical = vault.canonicalize().unwrap();
+        let db = dir.path().join("x.db");
+
+        {
+            let s = Store::open(&db, TEST_DIM).unwrap();
+            // Row from a different vault — the migration must refuse.
+            seed_absolute_row(&s, "/somewhere/else/a.md", "body a");
+        }
+        let s = Store::open(&db, TEST_DIM).unwrap();
+        let outcome = s.migrate_paths_to_relative(&canonical).unwrap();
+        assert_eq!(outcome, MigrationOutcome::Refused { offending_rows: 2 });
+        // meta.path_schema_version must NOT be set.
+        assert_eq!(s.get_meta("path_schema_version").unwrap(), None);
+        // Row still intact.
+        let p: String = s
+            .conn()
+            .query_row("SELECT path FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(p, "/somewhere/else/a.md");
+    }
+
+    #[test]
+    fn migrate_is_noop_on_empty_db() {
+        let dir = TempDir::new().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let canonical = vault.canonicalize().unwrap();
+        let s = Store::open(dir.path().join("x.db"), TEST_DIM).unwrap();
+        let outcome = s.migrate_paths_to_relative(&canonical).unwrap();
+        assert_eq!(
+            outcome,
+            MigrationOutcome::Migrated {
+                chunks_rewritten: 0,
+                files_rewritten: 0,
+            }
+        );
+        assert_eq!(
+            s.get_meta("path_schema_version").unwrap().as_deref(),
+            Some(PATH_SCHEMA_VERSION)
+        );
     }
 }
