@@ -8,7 +8,7 @@
 ## Components
 - **Walker** (`src/walk.rs`): initial full scan, content-hash diff → dirty set.
 - **Chunker** (`src/chunk.rs`): heading-aware (H1/H2/H3) + ~500-token fallback with 50-token overlap. Pure.
-- **Embedder** (`src/embed/`): Gemini `gemini-embedding-001`, Matryoshka dim 768, task-asymmetric (`RETRIEVAL_DOCUMENT` for indexing, `RETRIEVAL_QUERY` for search). `Fake` embedder for tests (SHA256-seeded, L2-normalized). `AnyEmbedder` enum for static dispatch (native async fn in traits → not dyn-compatible).
+- **Embedder** (`src/embed/`): Gemini `gemini-embedding-001`, Matryoshka-truncatable — the configured embedding dim (default 3072) is requested via `outputDimensionality` and baked into storage, task-asymmetric (`RETRIEVAL_DOCUMENT` for indexing, `RETRIEVAL_QUERY` for search). `Fake` embedder for tests (SHA256-seeded, L2-normalized). `AnyEmbedder` enum for static dispatch (native async fn in traits → not dyn-compatible).
 - **Store** (`src/store/`): SQLite via `rusqlite` (`bundled` + `load_extension`) with `sqlite-vec` loaded as a real extension (`vec0` virtual table, `distance_metric=cosine`) and FTS5 for BM25. Shared across tasks via `Arc<Mutex<Store>>`; every SQL call runs inside `spawn_blocking`.
 - **Indexer** (`src/indexer/`): single pipeline consuming dirty paths from an `mpsc::UnboundedReceiver`. Computes per-file SHA256, short-circuits on unchanged files, splits into chunks, consults `embedding_cache` before calling the embedder (batched), persists chunks+vectors+FTS atomically, bumps `last_reindex_ms`. Both the startup walker and the live watcher feed the same channel.
 - **Watcher** (`src/watch/`): `notify` recursive watcher with a 500ms-polled in-house debounce map (`HashMap<PathBuf, Instant>`). Filters to `.md` files, rejects `.git` / `.obsidian` / `node_modules` / dot-files. Debounce window comes from `DOCINDEX_DEBOUNCE_MS` (default 5s).
@@ -20,7 +20,7 @@
 See `src/store/schema.sql`. Notable tables:
 - `chunks` — canonical chunk rows; uniqueness on `(path, chunk_idx)`.
 - `chunks_fts` — contentless FTS5 over `chunks`, `tokenize='porter unicode61'`.
-- `chunks_vec` — `vec0` virtual table, `embedding FLOAT[768] distance_metric=cosine`.
+- `chunks_vec` — `vec0` virtual table, `embedding FLOAT[<DOCINDEX_EMBED_DIM>] distance_metric=cosine` (the dim literal is rendered at `Store::open` time from config).
 - `embedding_cache` — content-hashed embedding cache (rename-safe).
 - `files` — per-path `{content_hash, mtime_ns, indexed_at}` for the startup diff.
 - `meta` — `schema_version=2`, `embedding_model`, `embedding_dim`, `last_full_scan`.
@@ -38,7 +38,7 @@ See `src/store/schema.sql`. Notable tables:
 Keyed by `content_hash`. Rename/move of a chunk with identical text skips the API call.
 
 ## sqlite-vec loading
-`src/store/mod.rs` registers the `sqlite3_vec_init` C function via `rusqlite::ffi::sqlite3_auto_extension` exactly once per process (`OnceLock`). Every subsequent `Connection::open` loads the extension before any SQL runs, so the schema can `CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding FLOAT[768] distance_metric=cosine)`. The store calls `SELECT vec_version()` right after open and errors hard if the extension isn't present — no silent fallback.
+`src/store/mod.rs` registers the `sqlite3_vec_init` C function via `rusqlite::ffi::sqlite3_auto_extension` exactly once per process (`OnceLock`). Every subsequent `Connection::open` loads the extension before any SQL runs. `Store::open` first applies the base `schema.sql` (chunks, FTS5, cache, files, meta), then renders the `chunks_vec` DDL from the configured dim — `CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding FLOAT[<embed_dim>] distance_metric=cosine)` — and executes it, then checks `meta.embedding_dim` and refuses to start on mismatch. The store also calls `SELECT vec_version()` right after open and errors hard if the extension isn't present — no silent fallback.
 
 ## Concurrency model
 - `main.rs` builds a multi-thread tokio runtime.

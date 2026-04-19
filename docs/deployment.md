@@ -40,7 +40,9 @@ DOCINDEX_LISTEN=100.83.46.59:7777
 DOCINDEX_BEARER=<random 32-char secret>
 GEMINI_API_KEY=<from Google AI Studio>
 DOCINDEX_EMBED_MODEL=gemini-embedding-001
-DOCINDEX_EMBED_DIM=768
+# 3072 is gemini-embedding-001's native dim. 768/1536 are valid Matryoshka
+# truncations if you want to trade a little quality for disk/ANN cost.
+DOCINDEX_EMBED_DIM=3072
 DOCINDEX_DEBOUNCE_MS=5000
 DOCINDEX_HTTP_TIMEOUT_MS=30000
 DOCINDEX_LOG_FORMAT=json
@@ -131,3 +133,24 @@ The DB version is stored in `meta.schema_version`. Phase 2 is at `2`. When bumpi
 1. Back up `index.db` first (`cp index.db index.db.bak`).
 2. Deploy a binary that handles the new version.
 3. On first boot it will apply migrations (or error if the on-disk version is ahead).
+
+## Changing the embedding dim
+
+`DOCINDEX_EMBED_DIM` is baked into the `chunks_vec` DDL *and* cached in `meta.embedding_dim`. The store refuses to open when the two disagree — you'll see:
+
+```
+store: embedding_dim on disk is <stored>, config says <new> — refusing to mix. Delete index.db to reindex at new dim.
+```
+
+To switch dim (e.g. 768 → 3072):
+
+```sh
+systemctl --user stop docindex-server
+# Update the env file:
+#   sed -i 's/^DOCINDEX_EMBED_DIM=.*/DOCINDEX_EMBED_DIM=3072/' ~/.config/docindex/env
+rm ~/index.db ~/index.db-wal ~/index.db-shm 2>/dev/null || true
+systemctl --user start docindex-server
+journalctl --user -u docindex-server -f   # watch the reindex
+```
+
+The initial scan will re-embed every file at the new dim. Embedding cache rows at the previous dim are swept on open, so there's no chance of mixed-dim reads.

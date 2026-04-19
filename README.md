@@ -5,7 +5,7 @@ Semantic + BM25 search server for personal docs/notes. Indexes a folder of markd
 ## Stack
 - **Language:** Rust (edition 2024, MSRV 1.90)
 - **Storage:** SQLite (`rusqlite`, bundled) + [sqlite-vec](https://github.com/asg017/sqlite-vec) (vectors, `vec0` cosine) + FTS5 (BM25)
-- **Embeddings:** Google `gemini-embedding-001` (Matryoshka, dim 768) — or deterministic `fake` backend for tests
+- **Embeddings:** Google `gemini-embedding-001` at the configured dim (default 3072 native; Matryoshka-truncatable via `DOCINDEX_EMBED_DIM`) — or deterministic `fake` backend for tests
 - **Async runtime:** `tokio` (multi-thread)
 - **HTTP server:** `axum` 0.8
 - **HTTP client:** `reqwest` + rustls

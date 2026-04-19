@@ -91,7 +91,7 @@ Obsidian mobile ──Tailscale──►  docindex-server  ──►  SQLite (in
 - **SQLite:** `rusqlite` 0.34 with `bundled` + `load_extension` features (statically linked libsqlite3)
 - **Vector search:** `sqlite-vec` 0.1.x — **loaded as a real SQLite extension** via `sqlite3_auto_extension`, exposing the `vec0` virtual table (`distance_metric=cosine`)
 - **FTS:** SQLite FTS5 (compiled into the bundled libsqlite3), `tokenize='porter unicode61'`
-- **Embeddings:** Google `gemini-embedding-001`, Matryoshka dim 768, task-asymmetric (doc/query). `AnyEmbedder` enum for static dispatch (native async fn in traits → not dyn-compatible).
+- **Embeddings:** Google `gemini-embedding-001` at native dim 3072 by default (Matryoshka-truncatable via `DOCINDEX_EMBED_DIM` — 768 is a smaller tradeoff for tiny scale), task-asymmetric (doc/query). `AnyEmbedder` enum for static dispatch (native async fn in traits → not dyn-compatible).
 - **Hashing:** `sha2` + `hex`
 - **Filesystem walker:** `walkdir`
 - **File watcher:** `notify` 8 with in-house debounce (default 5s, overridable via `DOCINDEX_DEBOUNCE_MS`)
@@ -164,7 +164,7 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
 );
 
 CREATE VIRTUAL TABLE chunks_vec USING vec0(
-  embedding FLOAT[768] distance_metric=cosine
+  embedding FLOAT[<embed_dim>] distance_metric=cosine  -- rendered from DOCINDEX_EMBED_DIM at open
 );
 
 CREATE TABLE embedding_cache (
@@ -280,7 +280,7 @@ The bind address is validated at startup in `config.rs`: `0.0.0.0:*` and `[::]:*
 - **FTS5 MATCH is picky:** Parens, colons, quotes, backslashes are operators. Sanitize user input through `fts_query_from_user`: tokenize on alphanumerics/`_-`, wrap each in double quotes, implicit AND. Drop tokens ≤ 1 char. Errors from FTS fall back to an empty candidate list so the semantic side still ranks.
 - **rusqlite is !Sync:** Don't call it from async code directly. Wrap every SQL call in `tokio::task::spawn_blocking(move || { let guard = store.lock()...; guard.method() })`. Keep the guard lifetime short.
 - **Gemini task types:** `RETRIEVAL_DOCUMENT` for indexing, `RETRIEVAL_QUERY` for search. Getting this wrong silently degrades quality.
-- **Matryoshka dim:** Request `outputDimensionality: 768` at embed time. Storing 3072 "just in case" quadruples disk and slows ANN for zero recall gain at this scale.
+- **Matryoshka dim:** Request `outputDimensionality: <DOCINDEX_EMBED_DIM>` at embed time (default 3072 — the model's native size). Smaller dims (768, 1536) are Matryoshka-valid and save disk/ANN cost; larger than 3072 is not meaningful for this model. The dim is baked into the `chunks_vec` DDL *and* cached under `meta.embedding_dim` — the store refuses to open if the on-disk dim doesn't match `DOCINDEX_EMBED_DIM`. Wipe `index.db` to change dim.
 - **Debounce state:** The watcher's debounce map is keyed by the event path as `notify` reports it; the relevance filter rejects `.git`, `.obsidian`, `node_modules`, and dot-files. Symlink-containing vaults may dedupe unexpectedly — don't rely on symlinks inside the vault.
 - **Dev-loopback bypass:** `DOCINDEX_ALLOW_LOOPBACK=true` is **dev/test only**. Production MUST leave it unset/false — the Tailscale boundary is not optional.
 - **Unicode in FTS5:** Use `tokenize='porter unicode61'`, not the default — the default strips non-ASCII.
