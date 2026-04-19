@@ -2,6 +2,9 @@
 
 Semantic + BM25 search server for personal docs/notes. Indexes a folder of markdown, serves a tiny HTTP API over Tailscale. Built to power an Obsidian mobile plugin and anything else that wants ranked retrieval against a personal vault.
 
+## What it indexes
+Files with extension `.md` or `.txt` (case-insensitive) anywhere under `DOCINDEX_VAULT_DIR`. Dot-files, `.git`, `.obsidian`, and `node_modules` are skipped. Heading-less files (plain `.txt`) flow through the chunker's 500-word fallback path.
+
 ## Stack
 - **Language:** Rust (edition 2024, MSRV 1.90)
 - **Storage:** SQLite (`rusqlite`, bundled) + [sqlite-vec](https://github.com/asg017/sqlite-vec) (vectors, `vec0` cosine) + FTS5 (BM25)

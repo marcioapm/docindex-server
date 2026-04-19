@@ -250,6 +250,8 @@ When you change how a file is indexed, change it once in `indexer::reindex_one` 
 
 Input: raw markdown bytes. Output: an ordered `Vec<Chunk>`. Chunks are deterministic — same input → same output, including byte-identical content and identical `content_hash`. The chunker does **not** call the embedder or the store; it's pure.
 
+Indexable extensions live in `walk::INDEXABLE_EXTENSIONS` (`md`, `txt`; case-insensitive) and are shared by the walker and the watcher. `.txt` files have no ATX headings, so they naturally flow through the 500-word fallback path — one chunk when short, heading-less sub-chunks with 50-word overlap when long.
+
 ### Embedding cache
 
 Before calling Gemini, the indexer hashes the chunk content (`sha256`) and consults `embedding_cache`. A hit returns the cached vector; a miss is batched into a single embedder call, then stored keyed by hash. **Renames and reorganizations never re-embed** — this is load-bearing for cost.

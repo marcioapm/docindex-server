@@ -67,3 +67,42 @@ def test_search_respects_limit(spawn_server, tmp_path):
     r = server.post("/search", {"query": "language database vpn markdown", "limit": 2})
     assert r.status_code == 200
     assert len(r.json()["hits"]) <= 2
+
+
+# Mixed .md + .txt vault: the walker accepts both (case-insensitive), and the
+# chunker falls back to the 500-word split for heading-less .txt files. Both
+# should be searchable without any per-extension tweaks in the server.
+MIXED_VAULT_FILES = {
+    "rust.md": "# Rust\n\nRust is a systems programming language with ownership and borrow checking.\n",
+    "plaintext.txt": "Kafka is a distributed commit log with partitioned topics and consumer groups.\n",
+    "UPPER.TXT": "Zebra stripes help confuse predators with optical patterns.\n",
+}
+
+
+def _write_mixed_vault(tmp_path: pathlib.Path) -> pathlib.Path:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    for name, content in MIXED_VAULT_FILES.items():
+        (vault / name).write_text(content)
+    return vault
+
+
+@pytest.mark.parametrize(
+    "query,expected_file",
+    [
+        ("rust ownership borrow", "rust.md"),
+        ("kafka commit log partitioned", "plaintext.txt"),
+        ("zebra stripes predators", "UPPER.TXT"),
+    ],
+)
+def test_search_indexes_md_and_txt(spawn_server, tmp_path, query, expected_file):
+    vault = _write_mixed_vault(tmp_path)
+    server = spawn_server(vault)
+    server.wait_for_chunks(len(MIXED_VAULT_FILES))
+    r = server.post("/search", {"query": query, "limit": 5})
+    assert r.status_code == 200, r.text
+    hits = r.json()["hits"]
+    assert hits, f"expected at least one hit for {query!r}"
+    assert hits[0]["path"].endswith(expected_file), (
+        f"top hit {hits[0]['path']} for query {query!r}"
+    )

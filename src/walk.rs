@@ -48,10 +48,23 @@ impl WalkError {
 /// Directory names we never descend into, regardless of depth.
 const SKIPPED_DIRS: &[&str] = &[".git", ".obsidian", "node_modules"];
 
-/// Recursively scan `root` and return one `FileState` per markdown file.
+/// File extensions (lowercase, no leading dot) the indexer will pick up.
+/// Matched case-insensitively. Keep this list small — anything listed here
+/// must be sensible to feed straight into the chunker.
+pub const INDEXABLE_EXTENSIONS: &[&str] = &["md", "txt"];
+
+/// True iff `ext` matches one of [`INDEXABLE_EXTENSIONS`] case-insensitively.
+pub fn is_indexable_extension(ext: &str) -> bool {
+    INDEXABLE_EXTENSIONS
+        .iter()
+        .any(|known| ext.eq_ignore_ascii_case(known))
+}
+
+/// Recursively scan `root` and return one `FileState` per indexable file.
 ///
 /// Rules:
-/// * Only files ending in `.md` (case-insensitive) are returned.
+/// * Only files whose extension is in [`INDEXABLE_EXTENSIONS`]
+///   (case-insensitive) are returned.
 /// * Directories named in [`SKIPPED_DIRS`] are skipped, as is any directory
 ///   whose name starts with `.`.
 /// * Files whose names start with `.` are skipped.
@@ -97,7 +110,7 @@ pub fn scan(root: &Path) -> Result<Vec<FileState>, WalkError> {
         }
         let path = entry.path();
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if !ext.eq_ignore_ascii_case("md") {
+        if !is_indexable_extension(ext) {
             continue;
         }
         out.push(hash_file(path)?);
@@ -155,8 +168,8 @@ mod tests {
         write(root, "b.md", "beta");
         write(root, "a.md", "alpha");
         write(root, "notes/c.md", "gamma");
-        write(root, "README.txt", "nope");
         write(root, "image.png", "binary");
+        write(root, "draft.rtf", "nope");
         write(root, ".secret.md", "nope");
         write(root, ".git/config.md", "nope");
         write(root, ".obsidian/plugins.md", "nope");
@@ -188,6 +201,25 @@ mod tests {
     }
 
     #[test]
+    fn mixes_md_and_txt_sorted() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, "readme.md", "md body");
+        write(root, "notes.txt", "txt body");
+        write(root, "a.TXT", "upper txt");
+        write(root, "draft.rtf", "skip");
+        write(root, "image.png", "skip");
+
+        let got = scan(root).unwrap();
+        let names: Vec<_> = got
+            .iter()
+            .map(|fs| fs.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // Path-sorted; .rtf and .png rejected; case-insensitive .TXT kept.
+        assert_eq!(names, vec!["a.TXT", "notes.txt", "readme.md"]);
+    }
+
+    #[test]
     fn non_directory_errors() {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("not-a-dir");
@@ -207,5 +239,15 @@ mod tests {
         write(dir.path(), "UPPER.MD", "x");
         let got = scan(dir.path()).unwrap();
         assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn is_indexable_extension_matches() {
+        assert!(is_indexable_extension("md"));
+        assert!(is_indexable_extension("MD"));
+        assert!(is_indexable_extension("txt"));
+        assert!(is_indexable_extension("TXT"));
+        assert!(!is_indexable_extension("rtf"));
+        assert!(!is_indexable_extension(""));
     }
 }

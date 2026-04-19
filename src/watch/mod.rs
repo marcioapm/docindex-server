@@ -19,6 +19,8 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::walk::is_indexable_extension;
+
 #[derive(Debug, Error)]
 pub enum WatchError {
     #[error("watch: {0}")]
@@ -30,7 +32,7 @@ pub enum WatchError {
 const SKIPPED_DIR_SEGMENTS: &[&str] = &[".git", ".obsidian", "node_modules"];
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Watch `vault_dir` recursively and push any markdown path that changes
+/// Watch `vault_dir` recursively and push any indexable path that changes
 /// into `tx`. Returns once `cancel` resolves.
 ///
 /// The task owns the watcher for its lifetime — dropping the returned
@@ -133,13 +135,13 @@ fn flush(
 }
 
 fn is_relevant(path: &Path) -> bool {
-    // Filter: markdown only, skip dot-files and known noisy directories.
-    let is_md = path
+    // Filter: indexable extensions only, skip dot-files and known noisy dirs.
+    let ext_ok = path
         .extension()
         .and_then(|s| s.to_str())
-        .map(|s| s.eq_ignore_ascii_case("md"))
+        .map(is_indexable_extension)
         .unwrap_or(false);
-    if !is_md {
+    if !ext_ok {
         return false;
     }
     for comp in path.components() {
@@ -164,7 +166,9 @@ mod tests {
     fn relevance_filters() {
         assert!(is_relevant(&PathBuf::from("/vault/note.md")));
         assert!(is_relevant(&PathBuf::from("/vault/sub/note.MD")));
-        assert!(!is_relevant(&PathBuf::from("/vault/note.txt")));
+        assert!(is_relevant(&PathBuf::from("/vault/plain.txt")));
+        assert!(is_relevant(&PathBuf::from("/vault/sub/plain.TXT")));
+        assert!(!is_relevant(&PathBuf::from("/vault/draft.rtf")));
         assert!(!is_relevant(&PathBuf::from("/vault/.hidden.md")));
         assert!(!is_relevant(&PathBuf::from("/vault/.git/a.md")));
         assert!(!is_relevant(&PathBuf::from("/vault/node_modules/a.md")));
