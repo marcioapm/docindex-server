@@ -46,7 +46,7 @@ Analyze recently modified code and apply refinements that:
 - `src/indexer/mod.rs` is the single indexing pipeline; walker and watcher both feed it via the same channel.
 - Embedding cache lookup is always the first step before a Gemini call.
 - Every HTTP handler path: bearer auth layer → handler → validate input → call into `src/search` or `src/store` via `spawn_blocking` where needed → `ApiError` / structured JSON response.
-- Vector blobs are little-endian packed `f32[768]`; serialize consistently.
+- Vector blobs are little-endian packed `f32[DOCINDEX_EMBED_DIM]` (default 3072); serialize consistently.
 - Test files colocated with source using `#[cfg(test)] mod tests`; table-driven tests preferred where they read well.
 - Python E2E tests (`tests/suites/*.py`) spawn the real release binary and curl it; keep them deterministic (fake embedder, ephemeral ports, `DOCINDEX_ALLOW_LOOPBACK=true`).
 

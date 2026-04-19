@@ -46,10 +46,10 @@ Follow these steps precisely:
 - Bind address validated as a Tailscale IP; never `0.0.0.0`. `DOCINDEX_ALLOW_LOOPBACK` is a dev bypass only.
 - Bearer auth middleware actually applied to every non-`/health` route (not just declared).
 - Gemini client uses `RETRIEVAL_DOCUMENT` for indexing and `RETRIEVAL_QUERY` for search — mismatches are real bugs.
-- Matryoshka dim is 768 and matches `meta.embedding_dim`; the store refuses mixed dims.
+- Matryoshka dim defaults to 3072 (native `gemini-embedding-001`) and is settable via `DOCINDEX_EMBED_DIM`; it must match `meta.embedding_dim`; the store refuses mixed dims.
 - Any `chunks` mutation also updates `chunks_fts` (FTS5 is contentless and NOT auto-synced).
 - `chunks_vec` is a real `vec0` virtual table; `sqlite-vec` is loaded via `rusqlite::ffi::sqlite3_auto_extension` at process startup (or per-connection init). No silent fallback to a BLOB column.
-- Vector blobs are little-endian packed `f32[768]`.
+- Vector blobs are little-endian packed `f32[DOCINDEX_EMBED_DIM]` (default 3072).
 - Rusqlite is synchronous — any DB call from an async context MUST be inside `tokio::task::spawn_blocking`.
 - Walker + watcher feed the same indexing pipeline; no duplicated chunking/embedding logic.
 - Embedding cache keyed by `content_hash` — renames/moves must not re-embed.
