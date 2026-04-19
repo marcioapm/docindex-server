@@ -246,6 +246,12 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 
 When you change how a file is indexed, change it once in `indexer::reindex_one` / `resolve_embeddings`; never duplicate logic between walker and watcher.
 
+### Path invariant: everything downstream of the walker/watcher is vault-relative
+
+The mpsc channel, `chunks.path`, `files.path`, and every `/search` / `/similar` `hit.path` MUST be vault-relative (e.g. `notes/foo.md`, never `/home/.../vault/notes/foo.md`). Absolute paths are rejected at the indexer boundary (`reindex_one` errors if given one) and stripped at the walker/watcher boundary (via `canonicalize()` + `strip_prefix` against the canonicalized vault root, rejecting symlink escapes with a warning).
+
+This matches Obsidian's `TFile.path` so the plugin can pass `hit.path` straight into `openLinkText()` / `getAbstractFileByPath()` with no rewriting. Existing DBs are migrated in place on first open via `Store::migrate_paths_to_relative(vault_dir)` — idempotent via `meta.path_schema_version = 1`, refuses (logged, not fatal) if any row is absolute but outside the vault.
+
 ### Chunker contract
 
 Input: raw markdown bytes. Output: an ordered `Vec<Chunk>`. Chunks are deterministic — same input → same output, including byte-identical content and identical `content_hash`. The chunker does **not** call the embedder or the store; it's pure.

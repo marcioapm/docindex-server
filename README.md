@@ -23,6 +23,8 @@ POST /similar  { path,  limit=10 }    -> same shape
 ```
 `/search` and `/similar` require `Authorization: Bearer $DOCINDEX_BEARER`. `limit` is clamped to [1, 50]. Errors return `{error, code}` JSON.
 
+Every `hit.path` (and the `path` accepted by `/similar`) is **vault-relative** — e.g. `"notes/foo.md"`, never `/home/…/vault/notes/foo.md`. This matches Obsidian's `TFile.path` so the plugin can feed paths straight into `openLinkText()` / `getAbstractFileByPath()` without rewriting. Databases created before v0.2.0 are migrated in place on first open: any `chunks.path` / `files.path` that are absolute but still inside `DOCINDEX_VAULT_DIR` get rewritten atomically, and rows pointing outside the vault cause the migration to refuse (logged, not fatal) so operators can reconcile. Once complete, `meta.path_schema_version = 1` short-circuits the scan on every subsequent boot.
+
 ## Ranking
 Hybrid: top-30 cosine (sqlite-vec `chunks_vec` cosine) + top-30 BM25 (FTS5), fused with Reciprocal Rank Fusion (k=60).
 

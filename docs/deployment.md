@@ -134,6 +134,28 @@ The DB version is stored in `meta.schema_version`. Phase 2 is at `2`. When bumpi
 2. Deploy a binary that handles the new version.
 3. On first boot it will apply migrations (or error if the on-disk version is ahead).
 
+## Path-normalization migration (v0.2.0+)
+
+Databases indexed before v0.2.0 stored absolute paths in `chunks.path` / `files.path` (e.g. `/home/docindex/vault/notes/foo.md`). Since v0.2.0 all rows are vault-relative (`notes/foo.md`).
+
+**You do not need to wipe the DB or re-index** — on first boot of a v0.2.0+ binary, `Store::migrate_paths_to_relative(vault_dir)` runs in a single transaction:
+
+- If every absolute row lies inside the configured `DOCINDEX_VAULT_DIR`, `chunks.path` and `files.path` are rewritten with `substr(path, length(vault_dir) + 2)` and `meta.path_schema_version` is set to `1`.
+- If any row points outside the vault (e.g. the vault was moved without also moving the DB), the migration **refuses** — it logs the offending row count and proceeds without touching data. The indexer will still start, but searches may miss those rows until you reconcile (either move the DB back next to the original vault, or accept the re-index and wipe).
+- Once `path_schema_version = 1` is set, subsequent boots short-circuit the scan — the check is a single `meta` read.
+
+What you'll see in the log on a successful first migration:
+
+```
+INFO migrated N rows from absolute to relative paths (chunks=A, files=B, vault=...)
+```
+
+And on an already-migrated DB:
+
+```
+DEBUG path migration: already at path_schema_version=1
+```
+
 ## Changing the embedding dim
 
 `DOCINDEX_EMBED_DIM` is baked into the `chunks_vec` DDL *and* cached in `meta.embedding_dim`. The store refuses to open when the two disagree — you'll see:

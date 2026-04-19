@@ -6,12 +6,12 @@
 - Single static binary, SQLite storage, minimal ops.
 
 ## Components
-- **Walker** (`src/walk.rs`): initial full scan, content-hash diff → dirty set. Accepts the extensions in `walk::INDEXABLE_EXTENSIONS` (currently `.md` and `.txt`, case-insensitive).
+- **Walker** (`src/walk.rs`): initial full scan, content-hash diff → dirty set. Accepts the extensions in `walk::INDEXABLE_EXTENSIONS` (currently `.md` and `.txt`, case-insensitive). Emits **vault-relative** paths only — entries whose canonical location escapes the canonicalized vault root (e.g. via a symlink) are logged and skipped.
 - **Chunker** (`src/chunk.rs`): heading-aware (H1/H2/H3) + ~500-token fallback with 50-token overlap. Pure. Heading-less inputs (plain `.txt`) flow through the fallback path.
 - **Embedder** (`src/embed/`): Gemini `gemini-embedding-001`, Matryoshka-truncatable — the configured embedding dim (default 3072) is requested via `outputDimensionality` and baked into storage, task-asymmetric (`RETRIEVAL_DOCUMENT` for indexing, `RETRIEVAL_QUERY` for search). `Fake` embedder for tests (SHA256-seeded, L2-normalized). `AnyEmbedder` enum for static dispatch (native async fn in traits → not dyn-compatible).
-- **Store** (`src/store/`): SQLite via `rusqlite` (`bundled` + `load_extension`) with `sqlite-vec` loaded as a real extension (`vec0` virtual table, `distance_metric=cosine`) and FTS5 for BM25. Shared across tasks via `Arc<Mutex<Store>>`; every SQL call runs inside `spawn_blocking`.
-- **Indexer** (`src/indexer/`): single pipeline consuming dirty paths from an `mpsc::UnboundedReceiver`. Computes per-file SHA256, short-circuits on unchanged files, splits into chunks, consults `embedding_cache` before calling the embedder (batched), persists chunks+vectors+FTS atomically, bumps `last_reindex_ms`. Both the startup walker and the live watcher feed the same channel.
-- **Watcher** (`src/watch/`): `notify` recursive watcher with a 500ms-polled in-house debounce map (`HashMap<PathBuf, Instant>`). Filters to `walk::INDEXABLE_EXTENSIONS` (`.md`, `.txt`), rejects `.git` / `.obsidian` / `node_modules` / dot-files. Debounce window comes from `DOCINDEX_DEBOUNCE_MS` (default 5s).
+- **Store** (`src/store/`): SQLite via `rusqlite` (`bundled` + `load_extension`) with `sqlite-vec` loaded as a real extension (`vec0` virtual table, `distance_metric=cosine`) and FTS5 for BM25. Shared across tasks via `Arc<Mutex<Store>>`; every SQL call runs inside `spawn_blocking`. On open the server calls `migrate_paths_to_relative(vault_dir)` which idempotently rewrites any pre-0.2.0 absolute paths in `chunks.path` / `files.path` to vault-relative form (or refuses, logged-not-fatal, if any row points outside the vault); success is recorded in `meta.path_schema_version = 1`.
+- **Indexer** (`src/indexer/`): single pipeline consuming **relative** dirty paths from an `mpsc::UnboundedReceiver<PathBuf>`. `reindex_one` rejects absolute paths defensively, then joins them onto `ctx.vault_dir` for I/O while using the relative string as the DB key. Computes per-file SHA256, short-circuits on unchanged files, splits into chunks, consults `embedding_cache` before calling the embedder (batched), persists chunks+vectors+FTS atomically, bumps `last_reindex_ms`. Both the startup walker and the live watcher feed the same channel.
+- **Watcher** (`src/watch/`): `notify` recursive watcher with a 500ms-polled in-house debounce map (`HashMap<PathBuf, Instant>`). Strips the canonicalized vault prefix before inserting into the debounce map, so the indexer only ever sees relative paths. Filters to `walk::INDEXABLE_EXTENSIONS` (`.md`, `.txt`), rejects `.git` / `.obsidian` / `node_modules` / dot-files. Debounce window comes from `DOCINDEX_DEBOUNCE_MS` (default 5s).
 - **Search** (`src/search/`): hybrid BM25+semantic retrieval with Reciprocal Rank Fusion (k=60, candidate pool 30 per ranker). Pure `fuse_rrf` is unit-tested. FTS queries are sanitized (`fts_query_from_user`) — tokenized to alphanumerics+`_-`, each token double-quoted, implicit AND. Snippets are heading-stripped, whitespace-collapsed, 240 chars.
 - **API** (`src/api/`): axum 0.8 router with `/health` (public), `/search` + `/similar` (bearer-protected via middleware). Structured errors as `{error, code}` JSON. `AppState` is `Send+Sync` (statically asserted in `server.rs`).
 - **Server** (`src/server.rs`): wires everything; spawns indexer first, then watcher + initial scan, serves HTTP with `with_graceful_shutdown` that listens for SIGINT + SIGTERM (Unix) / Ctrl-C (otherwise). Bind is Tailscale-IP only (config rejects `0.0.0.0`/`[::]`); dev/test can opt in via `DOCINDEX_ALLOW_LOOPBACK=true`.
@@ -23,7 +23,14 @@ See `src/store/schema.sql`. Notable tables:
 - `chunks_vec` — `vec0` virtual table, `embedding FLOAT[<DOCINDEX_EMBED_DIM>] distance_metric=cosine` (the dim literal is rendered at `Store::open` time from config).
 - `embedding_cache` — content-hashed embedding cache (rename-safe).
 - `files` — per-path `{content_hash, mtime_ns, indexed_at}` for the startup diff.
-- `meta` — `schema_version=2`, `embedding_model`, `embedding_dim`, `last_full_scan`.
+- `meta` — `schema_version=2`, `path_schema_version=1` (after the absolute→relative path migration), `embedding_model`, `embedding_dim`, `last_full_scan`.
+
+## Path invariants
+- The mpsc channel, `chunks.path`, `files.path`, and every `/search` / `/similar` `hit.path` are **always vault-relative** (e.g. `notes/foo.md`). Absolute paths never leave the walker / watcher boundary.
+- `walk::relativize_inside(vault, path)` and `watch::strip_vault_prefix` canonicalize the candidate and the vault root before stripping; any candidate that would escape (via symlinks or `..`) is rejected with a warning, never silently written through.
+- `indexer::reindex_one` accepts relative paths only and errors if given an absolute one — this is the defensive backstop that guarantees the channel contract.
+- Migration (`Store::migrate_paths_to_relative(vault_dir)`): idempotent, transactional, refuses when any absolute row lies outside `vault_dir`. Logs `migrated N rows from absolute to relative paths` on success and sets `meta.path_schema_version = 1` so subsequent boots short-circuit.
+- Clients (notably the Obsidian plugin) treat `hit.path` as directly compatible with `TFile.path` — no stripping, no prefixing.
 
 ## Ranking
 1. Embed query with `RETRIEVAL_QUERY`.
