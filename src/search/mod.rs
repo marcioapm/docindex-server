@@ -29,6 +29,38 @@ pub const SNIPPET_MAX: usize = 240;
 /// Hard ceiling on `limit` — keeps handlers from accidentally blowing up.
 pub const LIMIT_MAX: usize = 50;
 
+/// Default smoothing constant for the *display* normalization. Smaller than
+/// `RRF_K` on purpose: ranking wants stability in the long tail, but display
+/// wants the rank-1 doc to score ~1.0 and rank-10ish to score ~0.55 so a
+/// single threshold is meaningful across queries.
+pub const DEFAULT_DISPLAY_K: f64 = 10.0;
+/// Default weight for the semantic branch in `score_normalized`.
+pub const DEFAULT_WEIGHT_VEC: f64 = 0.55;
+/// Default weight for the BM25 branch in `score_normalized`.
+pub const DEFAULT_WEIGHT_BM25: f64 = 0.45;
+
+/// Parameters for the query-independent display score.
+///
+/// Ranking still uses RRF with `k=60`; this struct only controls the 0..1
+/// `score_normalized` field attached to each hit (used by the plugin for
+/// threshold filtering + percentage display).
+#[derive(Debug, Clone, Copy)]
+pub struct DisplayScoring {
+    pub k: f64,
+    pub w_vec: f64,
+    pub w_bm25: f64,
+}
+
+impl Default for DisplayScoring {
+    fn default() -> Self {
+        Self {
+            k: DEFAULT_DISPLAY_K,
+            w_vec: DEFAULT_WEIGHT_VEC,
+            w_bm25: DEFAULT_WEIGHT_BM25,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SearchError {
     #[error("search: {0}")]
@@ -46,6 +78,11 @@ pub enum SearchError {
 }
 
 /// Single search hit returned in API responses.
+///
+/// `score` is kept for back-compat; it is identical to `score_rrf` (the RRF
+/// fusion score used for ranking). `score_normalized` is the 0..1
+/// query-independent display score derived from per-branch ranks via
+/// [`normalize_score`].
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Hit {
     pub path: String,
@@ -53,6 +90,8 @@ pub struct Hit {
     pub heading_path: String,
     pub snippet: String,
     pub score: f64,
+    pub score_rrf: f64,
+    pub score_normalized: f64,
     pub chunk_id: i64,
 }
 
@@ -81,8 +120,15 @@ pub async fn search(
     }
     let fts_query = fts_query_from_user(query);
     let (vec_hits, fts_hits) = run_candidate_queries(store.clone(), q_vec, fts_query).await?;
-    let fused = fuse_rrf(&rank_ids(&vec_hits), &rank_ids(&fts_hits), RRF_K);
-    hydrate(store, &fused, clamp_limit(limit), None).await
+    let fused = fuse_rrf_ranked(&rank_ids(&vec_hits), &rank_ids(&fts_hits), RRF_K);
+    hydrate(
+        store,
+        &fused,
+        clamp_limit(limit),
+        None,
+        DisplayScoring::default(),
+    )
+    .await
 }
 
 /// Find chunks similar to the stored content at `path`.
@@ -148,8 +194,15 @@ pub async fn similar(
 
     let fts_query = fts_query_from_user(&bag);
     let (vec_hits, fts_hits) = run_candidate_queries(store.clone(), q_vec, fts_query).await?;
-    let fused = fuse_rrf(&rank_ids(&vec_hits), &rank_ids(&fts_hits), RRF_K);
-    hydrate(store, &fused, clamp_limit(limit), Some(path.to_string())).await
+    let fused = fuse_rrf_ranked(&rank_ids(&vec_hits), &rank_ids(&fts_hits), RRF_K);
+    hydrate(
+        store,
+        &fused,
+        clamp_limit(limit),
+        Some(path.to_string()),
+        DisplayScoring::default(),
+    )
+    .await
 }
 
 /// Reciprocal Rank Fusion over two ranked lists.
@@ -159,21 +212,88 @@ pub async fn similar(
 /// The return value is sorted by descending score. Ties are broken by
 /// id ascending for determinism.
 pub fn fuse_rrf(a: &[i64], b: &[i64], k: f64) -> Vec<(i64, f64)> {
+    fuse_rrf_ranked(a, b, k)
+        .into_iter()
+        .map(|f| (f.id, f.score_rrf))
+        .collect()
+}
+
+/// Fusion result that also carries the per-branch rank of each doc.
+///
+/// `v_rank` / `b_rank` are 1-based and `None` when the doc was missing from
+/// that branch. These ranks feed into [`normalize_score`] for the
+/// query-independent display score.
+#[derive(Debug, Clone, Copy)]
+pub struct FusedHit {
+    pub id: i64,
+    pub score_rrf: f64,
+    pub v_rank: Option<usize>,
+    pub b_rank: Option<usize>,
+}
+
+/// Rank-preserving variant of [`fuse_rrf`].
+///
+/// Same ordering and scores as `fuse_rrf`, but each entry also carries the
+/// 1-based rank it held in each branch (or `None` if absent). Callers that
+/// only want `(id, score)` can use the thin `fuse_rrf` wrapper.
+pub fn fuse_rrf_ranked(a: &[i64], b: &[i64], k: f64) -> Vec<FusedHit> {
     use std::collections::HashMap;
-    let mut scores: HashMap<i64, f64> = HashMap::new();
-    for list in [a, b] {
-        for (i, id) in list.iter().enumerate() {
-            let rank = (i + 1) as f64;
-            *scores.entry(*id).or_insert(0.0) += 1.0 / (k + rank);
-        }
+    let mut by_id: HashMap<i64, FusedHit> = HashMap::new();
+    for (i, id) in a.iter().enumerate() {
+        let rank = i + 1;
+        let entry = by_id.entry(*id).or_insert(FusedHit {
+            id: *id,
+            score_rrf: 0.0,
+            v_rank: None,
+            b_rank: None,
+        });
+        entry.score_rrf += 1.0 / (k + rank as f64);
+        entry.v_rank.get_or_insert(rank);
     }
-    let mut out: Vec<(i64, f64)> = scores.into_iter().collect();
+    for (i, id) in b.iter().enumerate() {
+        let rank = i + 1;
+        let entry = by_id.entry(*id).or_insert(FusedHit {
+            id: *id,
+            score_rrf: 0.0,
+            v_rank: None,
+            b_rank: None,
+        });
+        entry.score_rrf += 1.0 / (k + rank as f64);
+        entry.b_rank.get_or_insert(rank);
+    }
+    let mut out: Vec<FusedHit> = by_id.into_values().collect();
     out.sort_by(|x, y| {
-        y.1.partial_cmp(&x.1)
+        y.score_rrf
+            .partial_cmp(&x.score_rrf)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| x.0.cmp(&y.0))
+            .then_with(|| x.id.cmp(&y.id))
     });
     out
+}
+
+/// Per-branch normalized contribution: rank-1 → 1.0, then monotonically
+/// decaying in `rank`. `None` (absent from this branch) → 0.0.
+fn branch_norm(rank: Option<usize>, k: f64) -> f64 {
+    match rank {
+        Some(r) => (k + 1.0) / (k + r as f64),
+        None => 0.0,
+    }
+}
+
+/// Query-independent display score in `[0, 1]`.
+///
+/// `v_rank` / `b_rank` are the 1-based ranks in the vec + BM25 candidate
+/// lists (or `None` if the doc didn't make that list). `k` is the display
+/// smoothing constant (NOT the RRF constant — defaults to
+/// [`DEFAULT_DISPLAY_K`] = 10). `w_vec + w_bm25` should sum to 1.0.
+pub fn normalize_score(
+    v_rank: Option<usize>,
+    b_rank: Option<usize>,
+    k: f64,
+    w_vec: f64,
+    w_bm25: f64,
+) -> f64 {
+    w_vec * branch_norm(v_rank, k) + w_bm25 * branch_norm(b_rank, k)
 }
 
 fn rank_ids<T>(hits: &[(i64, T)]) -> Vec<i64> {
@@ -218,9 +338,10 @@ async fn run_candidate_queries(
 
 async fn hydrate(
     store: Arc<Mutex<Store>>,
-    fused: &[(i64, f64)],
+    fused: &[FusedHit],
     limit: usize,
     exclude_path: Option<String>,
+    display: DisplayScoring,
 ) -> Result<Vec<Hit>, SearchError> {
     let fused = fused.to_vec();
     tokio::task::spawn_blocking(move || -> Result<Vec<Hit>, SearchError> {
@@ -228,11 +349,11 @@ async fn hydrate(
             .lock()
             .map_err(|e| SearchError::Msg(format!("store lock: {e}")))?;
         let mut out = Vec::with_capacity(limit);
-        for (id, score) in fused {
+        for f in fused {
             if out.len() >= limit {
                 break;
             }
-            let Some(row) = guard.chunk_for_hit(id)? else {
+            let Some(row) = guard.chunk_for_hit(f.id)? else {
                 continue;
             };
             if let Some(p) = &exclude_path
@@ -240,14 +361,16 @@ async fn hydrate(
             {
                 continue;
             }
-            out.push(to_hit(&row, score));
+            let norm =
+                normalize_score(f.v_rank, f.b_rank, display.k, display.w_vec, display.w_bm25);
+            out.push(to_hit(&row, f.score_rrf, norm));
         }
         Ok(out)
     })
     .await?
 }
 
-fn to_hit(row: &HitRow, score: f64) -> Hit {
+fn to_hit(row: &HitRow, score_rrf: f64, score_normalized: f64) -> Hit {
     let title = std::path::Path::new(&row.path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -257,7 +380,9 @@ fn to_hit(row: &HitRow, score: f64) -> Hit {
         title,
         heading_path: row.heading_path.clone(),
         snippet: make_snippet(&row.content, SNIPPET_MAX),
-        score,
+        score: score_rrf,
+        score_rrf,
+        score_normalized,
         chunk_id: row.id,
     }
 }
@@ -416,5 +541,78 @@ mod tests {
         // happen to align at the boundary.
         let s = make_snippet(&"word ".repeat(100), 20);
         assert!(s.chars().count() <= 20, "got {s:?}");
+    }
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn normalize_score_rank1_both_is_one() {
+        let s = normalize_score(Some(1), Some(1), 10.0, 0.55, 0.45);
+        assert!(approx(s, 1.0), "got {s}");
+    }
+
+    #[test]
+    fn normalize_score_only_vec_is_w_vec() {
+        let s = normalize_score(Some(1), None, 10.0, 0.55, 0.45);
+        assert!(approx(s, 0.55), "got {s}");
+    }
+
+    #[test]
+    fn normalize_score_only_bm25_is_w_bm25() {
+        let s = normalize_score(None, Some(1), 10.0, 0.55, 0.45);
+        assert!(approx(s, 0.45), "got {s}");
+    }
+
+    #[test]
+    fn normalize_score_rank10_both_mid() {
+        // (10+1)/(10+10) = 0.55 per branch → total 0.55.
+        let s = normalize_score(Some(10), Some(10), 10.0, 0.55, 0.45);
+        assert!(approx(s, 0.55), "got {s}");
+    }
+
+    #[test]
+    fn normalize_score_absent_is_zero() {
+        let s = normalize_score(None, None, 10.0, 0.55, 0.45);
+        assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn normalize_score_rank20_both_roughly_0_367() {
+        let s = normalize_score(Some(20), Some(20), 10.0, 0.55, 0.45);
+        assert!((s - 0.3667).abs() < 0.01, "got {s}");
+    }
+
+    #[test]
+    fn normalize_score_monotonic_in_rank() {
+        let s1 = normalize_score(Some(1), Some(1), 10.0, 0.55, 0.45);
+        let s5 = normalize_score(Some(5), Some(5), 10.0, 0.55, 0.45);
+        let s20 = normalize_score(Some(20), Some(20), 10.0, 0.55, 0.45);
+        assert!(s1 > s5 && s5 > s20, "{s1} {s5} {s20}");
+    }
+
+    #[test]
+    fn fuse_rrf_ranked_tracks_ranks() {
+        let vec_list = vec![10, 20, 30];
+        let fts_list = vec![30, 10, 40];
+        let fused = fuse_rrf_ranked(&vec_list, &fts_list, 60.0);
+        let by_id: std::collections::HashMap<i64, FusedHit> =
+            fused.iter().map(|f| (f.id, *f)).collect();
+        assert_eq!(by_id[&10].v_rank, Some(1));
+        assert_eq!(by_id[&10].b_rank, Some(2));
+        assert_eq!(by_id[&20].v_rank, Some(2));
+        assert_eq!(by_id[&20].b_rank, None);
+        assert_eq!(by_id[&40].v_rank, None);
+        assert_eq!(by_id[&40].b_rank, Some(3));
+    }
+
+    #[test]
+    fn display_scoring_default_matches_constants() {
+        let d = DisplayScoring::default();
+        assert_eq!(d.k, DEFAULT_DISPLAY_K);
+        assert_eq!(d.w_vec, DEFAULT_WEIGHT_VEC);
+        assert_eq!(d.w_bm25, DEFAULT_WEIGHT_BM25);
+        assert!(approx(d.w_vec + d.w_bm25, 1.0));
     }
 }
