@@ -39,6 +39,25 @@ See `src/store/schema.sql`. Notable tables:
 4. Fuse with RRF: `score(d) = Σ 1/(k+rank_i(d))`, `k=60`. Sorted desc; ties broken by id ascending (deterministic).
 5. Hydrate top-N (clamped to [1, 50]) with snippet + `heading_path`.
 
+Every hit carries three score fields:
+- `score` — the RRF score, kept for API back-compat.
+- `score_rrf` — same value as `score`, duplicated for clarity. This is the field the ranker orders on.
+- `score_normalized` — a query-independent display score in `[0, 1]` derived from per-branch ranks. See below.
+
+### Why two `k`s (ranking k=60, display k=10)
+
+RRF's strength is stability in the long tail: `k=60` deliberately dampens differences between rank 1 and rank 2 so a doc that appears in both lists beats one that only appears in one even if it's not top-1 anywhere. That's great for ranking, terrible for a threshold — the absolute RRF score of the top hit drifts with list size and overlap, so "score ≥ 0.3" means different things across queries.
+
+The plugin needs a stable `"is this result good enough to show?"` threshold, so we add a second normalization only for display:
+
+```
+branch_norm(rank, k) = (k + 1) / (k + rank)    if present, else 0
+score_normalized     = W_VEC  * branch_norm(v_rank, k)
+                     + W_BM25 * branch_norm(b_rank, k)
+```
+
+At `k=10`, rank-1 in both branches → `0.55 + 0.45 = 1.0`; rank-10 in both → `0.55`; rank-20 in both → `~0.37`. The default threshold of `0.40` ≈ "rank ≤ 15 in at least one branch, ideally both." Tunable via env (see `docs/deployment.md`, "Tuning display + threshold").
+
 `search::similar(path, limit)` uses the average of the path's stored chunk vectors (L2-normalized) as the semantic query, and the concatenated first-4-chunk content as the FTS bag. Excludes the source path from hydration.
 
 ## Embedding cache

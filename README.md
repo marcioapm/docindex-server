@@ -18,7 +18,7 @@ Files with extension `.md` or `.txt` (case-insensitive) anywhere under `DOCINDEX
 ## Endpoints
 ```
 GET  /health                          -> { ok, indexed_chunks, last_reindex_ms, embedding_model, dim }
-POST /search   { query, limit=10 }    -> { hits: [{ path, title, heading_path, snippet, score, chunk_id }] }
+POST /search   { query, limit=10 }    -> { hits: [{ path, title, heading_path, snippet, score, score_rrf, score_normalized, chunk_id }] }
 POST /similar  { path,  limit=10 }    -> same shape
 ```
 `/search` and `/similar` require `Authorization: Bearer $DOCINDEX_BEARER`. `limit` is clamped to [1, 50]. Errors return `{error, code}` JSON.
@@ -26,7 +26,7 @@ POST /similar  { path,  limit=10 }    -> same shape
 Every `hit.path` (and the `path` accepted by `/similar`) is **vault-relative** — e.g. `"notes/foo.md"`, never `/home/…/vault/notes/foo.md`. This matches Obsidian's `TFile.path` so the plugin can feed paths straight into `openLinkText()` / `getAbstractFileByPath()` without rewriting. Databases created before v0.2.0 are migrated in place on first open: any `chunks.path` / `files.path` that are absolute but still inside `DOCINDEX_VAULT_DIR` get rewritten atomically, and rows pointing outside the vault cause the migration to refuse (logged, not fatal) so operators can reconcile. Once complete, `meta.path_schema_version = 1` short-circuits the scan on every subsequent boot.
 
 ## Ranking
-Hybrid: top-30 cosine (sqlite-vec `chunks_vec` cosine) + top-30 BM25 (FTS5), fused with Reciprocal Rank Fusion (k=60).
+Hybrid: top-30 cosine (sqlite-vec `chunks_vec` cosine) + top-30 BM25 (FTS5), fused with Reciprocal Rank Fusion (`k=60`). Every hit also carries `score_normalized` (0..1, query-independent) for display + threshold filtering — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and the `DOCINDEX_DISPLAY_K` / `DOCINDEX_WEIGHT_VEC` / `DOCINDEX_WEIGHT_BM25` env vars.
 
 ## Chunking
 Heading-aware (H1/H2/H3), ~500-token fallback, 50-token overlap. Stored per chunk: `(path, chunk_idx, heading_path, content, content_hash, mtime_ns)`.

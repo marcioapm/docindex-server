@@ -105,7 +105,7 @@ Obsidian mobile ──Tailscale──►  docindex-server  ──►  SQLite (in
 
 ```
 GET  /health                          → { ok, indexed_chunks, last_reindex_ms, embedding_model, dim }
-POST /search   { query, limit=10 }    → { hits: [{ path, title, heading_path, snippet, score, chunk_id }] }
+POST /search   { query, limit=10 }    → { hits: [{ path, title, heading_path, snippet, score, score_rrf, score_normalized, chunk_id }] }
 POST /similar  { path,  limit=10 }    → same shape
 ```
 
@@ -113,6 +113,14 @@ POST /similar  { path,  limit=10 }    → same shape
 - Bind: `DOCINDEX_LISTEN` **must be a Tailscale IP**, never `0.0.0.0` or `[::]` (enforced at startup in `config.rs`). Loopback is rejected unless `DOCINDEX_ALLOW_LOOPBACK=true` — dev/tests only; production MUST leave it unset/false.
 - Errors: JSON `{ "error": "...", "code": "..." }`. `code` values: `bad_request`, `unauthorized`, `not_found`, `internal`.
 - `limit` is clamped to `[1, 50]`.
+
+### Score fields
+Every hit carries three scores:
+- `score` — the RRF fusion score (kept for back-compat with older plugin versions).
+- `score_rrf` — same value as `score`. This is the field the ranker orders on.
+- `score_normalized` — 0..1, query-independent, derived from per-branch ranks via `W_VEC * branch_norm(v_rank, K) + W_BM25 * branch_norm(b_rank, K)` where `branch_norm(r, K) = (K+1)/(K+r)` (or 0 if absent from that branch). Used by the plugin for "% relevance" and threshold filtering. Defaults: `K = DOCINDEX_DISPLAY_K = 10`, `W_VEC = DOCINDEX_WEIGHT_VEC = 0.55`, `W_BM25 = DOCINDEX_WEIGHT_BM25 = 0.45`.
+
+`score_rrf` is what the server ranks on; `score_normalized` is what the plugin displays + thresholds. See `docs/ARCHITECTURE.md` ("Ranking") and `docs/deployment.md` ("Tuning display + threshold") for the rationale behind two `k`s (ranking k=60, display k=10).
 
 ## Lifecycle
 
@@ -136,6 +144,8 @@ POST /similar  { path,  limit=10 }    → same shape
 5. Return top-N (clamped 1..=50) with snippet + metadata.
 
 Don't normalize raw scores across the two lists — RRF avoids that rabbit hole.
+
+The `score_normalized` field attached to each hit is a separate, query-independent 0..1 score used only for display + the plugin's relevance-threshold filter; it uses a different smoothing constant (`DOCINDEX_DISPLAY_K`, default 10) so rank-1 pins to ~1.0 and a fixed threshold like 0.40 is meaningful across queries. See the "Score fields" sub-section of "Endpoints" above.
 
 `search::similar(path, limit)` uses the mean of the path's chunk vectors (L2-normalized) as the semantic query, concatenated first-4-chunk content as the FTS bag, and excludes the source path from hydration.
 

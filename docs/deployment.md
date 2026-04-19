@@ -176,3 +176,37 @@ journalctl --user -u docindex-server -f   # watch the reindex
 ```
 
 The initial scan will re-embed every file at the new dim. Embedding cache rows at the previous dim are swept on open, so there's no chance of mixed-dim reads.
+
+## Tuning display + threshold
+
+Three env vars control the 0..1 `score_normalized` field the plugin uses for
+"% relevance" and the relevance-threshold filter. None of them affect ranking
+— ranking is always RRF with `k=60`.
+
+- `DOCINDEX_DISPLAY_K` (default `10`) — smoothing constant for the display
+  normalization. Smaller = steeper falloff past rank-1. At the default, rank-1
+  in both branches scores `1.0`, rank-10 scores `~0.55`, rank-20 scores
+  `~0.37`.
+- `DOCINDEX_WEIGHT_VEC` (default `0.55`) — weight of the semantic branch.
+- `DOCINDEX_WEIGHT_BM25` (derived as `1 - DOCINDEX_WEIGHT_VEC` when unset) —
+  weight of the BM25 branch. If both are set explicitly they must sum to
+  `1.0 ± 0.01` or startup fails.
+
+The formula:
+
+```
+branch_norm(rank, K)   = (K + 1) / (K + rank)     if in list, else 0
+score_normalized(doc)  = W_VEC  * branch_norm(v_rank, K)
+                       + W_BM25 * branch_norm(b_rank, K)
+```
+
+Rule of thumb:
+- Bump `DOCINDEX_WEIGHT_VEC` toward `0.7` if you want semantic retrieval to
+  dominate (conceptual queries, exploratory search).
+- Drop it to `~0.40` if your vault is very keyword-heavy (API references,
+  code snippets, glossary-style notes).
+- Lower `DOCINDEX_DISPLAY_K` (e.g. `5`) to make the default threshold behave
+  stricter — only top-5ish results will clear 0.40.
+
+Changes take effect on restart. No DB migration needed; the formula is
+stateless.
