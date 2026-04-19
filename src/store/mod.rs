@@ -53,19 +53,31 @@ impl Store {
         let conn = Connection::open(path.as_ref())?;
         init_pragmas(&conn)?;
         verify_vec_loaded(&conn)?;
-        conn.execute_batch(SCHEMA_SQL)
+        // Apply the base schema and the dim-parameterized `chunks_vec` DDL
+        // in a single batch. vec0 requires the dim as a SQL literal, so it
+        // can't live in the static schema.sql file.
+        let full_schema = format!("{}\n{}", SCHEMA_SQL, vec_schema_ddl(embed_dim));
+        conn.execute_batch(&full_schema)
             .map_err(|e| StoreError::Msg(format!("apply schema: {e}")))?;
-        // vec0 requires the dim as a literal in the SQL text, so render the
-        // DDL here from config. `IF NOT EXISTS` makes the open idempotent.
-        // A pre-existing table at a different dim will silently stay, but
-        // the meta check below will catch it and refuse.
-        let vec_ddl = vec_schema_ddl(embed_dim);
-        conn.execute_batch(&vec_ddl)
-            .map_err(|e| StoreError::Msg(format!("apply vec schema: {e}")))?;
         let s = Self { conn };
         s.set_meta("schema_version", SCHEMA_VERSION)?;
-        match s.get_meta("embedding_dim")? {
-            None => s.set_meta("embedding_dim", &embed_dim.to_string())?,
+        s.reconcile_embedding_dim(embed_dim)?;
+        Ok(s)
+    }
+
+    /// Ensure `meta.embedding_dim` agrees with `embed_dim`:
+    ///
+    /// - missing: write it from config (first open).
+    /// - match: nothing to do.
+    /// - mismatch: refuse to open with `SchemaDimMismatch`.
+    ///
+    /// Also sweep any `embedding_cache` rows whose stored dim differs from
+    /// the current config — belt-and-suspenders for partial writes from
+    /// older builds, and keeps reads from ever returning a mismatched
+    /// vector.
+    fn reconcile_embedding_dim(&self, embed_dim: usize) -> Result<(), StoreError> {
+        match self.get_meta("embedding_dim")? {
+            None => self.set_meta("embedding_dim", &embed_dim.to_string())?,
             Some(v) => {
                 let stored: usize = v
                     .parse()
@@ -78,14 +90,11 @@ impl Store {
                 }
             }
         }
-        // Sweep any cached embeddings at a different dim so reads never
-        // return a mismatched vector (belt-and-suspenders alongside the
-        // meta check; also covers partial writes from older builds).
-        s.conn.execute(
+        self.conn.execute(
             "DELETE FROM embedding_cache WHERE dim != ?1",
             params![embed_dim as i64],
         )?;
-        Ok(s)
+        Ok(())
     }
 
     /// Exposed for tests that want to run raw SQL.
