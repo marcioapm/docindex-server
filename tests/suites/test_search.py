@@ -45,10 +45,41 @@ def test_search_top_hit_matches(spawn_server, tmp_path, query, expected_file):
     hits = r.json()["hits"]
     assert hits, "expected at least one hit"
     top = hits[0]
-    assert top["path"].endswith(expected_file), f"top hit {top['path']} for query {query!r}"
+    # Vault is flat in this suite, so the relative path is just the filename.
+    assert top["path"] == expected_file, f"top hit {top['path']} for query {query!r}"
     assert "snippet" in top and top["snippet"]
     assert "score" in top
     assert "chunk_id" in top
+
+
+def test_search_returns_relative_paths(spawn_server, tmp_path):
+    """Every hit.path must be vault-relative — no absolute filesystem paths.
+
+    The plugin relies on this (Obsidian's TFile.path is always vault-relative);
+    leaking absolute paths would also leak host environment to the client.
+    """
+    vault = _write_vault(tmp_path)
+    # Move one file into a subdir so we also exercise a non-flat path shape.
+    nested_dir = vault / "nested"
+    nested_dir.mkdir()
+    (vault / "rust.md").rename(nested_dir / "rust.md")
+
+    server = spawn_server(vault)
+    server.wait_for_chunks(len(VAULT_FILES))
+    r = server.post(
+        "/search", {"query": "rust python sqlite tailscale obsidian", "limit": 50}
+    )
+    assert r.status_code == 200, r.text
+    hits = r.json()["hits"]
+    assert hits, "expected hits"
+    for h in hits:
+        p = h["path"]
+        assert not p.startswith("/"), f"hit.path must not be absolute, got {p!r}"
+        assert ".." not in p.split("/"), f"hit.path must not contain '..', got {p!r}"
+    paths = {h["path"] for h in hits}
+    assert "nested/rust.md" in paths, (
+        f"expected nested/rust.md in hits, got {sorted(paths)}"
+    )
 
 
 def test_search_empty_query_is_400(spawn_server, tmp_path):
@@ -103,6 +134,7 @@ def test_search_indexes_md_and_txt(spawn_server, tmp_path, query, expected_file)
     assert r.status_code == 200, r.text
     hits = r.json()["hits"]
     assert hits, f"expected at least one hit for {query!r}"
-    assert hits[0]["path"].endswith(expected_file), (
+    # Paths are vault-relative; the mixed vault is flat, so rel == filename.
+    assert hits[0]["path"] == expected_file, (
         f"top hit {hits[0]['path']} for query {query!r}"
     )

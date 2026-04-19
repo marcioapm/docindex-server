@@ -31,23 +31,28 @@ def test_similar_returns_related_doc(spawn_server, tmp_path):
     server.wait_for_chunks(len(VAULT))
     # Fake embedder is deterministic content-hash based; we rely on the FTS
     # side of RRF to return rust_traits.md as the closest peer to rust_lang.md.
-    target = str(vault / "rust_lang.md")
+    # Paths are vault-relative — clients (like Obsidian) don't know the server's
+    # filesystem layout.
+    target = "rust_lang.md"
     r = server.post("/similar", {"path": target, "limit": 5})
     assert r.status_code == 200, r.text
     hits = r.json()["hits"]
     assert hits, "expected at least one similar hit"
     paths = [h["path"] for h in hits]
     assert target not in paths, "similar must not include the source path"
-    assert any(p.endswith("rust_traits.md") for p in paths), (
+    assert any(p == "rust_traits.md" for p in paths), (
         f"expected rust_traits.md in top hits, got {paths}"
     )
+    # Defense in depth: no hit should leak an absolute host path.
+    for p in paths:
+        assert not p.startswith("/"), f"hit.path must be vault-relative, got {p!r}"
 
 
 def test_similar_unknown_path_is_404(spawn_server, tmp_path):
     vault = _write_vault(tmp_path)
     server = spawn_server(vault)
     server.wait_for_chunks(len(VAULT))
-    r = server.post("/similar", {"path": str(vault / "nope.md")})
+    r = server.post("/similar", {"path": "nope.md"})
     assert r.status_code == 404
     body = r.json()
     assert body["code"] == "not_found"
