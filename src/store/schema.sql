@@ -27,12 +27,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   tokenize='porter unicode61'
 );
 
--- sqlite-vec vec0 virtual table: packed little-endian float32, 768-dim,
--- cosine distance so the kNN MATCH operator ranks by semantic similarity
--- directly (no extra cosine pass on top of an L2 index).
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
-  embedding FLOAT[768] distance_metric=cosine
-);
+-- chunks_vec (sqlite-vec vec0 virtual table) is created from Rust with the
+-- configured embedding dim baked into the DDL — vec0 requires the dimension
+-- as a SQL literal, so we can't template it from a parameter here. See
+-- `Store::open` in `src/store/mod.rs` for the render.
 
 CREATE TABLE IF NOT EXISTS embedding_cache (
   content_hash TEXT PRIMARY KEY,

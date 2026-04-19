@@ -71,7 +71,7 @@ impl Config {
             "fake".to_string()
         };
 
-        let embed_dim = parse_int_default(lookup, "DOCINDEX_EMBED_DIM", 768, &mut errs);
+        let embed_dim = parse_int_default(lookup, "DOCINDEX_EMBED_DIM", 3072, &mut errs);
         let debounce_ms = parse_int_default(lookup, "DOCINDEX_DEBOUNCE_MS", 5000, &mut errs);
         let http_timeout_ms =
             parse_int_default(lookup, "DOCINDEX_HTTP_TIMEOUT_MS", 30000, &mut errs);
@@ -302,7 +302,7 @@ mod tests {
         let env = base_env(&dir);
         let c = Config::from_lookup(&lookup(&env)).expect("valid");
         assert_eq!(c.embed_model, "gemini-embedding-001");
-        assert_eq!(c.embed_dim, 768);
+        assert_eq!(c.embed_dim, 3072);
         assert_eq!(c.log_format, "json");
         assert_eq!(c.debounce, Duration::from_millis(5000));
     }

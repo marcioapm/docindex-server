@@ -14,7 +14,7 @@ pub struct Fake {
 
 impl Fake {
     pub fn new(dim: usize) -> Self {
-        let dim = if dim == 0 { 768 } else { dim };
+        // Caller is responsible for dim > 0 (config enforces it).
         Self { dim }
     }
 

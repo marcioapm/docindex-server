@@ -372,13 +372,14 @@ mod tests {
     use tempfile::TempDir;
 
     fn mk_ctx(dir: &Path) -> IndexerCtx {
-        let store = Arc::new(Mutex::new(Store::open(dir.join("x.db")).unwrap()));
+        const DIM: usize = 8;
+        let store = Arc::new(Mutex::new(Store::open(dir.join("x.db"), DIM).unwrap()));
         IndexerCtx {
             store,
-            embedder: AnyEmbedder::Fake(Arc::new(Fake::new(768))),
+            embedder: AnyEmbedder::Fake(Arc::new(Fake::new(DIM))),
             vault_dir: dir.join("vault"),
             embed_model: "test".into(),
-            embed_dim: 768,
+            embed_dim: DIM,
             last_reindex_ms: Arc::new(AtomicI64::new(0)),
         }
     }

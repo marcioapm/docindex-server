@@ -28,7 +28,7 @@ use crate::{
 /// graceful shutdown on SIGINT/SIGTERM or a bind error).
 pub async fn run(cfg: Config) -> Result<()> {
     let embedder = build_embedder(&cfg)?;
-    let store = Store::open(&cfg.db_path).context("open store")?;
+    let store = Store::open(&cfg.db_path, cfg.embed_dim).context("open store")?;
     let store = Arc::new(Mutex::new(store));
 
     let last_reindex_ms = Arc::new(AtomicI64::new(now_ms().checked_sub(1).unwrap_or(0)));

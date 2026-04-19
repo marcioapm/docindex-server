@@ -27,6 +27,10 @@ pub enum StoreError {
     VecExtension(String),
     #[error("store: dim mismatch: got {got}, want {want}")]
     DimMismatch { got: usize, want: usize },
+    #[error(
+        "store: embedding_dim on disk is {stored}, config says {config} — refusing to mix. Delete index.db to reindex at new dim."
+    )]
+    DimMixed { stored: usize, config: usize },
 }
 
 /// Wraps a `rusqlite::Connection` with the docindex schema applied and
@@ -37,17 +41,52 @@ pub struct Store {
 
 impl Store {
     /// Open (or create) the SQLite DB at `path`. Registers `sqlite-vec` as
-    /// an auto-extension exactly once per process, then applies the schema
-    /// and writes `meta.schema_version`.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+    /// an auto-extension exactly once per process, applies the base schema,
+    /// renders + applies the `chunks_vec` DDL with `embed_dim` baked into
+    /// `FLOAT[...]`, and enforces that `meta.embedding_dim` matches
+    /// `embed_dim` (refusing to start on mismatch).
+    pub fn open(path: impl AsRef<Path>, embed_dim: usize) -> Result<Self, StoreError> {
+        if embed_dim == 0 {
+            return Err(StoreError::Msg("embed_dim must be > 0".into()));
+        }
         register_sqlite_vec()?;
         let conn = Connection::open(path.as_ref())?;
         init_pragmas(&conn)?;
         verify_vec_loaded(&conn)?;
         conn.execute_batch(SCHEMA_SQL)
             .map_err(|e| StoreError::Msg(format!("apply schema: {e}")))?;
+        // vec0 requires the dim as a literal in the SQL text, so render the
+        // DDL here from config. `IF NOT EXISTS` makes the open idempotent.
+        // A pre-existing table at a different dim will silently stay, but
+        // the meta check below will catch it and refuse.
+        let vec_ddl = format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding FLOAT[{embed_dim}] distance_metric=cosine)"
+        );
+        conn.execute_batch(&vec_ddl)
+            .map_err(|e| StoreError::Msg(format!("apply vec schema: {e}")))?;
         let s = Self { conn };
         s.set_meta("schema_version", SCHEMA_VERSION)?;
+        match s.get_meta("embedding_dim")? {
+            None => s.set_meta("embedding_dim", &embed_dim.to_string())?,
+            Some(v) => {
+                let stored: usize = v
+                    .parse()
+                    .map_err(|e| StoreError::Msg(format!("parse meta.embedding_dim {v:?}: {e}")))?;
+                if stored != embed_dim {
+                    return Err(StoreError::DimMixed {
+                        stored,
+                        config: embed_dim,
+                    });
+                }
+            }
+        }
+        // Sweep any cached embeddings at a different dim so reads never
+        // return a mismatched vector (belt-and-suspenders alongside the
+        // meta check; also covers partial writes from older builds).
+        s.conn.execute(
+            "DELETE FROM embedding_cache WHERE dim != ?1",
+            params![embed_dim as i64],
+        )?;
         Ok(s)
     }
 
@@ -461,10 +500,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Dim used by the store's own tests. Small and cheap — the behavior
+    /// under test (upsert, FTS sync, vec delete+insert, caching, reopen)
+    /// doesn't depend on the embedding size as long as it's consistent.
+    const TEST_DIM: usize = 8;
+
     fn open_temp() -> (TempDir, Store) {
+        open_temp_with_dim(TEST_DIM)
+    }
+
+    fn open_temp_with_dim(dim: usize) -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("x.db");
-        let store = Store::open(&path).expect("open");
+        let store = Store::open(&path, dim).expect("open");
         (dir, store)
     }
 
@@ -498,7 +546,7 @@ mod tests {
         s.conn()
             .execute(
                 "INSERT INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)",
-                params![1i64, encode_f32(&vec![0.0_f32; 768])],
+                params![1i64, encode_f32(&[0.0_f32; TEST_DIM])],
             )
             .expect("insert into vec0");
     }
@@ -570,7 +618,7 @@ mod tests {
         let id = s
             .upsert_chunk(&sample_chunk(0, "searchable token", "h"), "/v/a.md", 1)
             .unwrap();
-        s.set_vector_for_chunk(id, &vec![0.0; 768]).unwrap();
+        s.set_vector_for_chunk(id, &[0.0; TEST_DIM]).unwrap();
         s.delete_chunks_for_path("/v/a.md").unwrap();
         let n: i64 = s
             .conn()
@@ -623,9 +671,9 @@ mod tests {
         let id = s
             .upsert_chunk(&sample_chunk(0, "x", "h"), "/v/a.md", 1)
             .unwrap();
-        let v: Vec<f32> = (0..768).map(|i| i as f32 / 768.0).collect();
+        let v: Vec<f32> = (0..TEST_DIM).map(|i| i as f32 / TEST_DIM as f32).collect();
         s.set_vector_for_chunk(id, &v).unwrap();
-        s.set_vector_for_chunk(id, &vec![0.0; 768]).unwrap();
+        s.set_vector_for_chunk(id, &[0.0; TEST_DIM]).unwrap();
         let n: i64 = s
             .conn()
             .query_row(
@@ -649,17 +697,18 @@ mod tests {
     fn reopen_persists() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("x.db");
+        let cached_vec: Vec<f32> = (0..TEST_DIM).map(|i| i as f32 / 10.0).collect();
         let id = {
-            let s = Store::open(&path).unwrap();
+            let s = Store::open(&path, TEST_DIM).unwrap();
             let id = s
                 .upsert_chunk(&sample_chunk(0, "persist me", "h"), "/v/a.md", 1)
                 .unwrap();
-            s.set_vector_for_chunk(id, &vec![0.0; 768]).unwrap();
-            s.put_embedding_cache("h", "m", "RETRIEVAL_DOCUMENT", 4, &[1.0, 2.0, 3.0, 4.0])
+            s.set_vector_for_chunk(id, &[0.0; TEST_DIM]).unwrap();
+            s.put_embedding_cache("h", "m", "RETRIEVAL_DOCUMENT", TEST_DIM, &cached_vec)
                 .unwrap();
             id
         };
-        let s2 = Store::open(&path).unwrap();
+        let s2 = Store::open(&path, TEST_DIM).unwrap();
         let content: String = s2
             .conn()
             .query_row("SELECT content FROM chunks WHERE id=?1", params![id], |r| {
@@ -668,6 +717,70 @@ mod tests {
             .unwrap();
         assert_eq!(content, "persist me");
         let cached = s2.get_embedding_cache("h").unwrap().expect("hit");
-        assert_eq!(cached.len(), 4);
+        assert_eq!(cached.len(), TEST_DIM);
+    }
+
+    #[test]
+    fn rejects_mixed_dim_on_reopen() {
+        // Open at one dim, close, reopen at another — must refuse with the
+        // DimMixed error so the operator has to explicitly nuke the DB.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.db");
+        {
+            let _s = Store::open(&path, 8).expect("first open");
+        }
+        let err = match Store::open(&path, 16) {
+            Ok(_) => panic!("second open must fail"),
+            Err(e) => e,
+        };
+        match err {
+            StoreError::DimMixed { stored, config } => {
+                assert_eq!(stored, 8);
+                assert_eq!(config, 16);
+            }
+            other => panic!("expected DimMixed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reopen_at_same_dim_ok() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.db");
+        {
+            let _s = Store::open(&path, 16).expect("first open");
+        }
+        let _s = Store::open(&path, 16).expect("second open at same dim");
+    }
+
+    #[test]
+    fn embedding_cache_swept_on_dim_change() {
+        // Any cache row at a dim other than the currently-open dim must be
+        // deleted on open. We can't open at mixed dim (that's rejected), so
+        // simulate by poking a stale row into the cache at the current dim
+        // but with the `dim` column set to something else, then reopening.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.db");
+        {
+            let s = Store::open(&path, 8).expect("first open");
+            // Bypass the dim check inside put_embedding_cache.
+            s.conn()
+                .execute(
+                    "INSERT INTO embedding_cache(content_hash, model, task_type, dim, embedding, created_at) \
+                     VALUES ('stale', 'm', 'RETRIEVAL_DOCUMENT', 99, X'00', strftime('%s','now'))",
+                    [],
+                )
+                .unwrap();
+        }
+        // Reopen at the same dim — sweep should delete the dim=99 row.
+        let s = Store::open(&path, 8).expect("reopen");
+        let n: i64 = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM embedding_cache WHERE content_hash = 'stale'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "stale cache row should be swept on open");
     }
 }

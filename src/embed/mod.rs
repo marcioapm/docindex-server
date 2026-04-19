@@ -3,8 +3,10 @@
 //! Gemini uses task-asymmetric embeddings: documents with
 //! `RETRIEVAL_DOCUMENT`, queries with `RETRIEVAL_QUERY`. Getting this wrong
 //! silently degrades ranking quality — the vectors still parse, they are
-//! just miscalibrated. Output is Matryoshka-truncated to 768 dimensions
-//! at the API boundary so we never round-trip the full 3072.
+//! just miscalibrated. Output is Matryoshka-truncated to the configured
+//! dim (`DOCINDEX_EMBED_DIM`, default 3072 — the model's native size; 768
+//! is a smaller Matryoshka truncation that trades a little quality for
+//! disk/ANN cost at tiny scale).
 
 pub mod fake;
 pub mod gemini;
