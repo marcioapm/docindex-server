@@ -100,6 +100,35 @@ def test_search_respects_limit(spawn_server, tmp_path):
     assert len(r.json()["hits"]) <= 2
 
 
+def test_search_hits_carry_normalized_and_rrf_scores(spawn_server, tmp_path):
+    """Every hit must expose score_rrf and score_normalized alongside score.
+
+    - `score` stays as the RRF value for back-compat.
+    - `score_rrf` equals `score` (duplicate for clarity).
+    - `score_normalized` is in [0.0, 1.0].
+    - Results are ordered by `score_rrf` descending (RRF is the ranker).
+    """
+    vault = _write_vault(tmp_path)
+    server = spawn_server(vault)
+    server.wait_for_chunks(len(VAULT_FILES))
+    r = server.post(
+        "/search", {"query": "rust python sqlite tailscale obsidian", "limit": 50}
+    )
+    assert r.status_code == 200, r.text
+    hits = r.json()["hits"]
+    assert hits, "expected hits"
+    for h in hits:
+        assert "score" in h and "score_rrf" in h and "score_normalized" in h, h
+        assert h["score_rrf"] == h["score"], h
+        assert 0.0 <= h["score_normalized"] <= 1.0, h
+    scores = [h["score_rrf"] for h in hits]
+    assert scores == sorted(scores, reverse=True), scores
+    # The top hit in a clean query like this should be decisively normalized
+    # above the default 0.40 threshold — rank-1 in at least one branch gets
+    # at least max(W_VEC, W_BM25) = 0.55.
+    assert hits[0]["score_normalized"] >= 0.40, hits[0]
+
+
 # Mixed .md + .txt vault: the walker accepts both (case-insensitive), and the
 # chunker falls back to the 500-word split for heading-less .txt files. Both
 # should be searchable without any per-extension tweaks in the server.
