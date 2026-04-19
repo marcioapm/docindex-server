@@ -14,7 +14,10 @@ pub struct Fake {
 
 impl Fake {
     pub fn new(dim: usize) -> Self {
-        // Caller is responsible for dim > 0 (config enforces it).
+        // Caller is responsible for dim > 0 (config enforces it). The
+        // debug_assert catches accidental test misuse; production config
+        // rejects dim=0 before reaching here.
+        debug_assert!(dim > 0, "Fake embedder dim must be positive");
         Self { dim }
     }
 

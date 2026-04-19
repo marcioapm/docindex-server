@@ -28,7 +28,7 @@ pub enum StoreError {
     #[error("store: embedding_cache row dim mismatch: got {got}, want {want}")]
     CacheDimMismatch { got: usize, want: usize },
     #[error(
-        "store: embedding_dim on disk is {stored}, config says {config} — refusing to mix. Delete index.db to reindex at new dim."
+        "store: embedding_dim on disk is {stored}, config says {config} — refusing to mix. Delete the index DB to reindex at the new dim."
     )]
     SchemaDimMismatch { stored: usize, config: usize },
 }
@@ -735,17 +735,18 @@ mod tests {
         {
             let _s = Store::open(&path, 8).expect("first open");
         }
-        let err = match Store::open(&path, 16) {
-            Ok(_) => panic!("second open must fail"),
-            Err(e) => e,
-        };
-        match err {
-            StoreError::SchemaDimMismatch { stored, config } => {
-                assert_eq!(stored, 8);
-                assert_eq!(config, 16);
-            }
-            other => panic!("expected SchemaDimMismatch, got {other:?}"),
-        }
+        let result = Store::open(&path, 16);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::SchemaDimMismatch {
+                    stored: 8,
+                    config: 16,
+                })
+            ),
+            "expected SchemaDimMismatch{{ stored: 8, config: 16 }}, got {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -760,10 +761,11 @@ mod tests {
 
     #[test]
     fn embedding_cache_swept_on_dim_change() {
-        // Any cache row at a dim other than the currently-open dim must be
-        // deleted on open. We can't open at mixed dim (that's rejected), so
-        // simulate by poking a stale row into the cache at the current dim
-        // but with the `dim` column set to something else, then reopening.
+        // Any embedding_cache row whose stored dim doesn't match the
+        // currently-open dim is deleted on open. We can't actually reopen
+        // at a mismatched dim (SchemaDimMismatch would block that), so
+        // simulate the state by poking a stale row with `dim = 99` into
+        // the cache while open at dim=8, then closing and reopening.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("x.db");
         {
