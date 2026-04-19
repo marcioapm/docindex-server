@@ -513,13 +513,9 @@ mod tests {
     const TEST_DIM: usize = 8;
 
     fn open_temp() -> (TempDir, Store) {
-        open_temp_with_dim(TEST_DIM)
-    }
-
-    fn open_temp_with_dim(dim: usize) -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("x.db");
-        let store = Store::open(&path, dim).expect("open");
+        let store = Store::open(&path, TEST_DIM).expect("open");
         (dir, store)
     }
 
