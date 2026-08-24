@@ -287,4 +287,50 @@ mod tests {
         };
         assert!(CliConfig::load(&empty_lookup(), &no_file(), &flags).is_err());
     }
+
+    /// `DOCINDEX_CLI_LIMIT` env var overrides the file value when no flag is
+    /// present.
+    #[test]
+    fn env_limit_beats_file() {
+        let mut env = HashMap::new();
+        env.insert("DOCINDEX_CLI_SERVER".into(), "http://x".into());
+        env.insert("DOCINDEX_CLI_LIMIT".into(), "42".into());
+        env.insert("DOCINDEX_CLI_CONFIG".into(), "/cfg.toml".into());
+        let mut files = HashMap::new();
+        files.insert(
+            PathBuf::from("/cfg.toml"),
+            FileContent {
+                text: "server = \"http://x\"\nlimit = 5".into(),
+                mode: Some(0o600),
+            },
+        );
+        let reader = file_reader_for(files);
+        let flags = CliFlags::default();
+        let c = CliConfig::load(&lookup(&env), &reader, &flags).expect("valid");
+        // env says 42, file says 5 — env must win.
+        assert_eq!(c.limit, 42);
+    }
+
+    /// `DOCINDEX_CLI_FORMAT` env var overrides the file value when no flag is
+    /// present.
+    #[test]
+    fn env_format_beats_file() {
+        let mut env = HashMap::new();
+        env.insert("DOCINDEX_CLI_SERVER".into(), "http://x".into());
+        env.insert("DOCINDEX_CLI_FORMAT".into(), "json".into());
+        env.insert("DOCINDEX_CLI_CONFIG".into(), "/cfg.toml".into());
+        let mut files = HashMap::new();
+        files.insert(
+            PathBuf::from("/cfg.toml"),
+            FileContent {
+                text: "server = \"http://x\"\nformat = \"text\"".into(),
+                mode: Some(0o600),
+            },
+        );
+        let reader = file_reader_for(files);
+        let flags = CliFlags::default();
+        let c = CliConfig::load(&lookup(&env), &reader, &flags).expect("valid");
+        // env says json, file says text — env must win.
+        assert_eq!(c.format, OutputFormat::Json);
+    }
 }

@@ -494,4 +494,51 @@ mod tests {
             Err(EmbedError::Config(_))
         ));
     }
+
+    /// A response whose embedding length differs from the configured dim must
+    /// produce `EmbedError::DimMismatch`.
+    #[tokio::test]
+    async fn dim_mismatch_error_on_wrong_embedding_length() {
+        let server = MockServer::start().await;
+        // Client dim = 4, but the response returns a 3-element vector.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "embedding": [0.1, 0.2, 0.3], "index": 0 }]
+            })))
+            .mount(&server)
+            .await;
+        let v = test_voyage(&server, 0, Duration::from_millis(1));
+        let err = v
+            .embed_query("q")
+            .await
+            .expect_err("should fail on dim mismatch");
+        assert!(
+            matches!(err, EmbedError::DimMismatch { got: 3, want: 4 }),
+            "expected DimMismatch{{got:3, want:4}}, got: {err:?}"
+        );
+    }
+
+    /// When every attempt returns 429, `embed_query` must exhaust all retries
+    /// and return `EmbedError::RetriesExhausted`.
+    #[tokio::test]
+    async fn retries_exhausted_on_persistent_429() {
+        let server = MockServer::start().await;
+        // No `up_to_n_times` — replies 429 to every request.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429).set_body_json(json!({"error": "rate limited"})),
+            )
+            .mount(&server)
+            .await;
+        // max_retries = 1 → 2 total attempts, both fail.
+        let v = test_voyage(&server, 1, Duration::from_millis(0));
+        let err = v
+            .embed_query("q")
+            .await
+            .expect_err("should exhaust retries");
+        assert!(
+            matches!(err, EmbedError::RetriesExhausted(_)),
+            "expected RetriesExhausted, got: {err:?}"
+        );
+    }
 }

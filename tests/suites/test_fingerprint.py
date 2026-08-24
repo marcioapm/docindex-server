@@ -88,7 +88,7 @@ def _stop(proc: subprocess.Popen) -> None:
             proc.wait(timeout=2.0)
 
 
-def test_provider_mismatch_exits_nonzero_naming_field(docindex_bin, tmp_path):
+def test_dim_mismatch_exits_nonzero_naming_field(docindex_bin, tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()
     (vault / "a.md").write_text("# A\n\nalpha body\n")
@@ -108,11 +108,9 @@ def test_provider_mismatch_exits_nonzero_naming_field(docindex_bin, tmp_path):
     assert ready_a, log_a.read_text()
     _stop(proc_a)
 
-    # Second boot: same dim, different provider label ("fake" is the only
-    # provider that needs no API key in tests, so we instead flip the
-    # recorded label by reopening at fake with a different embed_dim, which
-    # is dim-mismatch — provider mismatch is exercised via voyage in the
-    # next test where a real key-free swap isn't required).
+    # Second boot: same provider, different dim — this is a dim mismatch.
+    # The server must refuse to start and name both the stored and new dim
+    # in its error output, along with the --reembed hint.
     port2 = _free_port()
     env_b = _env(
         vault,
