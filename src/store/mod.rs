@@ -155,6 +155,11 @@ impl Store {
     /// fingerprint. Used by `--reembed` after [`Store::open_for_reembed`] —
     /// the only supported way to change the embedding dim on an existing
     /// DB, since `chunks_vec`'s dim is baked into its DDL.
+    ///
+    /// The wipe and the fingerprint write are atomic: all three meta keys
+    /// (`embedding_provider` / `embedding_model` / `embedding_dim`) are
+    /// upserted inside the transaction before `commit`. A crash after commit
+    /// leaves a wiped index whose fingerprint exactly matches the new config.
     pub fn wipe_and_rebuild(
         &self,
         embed_dim: usize,
@@ -173,10 +178,20 @@ impl Store {
             .map_err(|e| StoreError::Msg(format!("reapply base schema: {e}")))?;
         tx.execute_batch(&vec_schema_ddl(embed_dim))
             .map_err(|e| StoreError::Msg(format!("recreate chunks_vec: {e}")))?;
+        // Write the fingerprint inside the same transaction so the wipe and
+        // the new fingerprint are committed atomically.
+        for (key, val) in [
+            ("embedding_provider", provider),
+            ("embedding_model", model),
+            ("embedding_dim", &embed_dim.to_string() as &str),
+        ] {
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, val],
+            )?;
+        }
         tx.commit()?;
-        self.set_meta("embedding_dim", &embed_dim.to_string())?;
-        self.set_meta("embedding_provider", provider)?;
-        self.set_meta("embedding_model", model)?;
         Ok(())
     }
 
@@ -1317,5 +1332,93 @@ mod tests {
                 params![encode_f32(&[0.0_f32; 16])],
             )
             .expect("insert at new dim");
+    }
+
+    /// All three fingerprint meta keys must be present immediately after
+    /// `wipe_and_rebuild` and match what was requested. They are written
+    /// inside the wipe transaction, so this also validates atomicity — there
+    /// is no post-commit window where any key can be absent.
+    #[test]
+    fn wipe_and_rebuild_fingerprint_is_atomic() {
+        let (_d, s) = open_temp();
+        s.wipe_and_rebuild(32, "voyage", "voyage-4-lite").unwrap();
+
+        assert_eq!(
+            s.get_meta("embedding_provider").unwrap().as_deref(),
+            Some("voyage"),
+            "embedding_provider not written"
+        );
+        assert_eq!(
+            s.get_meta("embedding_model").unwrap().as_deref(),
+            Some("voyage-4-lite"),
+            "embedding_model not written"
+        );
+        assert_eq!(
+            s.get_meta("embedding_dim").unwrap().as_deref(),
+            Some("32"),
+            "embedding_dim not written"
+        );
+        let outcome = s.check_fingerprint("voyage", "voyage-4-lite", 32).unwrap();
+        assert_eq!(
+            outcome,
+            FingerprintOutcome::Match,
+            "fingerprint check should match after wipe_and_rebuild"
+        );
+    }
+
+    // --- peek_fingerprint ------------------------------------------------
+
+    /// `peek_fingerprint` on a non-existent path returns `None` immediately
+    /// without creating the file.
+    #[test]
+    fn peek_fingerprint_none_for_nonexistent_path() {
+        let dir = TempDir::new().unwrap();
+        let result = Store::peek_fingerprint(dir.path().join("no-such.db")).unwrap();
+        assert!(result.is_none(), "expected None for missing DB");
+    }
+
+    /// After `set_fingerprint` on an open store, `peek_fingerprint` on the
+    /// same path (with the store dropped) returns the exact same triple.
+    #[test]
+    fn peek_fingerprint_returns_written_triple() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.db");
+        {
+            let s = Store::open(&path, TEST_DIM).unwrap();
+            s.set_fingerprint("voyage", "voyage-4", TEST_DIM).unwrap();
+        }
+        let result = Store::peek_fingerprint(&path).unwrap();
+        assert_eq!(
+            result,
+            Some(("voyage".into(), "voyage-4".into(), TEST_DIM)),
+            "peek_fingerprint should return the stored triple"
+        );
+    }
+
+    // --- provider-only mismatch ------------------------------------------
+
+    /// `check_fingerprint` must detect a provider change even when model and
+    /// dim are identical. This exercises the branch that was untested by the
+    /// E2E test (which changed the dim, not just the provider).
+    #[test]
+    fn fingerprint_mismatch_provider_only() {
+        let (_d, s) = open_temp();
+        s.set_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        // Same model and dim as stored, only the provider differs.
+        let outcome = s
+            .check_fingerprint("voyage", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        assert!(
+            matches!(outcome, FingerprintOutcome::Mismatch(_)),
+            "provider-only change must produce Mismatch, got: {outcome:?}"
+        );
+        let msg = match outcome {
+            FingerprintOutcome::Mismatch(m) => m,
+            _ => unreachable!(),
+        };
+        assert!(msg.contains("provider=gemini"), "{msg}");
+        assert!(msg.contains("provider=voyage"), "{msg}");
+        assert!(msg.contains("--reembed"), "{msg}");
     }
 }
