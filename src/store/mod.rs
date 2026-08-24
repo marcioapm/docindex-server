@@ -34,7 +34,7 @@ pub enum StoreError {
     #[error("store: embedding_cache row dim mismatch: got {got}, want {want}")]
     CacheDimMismatch { got: usize, want: usize },
     #[error(
-        "store: embedding_dim on disk is {stored}, config says {config} — refusing to mix. Delete the index DB to reindex at the new dim."
+        "store: embedding_dim on disk is {stored}, config says {config} — run with --reembed to reindex at the new dim, or delete the index DB as a fallback."
     )]
     SchemaDimMismatch { stored: usize, config: usize },
 }
@@ -1098,6 +1098,28 @@ mod tests {
             ),
             "expected SchemaDimMismatch{{ stored: 8, config: 16 }}, got {:?}",
             result.err()
+        );
+    }
+
+    /// The `SchemaDimMismatch` error message must offer `--reembed` as the
+    /// primary recovery path. Deleting the DB is a fallback, not the first
+    /// instruction — operators who have data they want to preserve should
+    /// reach for `--reembed` first.
+    #[test]
+    fn schema_dim_mismatch_message_names_reembed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.db");
+        {
+            let _s = Store::open(&path, 8).expect("first open");
+        }
+        let err = match Store::open(&path, 16) {
+            Err(e) => e,
+            Ok(_) => panic!("expected SchemaDimMismatch error"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--reembed"),
+            "SchemaDimMismatch message must name --reembed; got: {msg}"
         );
     }
 
