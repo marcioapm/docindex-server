@@ -533,7 +533,22 @@ mod tests {
             .collect::<Vec<_>>();
         let output = gemini.embed_documents(&inputs).await.unwrap();
         assert_eq!(output.len(), 17);
-        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        // Two batches must have been sent: one of 16, one of 1.
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2, "expected exactly 2 batch requests, got {}", reqs.len());
+        // Batch sizes: first request has 16 items, second has 1.
+        let first_count: usize = serde_json::from_slice::<serde_json::Value>(&reqs[0].body)
+            .unwrap()["requests"]
+            .as_array()
+            .unwrap()
+            .len();
+        let second_count: usize = serde_json::from_slice::<serde_json::Value>(&reqs[1].body)
+            .unwrap()["requests"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(first_count, 16, "first batch must have 16 items");
+        assert_eq!(second_count, 1, "second batch must have 1 item");
     }
 
     #[tokio::test]
@@ -590,5 +605,146 @@ mod tests {
             gemini.embed_documents(&[EmbedInput::text("a")]).await,
             Err(EmbedError::DimMismatch { got: 2, want: 4 })
         ));
+    }
+
+    /// Legacy model (gemini-embedding-001) must retry on 429 and succeed on
+    /// the subsequent attempt.
+    #[tokio::test]
+    async fn legacy_retry_on_429() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_json(json!({ "error": { "message": "rate limited" } })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "embedding": vector(0.5) })),
+            )
+            .mount(&server)
+            .await;
+        let gemini = test_gemini(&server, "gemini-embedding-001", 1).await;
+        let out = gemini
+            .embed_documents(&[EmbedInput::text("hello")])
+            .await
+            .expect("should succeed after one 429");
+        assert_eq!(out.len(), 1);
+    }
+
+    /// Legacy model must retry on 503 and succeed on the subsequent attempt.
+    #[tokio::test]
+    async fn legacy_retry_on_503() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({ "error": { "message": "service unavailable" } })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "embedding": vector(0.5) })),
+            )
+            .mount(&server)
+            .await;
+        let gemini = test_gemini(&server, "gemini-embedding-001", 1).await;
+        let out = gemini
+            .embed_documents(&[EmbedInput::text("hello")])
+            .await
+            .expect("should succeed after one 503");
+        assert_eq!(out.len(), 1);
+    }
+
+    /// Legacy model must fail fast on a 4xx other than 429 — no retries.
+    #[tokio::test]
+    async fn legacy_fail_fast_on_4xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({ "error": { "message": "bad request" } })),
+            )
+            .expect(1) // exactly one request — no retries
+            .mount(&server)
+            .await;
+        let gemini = test_gemini(&server, "gemini-embedding-001", 3).await;
+        let err = gemini
+            .embed_documents(&[EmbedInput::text("hello")])
+            .await
+            .expect_err("400 must not be retried");
+        assert!(
+            matches!(err, EmbedError::Api { status: 400, .. }),
+            "expected Api{{status:400}}, got: {err:?}"
+        );
+    }
+
+    /// Config validation (empty api_key, empty model, zero dim) must be
+    /// caught before any HTTP request is sent.
+    #[tokio::test]
+    async fn legacy_config_validation_errors() {
+        let server = MockServer::start().await;
+
+        let empty_key = Gemini {
+            api_key: String::new(),
+            model: "gemini-embedding-001".into(),
+            dim: 4,
+            base_url: server.uri(),
+            client: reqwest::Client::new(),
+            max_retries: 0,
+            base_delay: Duration::from_millis(1),
+        };
+        assert!(
+            matches!(
+                empty_key.embed_documents(&[EmbedInput::text("x")]).await,
+                Err(EmbedError::Config(_))
+            ),
+            "empty api_key must produce Config error"
+        );
+
+        let empty_model = Gemini {
+            api_key: "k".into(),
+            model: String::new(),
+            dim: 4,
+            base_url: server.uri(),
+            client: reqwest::Client::new(),
+            max_retries: 0,
+            base_delay: Duration::from_millis(1),
+        };
+        assert!(
+            matches!(
+                empty_model.embed_documents(&[EmbedInput::text("x")]).await,
+                Err(EmbedError::Config(_))
+            ),
+            "empty model must produce Config error"
+        );
+
+        let zero_dim = Gemini {
+            api_key: "k".into(),
+            model: "gemini-embedding-001".into(),
+            dim: 0,
+            base_url: server.uri(),
+            client: reqwest::Client::new(),
+            max_retries: 0,
+            base_delay: Duration::from_millis(1),
+        };
+        assert!(
+            matches!(
+                zero_dim.embed_documents(&[EmbedInput::text("x")]).await,
+                Err(EmbedError::Config(_))
+            ),
+            "dim=0 must produce Config error"
+        );
+
+        // No HTTP requests must have been sent for any of the above.
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            0,
+            "config errors must be caught before any HTTP request"
+        );
     }
 }
