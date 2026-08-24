@@ -624,16 +624,11 @@ impl Store {
              WHERE c.media_type != 'text'",
         )?;
 
-        // Max-heap keyed by (dist_bits, rowid): the root holds the entry with
-        // the LARGEST distance, so when the heap is full we can evict the
-        // worst candidate to make room for a closer one. IEEE 754 positive
-        // floats sort correctly by their bit representation; cosine distance
-        // is always ≥ 0, so this encoding is safe.
-        //
-        // Tie-break: the eviction condition uses strict `<`, so a new entry
-        // with the same distance as the current worst is not admitted. Among
-        // equally-distant candidates the first-scanned (lowest rowid, earliest
-        // in table order) is retained; higher-rowid duplicates are discarded.
+        // Max-heap of (dist_bits, rowid): the root holds the LARGEST distance.
+        // When full, evict the worst to admit a closer candidate. IEEE 754
+        // positive floats compare correctly by bit representation; cosine
+        // distance is ≥ 0, so this encoding is safe. Ties retain the first
+        // scanned (lowest rowid).
         let mut heap: BinaryHeap<(u32, i64)> = BinaryHeap::with_capacity(k + 1);
 
         let mut rows = stmt.query([])?;
@@ -1184,9 +1179,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Dim used by the store's own tests. Small and cheap — the behavior
-    /// under test (upsert, FTS sync, vec delete+insert, caching, reopen)
-    /// doesn't depend on the embedding size as long as it's consistent.
     const TEST_DIM: usize = 8;
 
     fn open_temp() -> (TempDir, Store) {
@@ -1333,22 +1325,14 @@ mod tests {
         );
     }
 
-    /// Confirm that `search_media_vec` with a cap of `k` returns exactly the
-    /// `k` closest media chunks and that eviction actually fires.
-    ///
-    /// Chunks are inserted in an order that interleaves near and far distances:
-    /// the heap fills with two far entries first, then a closer entry arrives
-    /// and evicts the worst, then another closer entry arrives and evicts again.
-    /// A min-heap (the original broken implementation) keeps the two furthest
-    /// instead of the two closest, so this test would fail against it.
+    /// `search_media_vec` with cap `k` returns exactly the `k` closest media
+    /// chunks in ascending-distance order. Chunks are inserted far-first so
+    /// the heap must evict twice; text chunks are excluded.
     #[test]
     fn search_media_vec_top_k_is_bounded_and_ordered() {
-        // Use a small cap so eviction is forced.
         const CAP: usize = 2;
         let (_d, s) = open_temp();
 
-        // Insert one text chunk (must be excluded) and four media chunks.
-        // Insertion order is far→far→near→near so eviction fires twice.
         let text_id = s
             .upsert_chunk(&sample_chunk(0, "text", "tx"), "t.md", 1)
             .unwrap();
@@ -1361,20 +1345,15 @@ mod tests {
             c
         };
 
-        // Insert in order: far first (dist=1.0), second-far (dist=0.5),
-        // then close (dist≈0.025), then closest (dist≈0.0). The heap fills
-        // after the first two, then evicts id_c when id_b arrives, and evicts
-        // id_b when id_a arrives — two evictions total.
+        // Insertion order: far first (dist=1.0), second-far (dist=0.5),
+        // near (dist≈0.025), closest (dist≈0.0). Heap fills after the first
+        // two, then evicts id_c when id_b arrives, and id_d when id_a arrives.
         let id_c = s.upsert_chunk(&make_image("c", "hc"), "c.png", 1).unwrap(); // dist=1.0
         let id_d = s.upsert_chunk(&make_image("d", "hd"), "d.png", 1).unwrap(); // dist=0.5
         let id_b = s.upsert_chunk(&make_image("b", "hb"), "b.png", 1).unwrap(); // dist≈0.025
         let id_a = s.upsert_chunk(&make_image("a", "ha"), "a.png", 1).unwrap(); // dist≈0.0
 
-        // Embeddings (pre-normalised unit vectors; cosine dist = 1 − dot product):
-        //   id_c → [-1, 0, …]  dist = 1.0  (inserted 1st — fills heap slot 1)
-        //   id_d → [ 0, 1, …]  dist = 0.5  (inserted 2nd — fills heap slot 2)
-        //   id_b → [√0.95, √0.05, …]  dist ≈ 0.025  (closer than id_d → evicts id_c)
-        //   id_a → [ 1, 0, …]  dist ≈ 0.0  (closest → evicts id_d)
+        // cosine dist = 1 − dot(query, v) for unit vectors, query = [1,0,…]
         s.set_vector_for_chunk(id_c, &[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             .unwrap();
         s.set_vector_for_chunk(id_d, &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -1391,7 +1370,6 @@ mod tests {
         let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let hits = s.search_media_vec(&query, CAP).unwrap();
 
-        // Exactly CAP results returned.
         assert_eq!(
             hits.len(),
             CAP,
@@ -1399,7 +1377,6 @@ mod tests {
             hits.len()
         );
 
-        // The two returned ids must be the two closest: id_a (dist≈0.0) and id_b (dist≈0.025).
         let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
         assert_eq!(
             ids,
@@ -1407,14 +1384,12 @@ mod tests {
             "top-2 must be id_a then id_b (closest first)"
         );
 
-        // Distances must be non-decreasing (ascending order).
         assert!(
             hits[0].1 <= hits[1].1,
             "hits must be ordered ascending by distance: {:?}",
             hits
         );
 
-        // Text chunk and the two far chunks must never appear.
         let result_ids: std::collections::HashSet<i64> = hits.iter().map(|(id, _)| *id).collect();
         assert!(
             !result_ids.contains(&text_id),
@@ -1430,14 +1405,8 @@ mod tests {
         );
     }
 
-    /// Same correctness check as above but with chunks inserted in REVERSE
-    /// distance order (furthest rowid first, closest rowid last). The table
-    /// scan returns rows in rowid order, so the heap sees distances
-    /// [1.0, 0.5, ≈0.05, ≈0.0] — furthest first, closest last.
-    ///
-    /// A min-heap (the original broken implementation) would evict the two
-    /// closest entries as they arrive, leaving the two furthest in the result.
-    /// A correct max-heap must still return the two closest.
+    /// Same correctness check as above but with chunks inserted in reverse
+    /// distance order: the table scan sees furthest first, closest last.
     #[test]
     fn search_media_vec_top_k_correct_when_furthest_inserted_first() {
         const CAP: usize = 2;
@@ -1449,9 +1418,7 @@ mod tests {
             c
         };
 
-        // Insert in DESCENDING distance order so rowid order = furthest first.
-        // id_far1 is farthest (dist=1.0), id_far2 is next (dist=0.5),
-        // id_near2 is close (dist≈0.05), id_near1 is closest (dist≈0.0).
+        // Insert furthest-first so rowid order == descending distance.
         let id_far1 = s
             .upsert_chunk(&make_image("far1", "hfar1"), "far1.png", 1)
             .unwrap();
@@ -1467,7 +1434,6 @@ mod tests {
 
         let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
-        // Assign embeddings: further from query = higher rowid.
         s.set_vector_for_chunk(id_far1, &[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             .unwrap(); // dist = 1.0
         s.set_vector_for_chunk(id_far2, &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -1490,13 +1456,11 @@ mod tests {
             hits.len()
         );
 
-        // Must return the two CLOSEST (id_near1 and id_near2), not the two furthest.
         let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
         assert_eq!(
             ids,
             vec![id_near1, id_near2],
-            "top-2 must be the two closest chunks regardless of insertion order; \
-             a min-heap bug returns the two furthest instead: got {ids:?}"
+            "top-2 must be the two closest chunks regardless of insertion order; got {ids:?}"
         );
 
         assert!(
@@ -1506,13 +1470,12 @@ mod tests {
         );
     }
 
-    /// Inserting many media chunks (more than SQLITE_MAX_VARIABLE_NUMBER, which
-    /// is typically 999) must not fail with a "too many SQL variables" error.
-    /// The old `IN (…)` implementation would blow up here.
+    /// N > SQLITE_MAX_VARIABLE_NUMBER (999) media chunks must not produce a
+    /// "too many SQL variables" error — the streaming join avoids IN (…).
     #[test]
     fn search_media_vec_handles_many_media_chunks_without_variable_overflow() {
         let (_d, s) = open_temp();
-        const N: usize = 1_100; // exceeds the default SQLITE_MAX_VARIABLE_NUMBER (999)
+        const N: usize = 1_100;
 
         let make_image = |idx: usize| {
             let mut c = sample_chunk(idx, "img content", &format!("h{idx}"));
@@ -1524,20 +1487,15 @@ mod tests {
             let id = s
                 .upsert_chunk(&make_image(i), &format!("img{i}.png"), 1)
                 .unwrap();
-            // Use a simple unit vector (dimension 0 = 1/(sqrt(8)), rest zero).
             let mut v = [0.0f32; TEST_DIM];
             v[i % TEST_DIM] = 1.0;
             s.set_vector_for_chunk(id, &v).unwrap();
         }
 
         let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        // Must succeed without panicking or returning a SQLite error.
         let hits = s
             .search_media_vec(&query, 10)
             .expect("search must succeed with many media chunks");
-        // The cap of 10 must be respected exactly. With 1100 chunks and a query
-        // that aligns with dimension-0, there are more than 10 candidates, so
-        // the result must be exactly 10.
         assert_eq!(
             hits.len(),
             10,
@@ -2032,16 +1990,12 @@ mod tests {
 
     #[test]
     fn embedding_cache_swept_on_dim_change() {
-        // Any embedding_cache row whose stored dim doesn't match the
-        // currently-open dim is deleted on open. We can't actually reopen
-        // at a mismatched dim (SchemaDimMismatch would block that), so
-        // simulate the state by poking a stale row with `dim = 99` into
-        // the cache while open at dim=8, then closing and reopening.
+        // Simulate a stale row (dim=99) by bypassing put_embedding_cache,
+        // which would reject a mismatched dim.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("x.db");
         {
             let s = Store::open(&path, 8).expect("first open");
-            // Bypass the dim check inside put_embedding_cache.
             s.conn()
                 .execute(
                     "INSERT INTO embedding_cache(content_hash, model, task_type, dim, embedding, created_at) \
@@ -2050,7 +2004,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        // Reopen at the same dim — sweep should delete the dim=99 row.
         let s = Store::open(&path, 8).expect("reopen");
         let n: i64 = s
             .conn()
@@ -2366,18 +2319,13 @@ mod tests {
         );
     }
 
-    /// When only 2 of the 3 fingerprint keys are present (`embedding_provider`
-    /// and `embedding_model` but not `embedding_dim`), `peek_fingerprint` must
-    /// return `None`. The partial-key branch is what `FingerprintOutcome::from_peek`
-    /// maps to `Fresh`, so a wrong return here would let a corrupted DB slip
-    /// through as a dim=0 Mismatch.
+    /// With 2-of-3 fingerprint keys present, `peek_fingerprint` returns `None`.
     #[test]
     fn peek_fingerprint_returns_none_for_partial_keys() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("x.db");
         {
-            // open_for_reembed skips reconcile_embedding_dim, so embedding_dim
-            // is not written to meta. Write only provider and model manually.
+            // open_for_reembed skips reconcile_embedding_dim; write only provider and model.
             let s = Store::open_for_reembed(&path, TEST_DIM).unwrap();
             s.set_meta("embedding_provider", "gemini").unwrap();
             s.set_meta("embedding_model", "gemini-embedding-001")
@@ -2390,15 +2338,13 @@ mod tests {
         );
     }
 
-    /// When only 1 of the 3 fingerprint keys is present, `peek_fingerprint`
-    /// must also return `None`.
+    /// With 1-of-3 fingerprint keys present, `peek_fingerprint` returns `None`.
     #[test]
     fn peek_fingerprint_returns_none_for_single_key() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("x.db");
         {
-            // open_for_reembed skips reconcile_embedding_dim so embedding_dim
-            // is absent; write only embedding_provider.
+            // open_for_reembed skips reconcile_embedding_dim.
             let s = Store::open_for_reembed(&path, TEST_DIM).unwrap();
             s.set_meta("embedding_provider", "gemini").unwrap();
         }
@@ -2411,15 +2357,12 @@ mod tests {
 
     // --- provider-only mismatch ------------------------------------------
 
-    /// `check_fingerprint` must detect a provider change even when model and
-    /// dim are identical. This exercises the branch that was untested by the
-    /// E2E test (which changed the dim, not just the provider).
+    /// `check_fingerprint` detects a provider change even when model and dim are unchanged.
     #[test]
     fn fingerprint_mismatch_provider_only() {
         let (_d, s) = open_temp();
         s.set_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
             .unwrap();
-        // Same model and dim as stored, only the provider differs.
         let outcome = s
             .check_fingerprint("voyage", "gemini-embedding-001", TEST_DIM)
             .unwrap();
@@ -2436,14 +2379,10 @@ mod tests {
         assert!(msg.contains("--reembed"), "{msg}");
     }
 
-    /// A DB with only `embedding_provider` written (partial fingerprint from
-    /// a hypothetical crash mid-`set_fingerprint`) must be treated as
-    /// `Fresh`, not `Mismatch`. This prevents confusing error messages with
-    /// fabricated empty-string field values.
+    /// A partial fingerprint (only `embedding_provider` written) is treated as `Fresh`.
     #[test]
     fn partial_fingerprint_is_fresh() {
         let (_d, s) = open_temp();
-        // Write only the first of the three fingerprint keys directly.
         s.set_meta("embedding_provider", "gemini").unwrap();
         let outcome = s
             .check_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
@@ -2455,9 +2394,7 @@ mod tests {
         );
     }
 
-    /// All three fingerprint meta keys must be present immediately after
-    /// `set_fingerprint`, with no window where any key can be absent.
-    /// Mirrors `wipe_and_rebuild_fingerprint_is_atomic`.
+    /// All three fingerprint meta keys are written atomically by `set_fingerprint`.
     #[test]
     fn set_fingerprint_writes_all_three_keys() {
         let (_d, s) = open_temp();
