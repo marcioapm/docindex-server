@@ -1,6 +1,6 @@
 # docindex-server
 
-Semantic + BM25 search server for personal docs/notes. Indexes a folder of markdown, serves a tiny HTTP API over Tailscale. Built to power an Obsidian mobile plugin (`docindex` binary) and a CLI (`docindex-search`) — anything that wants ranked retrieval against a personal vault.
+Semantic + BM25 search server for personal docs/notes. Indexes a folder of markdown, serves a tiny HTTP API over Tailscale. Built to power the [`docindex-obsidian`](https://github.com/marcioapm/docindex-obsidian) plugin and the `docindex-search` CLI — anything that wants ranked retrieval against a personal vault.
 
 ## What it indexes
 Files with extension `.md` or `.txt` (case-insensitive) anywhere under the configured vault directory. Dot-files, `.git`, `.obsidian`, and `node_modules` are skipped. Heading-less files (plain `.txt`) flow through the chunker's 500-word fallback path.
@@ -119,6 +119,11 @@ Heading-aware (H1/H2/H3), ~500-token fallback, 50-token overlap. Stored per chun
 - Embedding cache keyed by `content_hash` (survives renames/moves).
 - The index is fingerprinted with the `(provider, model, dim)` it was built with (`base_url` is excluded — pointing at a proxy/mock never invalidates a good index). A mismatch on startup refuses with an error naming every changed field and both values; pass `--reembed` to wipe chunks/vectors/FTS and rebuild at the new settings. See ["Changing the embedding dim, provider, or model"](docs/deployment.md#changing-the-embedding-dim-provider-or-model) in the deployment guide.
 
+## Clients
+
+- [`docindex-obsidian`](https://github.com/marcioapm/docindex-obsidian) — Obsidian desktop/mobile client with opt-in remote semantic + BM25 search.
+- `docindex-search` — CLI shipped by this repository.
+
 ## Deployment
 - Host: any Linux VPS, bound to the Tailscale interface.
 - Process: systemd user service.
@@ -152,4 +157,4 @@ make pytest
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and [`CLAUDE.md`](CLAUDE.md) for coding standards.
 
 ## License
-Private — for personal use.
+MIT — see [LICENSE](LICENSE).
