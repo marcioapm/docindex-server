@@ -166,9 +166,7 @@ impl Voyage {
                 return decode_embeddings(&raw, input_count, self.dim);
             }
 
-            let message = parse_api_error(&raw).unwrap_or_else(|| {
-                String::from_utf8(raw.to_vec()).unwrap_or_else(|_| "<binary body>".into())
-            });
+            let message = parse_api_error(&raw).unwrap_or_else(|| sanitise_error_body(&raw));
             last_err = EmbedError::Api {
                 status: status.as_u16(),
                 message,
@@ -327,6 +325,24 @@ fn parse_api_error(raw: &[u8]) -> Option<String> {
     match msg {
         Some(m) if !m.is_empty() => Some(m),
         _ => None,
+    }
+}
+
+/// Build a bounded, single-line excerpt from a raw response body for use in
+/// error messages and logs. Caps at 200 bytes and replaces control characters
+/// (newlines, tabs, etc.) with spaces so the excerpt stays on one log line.
+fn sanitise_error_body(raw: &[u8]) -> String {
+    const MAX_BYTES: usize = 200;
+    let truncated = &raw[..raw.len().min(MAX_BYTES)];
+    let text = String::from_utf8_lossy(truncated);
+    let single_line: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if raw.len() > MAX_BYTES {
+        format!("{single_line}…")
+    } else {
+        single_line
     }
 }
 
