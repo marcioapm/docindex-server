@@ -36,7 +36,7 @@ Create `~/.config/docindex/env` on the host:
 DOCINDEX_VAULT_DIR=/home/docindex/vault
 DOCINDEX_DB_PATH=/home/docindex/index.db
 # Use the Tailscale IP assigned to this host:
-DOCINDEX_LISTEN=100.83.46.59:7777
+DOCINDEX_LISTEN=100.64.0.1:7777
 DOCINDEX_BEARER=<random 32-char secret>
 GEMINI_API_KEY=<from Google AI Studio>
 DOCINDEX_EMBED_MODEL=gemini-embedding-001
@@ -106,9 +106,9 @@ Traffic from Tailscale (`tailscale0`) is allowed by default interface policy; UF
 From any Tailscale peer:
 
 ```sh
-curl http://100.83.46.59:7777/health
+curl http://100.64.0.1:7777/health
 curl -H "Authorization: Bearer $DOCINDEX_BEARER" \
-    -X POST http://100.83.46.59:7777/search \
+    -X POST http://100.64.0.1:7777/search \
     -H 'Content-Type: application/json' \
     -d '{"query":"hello","limit":5}'
 ```
@@ -156,26 +156,42 @@ And on an already-migrated DB:
 DEBUG path migration: already at path_schema_version=1
 ```
 
-## Changing the embedding dim
+## Changing the embedding dim, provider, or model
 
-`DOCINDEX_EMBED_DIM` is baked into the `chunks_vec` DDL *and* cached in `meta.embedding_dim`. The store refuses to open when the two disagree — you'll see:
+The index is fingerprinted on first boot: `meta.embedding_provider` /
+`embedding_model` / `embedding_dim` record what it was built with. On every
+subsequent boot the effective config (TOML + env + flags) is compared
+against that fingerprint:
 
-```
-store: embedding_dim on disk is <stored>, config says <new> — refusing to mix. Delete index.db to reindex at new dim.
-```
+- match → starts normally.
+- mismatch → refuses to start, naming every changed field and both values:
 
-To switch dim (e.g. 768 → 3072):
+  ```
+  index built with provider=gemini model=gemini-embedding-001 dim=3072,
+  config says provider=voyage model=voyage-4 dim=1024; re-embed required:
+  run with --reembed
+  ```
+
+To switch provider/model/dim (e.g. gemini 3072 → voyage-4 1024, or just a
+dim change like 768 → 3072):
 
 ```sh
 systemctl --user stop docindex-server
-# Update the env file:
-#   sed -i 's/^DOCINDEX_EMBED_DIM=.*/DOCINDEX_EMBED_DIM=3072/' ~/.config/docindex/env
-rm ~/index.db ~/index.db-wal ~/index.db-shm 2>/dev/null || true
-systemctl --user start docindex-server
-journalctl --user -u docindex-server -f   # watch the reindex
+# Update ~/.config/docindex/env or server.toml with the new [embed] settings.
+docindex --reembed   # or add --reembed to the systemd ExecStart temporarily
 ```
 
-The initial scan will re-embed every file at the new dim. Embedding cache rows at the previous dim are swept on open, so there's no chance of mixed-dim reads.
+`--reembed` wipes `chunks`, `files`, `embedding_cache`, `chunks_fts`, and
+`chunks_vec` in one transaction, recreates `chunks_vec` at the new dim, and
+writes the new fingerprint — then the normal startup scan re-embeds every
+file. Remove `--reembed` from the unit after the first successful boot; it
+is not meant to stay in the permanent `ExecStart`. `base_url` (proxy/mock
+overrides) is intentionally excluded from the fingerprint.
+
+`(provider, model, dim)` is baked into `chunks_vec`'s DDL (dim as a SQL
+literal) *and* cached in `meta`; there's no way to mix reads across dims —
+the store refuses to open on a raw dim-only mismatch even before the
+fingerprint check runs.
 
 ## Tuning display + threshold
 

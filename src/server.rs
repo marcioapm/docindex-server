@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use crate::{
     Config,
     api::{self, AppState},
-    embed::{AnyEmbedder, Fake, Gemini},
+    embed::{AnyEmbedder, Fake, Gemini, Voyage},
     indexer::{self, IndexerCtx},
     store::Store,
     watch as watcher,
@@ -28,7 +28,7 @@ use crate::{
 /// graceful shutdown on SIGINT/SIGTERM or a bind error).
 pub async fn run(cfg: Config) -> Result<()> {
     let embedder = build_embedder(&cfg)?;
-    let store = Store::open(&cfg.db_path, cfg.embed_dim).context("open store")?;
+    let store = open_store_with_fingerprint_check(&cfg)?;
     // Rewrite any pre-0.2.0 absolute paths to vault-relative form. Idempotent
     // across restarts; a mismatch between the DB's paths and the configured
     // vault_dir is surfaced as a refusal (logged, not fatal) so operators can
@@ -109,7 +109,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         listen = %bound,
         vault = %cfg.vault_dir.display(),
         db = %cfg.db_path.display(),
-        embed_backend = %cfg.embed_backend,
+        embed_backend = %cfg.embed_provider,
         "docindex-server listening"
     );
 
@@ -133,20 +133,98 @@ pub async fn run(cfg: Config) -> Result<()> {
     res
 }
 
+/// Open the store, resolving the embedding fingerprint (provider/model/dim)
+/// *before* the dim gets baked into `chunks_vec`'s DDL.
+///
+/// - No prior fingerprint (fresh DB, or pre-fingerprint upgrade): open
+///   normally and adopt the current config as the fingerprint.
+/// - Fingerprint matches: open normally.
+/// - Fingerprint mismatches and `--reembed` is not set: refuse with a
+///   message naming every changed field and both values.
+/// - Fingerprint mismatches and `--reembed` is set: open in reembed mode
+///   (skips the low-level dim refusal) and wipe + rebuild at the new dim.
+///
+/// The routing decision (normal open vs reembed open) and the mismatch
+/// message are both derived from `FingerprintOutcome::from_peek`, which
+/// applies the same comparison semantics as `Store::check_fingerprint`,
+/// so there is a single implementation of the equality rule.
+fn open_store_with_fingerprint_check(cfg: &Config) -> Result<Store> {
+    let provider = cfg.embed_provider.as_str();
+    let model = &cfg.embed_model;
+    let dim = cfg.embed_dim;
+
+    // Peek the stored fingerprint before the dim gets baked into chunks_vec's
+    // DDL — a mismatched dim passed to Store::open would be rejected by the
+    // low-level dim guard before we could surface the full fingerprint message.
+    let stored = Store::peek_fingerprint(&cfg.db_path).context("peek embedding fingerprint")?;
+
+    // Derive the routing decision from FingerprintOutcome so the comparison
+    // semantics (Fresh / Match / Mismatch) are not duplicated inline.
+    let peek_outcome = crate::store::FingerprintOutcome::from_peek(stored, provider, model, dim);
+    let store = match peek_outcome {
+        crate::store::FingerprintOutcome::Mismatch(_) => {
+            // Open without the dim guard so check_fingerprint can read meta
+            // before any reembed wipe.
+            Store::open_for_reembed(&cfg.db_path, dim).context("open store")?
+        }
+        _ => Store::open(&cfg.db_path, dim).context("open store")?,
+    };
+
+    // check_fingerprint reads the live meta rows and produces the
+    // authoritative outcome, including the canonical mismatch message.
+    match store
+        .check_fingerprint(provider, model, dim)
+        .context("check embedding fingerprint")?
+    {
+        crate::store::FingerprintOutcome::Fresh => {
+            store
+                .set_fingerprint(provider, model, dim)
+                .context("set embedding fingerprint")?;
+            Ok(store)
+        }
+        crate::store::FingerprintOutcome::Match => Ok(store),
+        crate::store::FingerprintOutcome::Mismatch(msg) if cfg.reembed => {
+            warn!(reason = %msg, "fingerprint mismatch; --reembed set, wiping and rebuilding");
+            store
+                .wipe_and_rebuild(dim, provider, model)
+                .context("wipe and rebuild index for --reembed")?;
+            Ok(store)
+        }
+        crate::store::FingerprintOutcome::Mismatch(msg) => Err(anyhow!("{msg}")),
+    }
+}
+
 fn build_embedder(cfg: &Config) -> Result<AnyEmbedder> {
-    match cfg.embed_backend.as_str() {
-        "gemini" => {
-            let g = Gemini::new(
-                cfg.gemini_key.clone(),
+    match cfg.embed_provider {
+        crate::embed::registry::EmbedProvider::Gemini => {
+            let mut g = Gemini::new(
+                cfg.embed_api_key.clone(),
                 cfg.embed_model.clone(),
                 cfg.embed_dim,
                 cfg.http_timeout,
             )
             .map_err(|e| anyhow!("build gemini client: {e}"))?;
+            if let Some(base_url) = &cfg.embed_base_url {
+                g.base_url = base_url.clone();
+            }
             Ok(AnyEmbedder::Gemini(Arc::new(g)))
         }
-        "fake" => Ok(AnyEmbedder::Fake(Arc::new(Fake::new(cfg.embed_dim)))),
-        other => Err(anyhow!("unknown DOCINDEX_EMBED {other:?}")),
+        crate::embed::registry::EmbedProvider::Voyage => {
+            let mut v = Voyage::new(
+                cfg.embed_api_key.clone(),
+                cfg.embed_model.clone(),
+                cfg.embed_dim,
+                cfg.http_timeout,
+            )
+            .map_err(|e| anyhow!("build voyage client: {e}"))?;
+            if let Some(base_url) = &cfg.embed_base_url {
+                v.base_url = base_url.clone();
+            }
+            Ok(AnyEmbedder::Voyage(Arc::new(v)))
+        }
+        crate::embed::registry::EmbedProvider::Fake => {
+            Ok(AnyEmbedder::Fake(Arc::new(Fake::new(cfg.embed_dim))))
+        }
     }
 }
 
@@ -192,3 +270,40 @@ fn _type_assertions() {
 // Silence unused `Ordering` when the cfg paths don't use it.
 #[allow(dead_code)]
 const _ORDERING: Ordering = Ordering::Relaxed;
+
+#[cfg(test)]
+mod tests {
+    use crate::store::{FingerprintOutcome, Store};
+    use tempfile::TempDir;
+
+    /// A first-boot open (fresh DB) must write the fingerprint so that a
+    /// second open detects a Match rather than Fresh. If the write were
+    /// dropped, the second open would also return Fresh and never catch a
+    /// provider/model/dim change.
+    #[test]
+    fn fresh_db_boot_writes_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("x.db");
+
+        // Simulate first boot: no stored fingerprint.
+        {
+            let store = Store::open(&db, 8).expect("open");
+            let outcome = store.check_fingerprint("fake", "fake", 8).expect("check");
+            assert_eq!(outcome, FingerprintOutcome::Fresh, "new DB must be Fresh");
+            store
+                .set_fingerprint("fake", "fake", 8)
+                .expect("set fingerprint");
+        }
+
+        // Second open: fingerprint must now Match, not Fresh.
+        let store2 = Store::open(&db, 8).expect("reopen");
+        let outcome2 = store2
+            .check_fingerprint("fake", "fake", 8)
+            .expect("check again");
+        assert_eq!(
+            outcome2,
+            FingerprintOutcome::Match,
+            "fingerprint written on first boot must be detected as Match on second open"
+        );
+    }
+}

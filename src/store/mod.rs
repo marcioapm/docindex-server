@@ -34,7 +34,7 @@ pub enum StoreError {
     #[error("store: embedding_cache row dim mismatch: got {got}, want {want}")]
     CacheDimMismatch { got: usize, want: usize },
     #[error(
-        "store: embedding_dim on disk is {stored}, config says {config} — refusing to mix. Delete the index DB to reindex at the new dim."
+        "store: embedding_dim on disk is {stored}, config says {config} — run with --reembed to reindex at the new dim, or delete the index DB as a fallback."
     )]
     SchemaDimMismatch { stored: usize, config: usize },
 }
@@ -46,12 +46,85 @@ pub struct Store {
 }
 
 impl Store {
+    /// Read the embedding fingerprint (`embedding_provider` / `embedding_model`
+    /// / `embedding_dim` in `meta`) without applying the dim-specific
+    /// `chunks_vec` DDL. Used by callers that need to decide *how* to open
+    /// (normal vs. `--reembed`) before the dim gets baked into a virtual
+    /// table — `chunks_vec`'s `CREATE VIRTUAL TABLE IF NOT EXISTS` would
+    /// otherwise silently keep whatever dim the table already has.
+    ///
+    /// Returns `None` for a DB file that doesn't exist yet, or exists but
+    /// has never had a fingerprint written (fresh index).
+    pub fn peek_fingerprint(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<(String, String, usize)>, StoreError> {
+        if !path.as_ref().exists() {
+            return Ok(None);
+        }
+        register_sqlite_vec()?;
+        let conn = Connection::open(path.as_ref())?;
+        init_pragmas(&conn)?;
+        // `meta` lives in the base schema, not the dim-parameterized part —
+        // safe to apply without ever touching `chunks_vec`.
+        conn.execute_batch(SCHEMA_SQL)
+            .map_err(|e| StoreError::Msg(format!("apply base schema: {e}")))?;
+        let provider: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'embedding_provider'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let model: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'embedding_model'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let dim: Option<usize> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'embedding_dim'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|v| v.parse().ok());
+        Ok(match (provider, model, dim) {
+            (Some(p), Some(m), Some(d)) => Some((p, m, d)),
+            _ => None,
+        })
+    }
+
     /// Open (or create) the SQLite DB at `path`. Registers `sqlite-vec` as
     /// an auto-extension exactly once per process, applies the base schema,
     /// renders + applies the `chunks_vec` DDL with `embed_dim` baked into
     /// `FLOAT[...]`, and enforces that `meta.embedding_dim` matches
     /// `embed_dim` (refusing to start on mismatch).
+    ///
+    /// Callers that need the unified `provider=.../model=.../dim=...`
+    /// fingerprint mismatch message (rather than this lower-level dim-only
+    /// refusal) should call [`Store::peek_fingerprint`] first and only
+    /// reach `open` once they know the dim will match — see
+    /// `server::open_store_with_fingerprint_check`.
     pub fn open(path: impl AsRef<Path>, embed_dim: usize) -> Result<Self, StoreError> {
+        Self::open_internal(path, embed_dim, false)
+    }
+
+    /// Open for a `--reembed` run: skips the `embedding_dim` mismatch
+    /// refusal so the caller can immediately call [`Store::wipe_and_rebuild`]
+    /// to drop and recreate `chunks_vec` at the new dim. Opening this way
+    /// without following up with a wipe leaves the store in an inconsistent
+    /// state — callers must always pair it with `wipe_and_rebuild`.
+    pub fn open_for_reembed(path: impl AsRef<Path>, embed_dim: usize) -> Result<Self, StoreError> {
+        Self::open_internal(path, embed_dim, true)
+    }
+
+    fn open_internal(
+        path: impl AsRef<Path>,
+        embed_dim: usize,
+        skip_dim_check: bool,
+    ) -> Result<Self, StoreError> {
         if embed_dim == 0 {
             return Err(StoreError::Msg("embed_dim must be > 0".into()));
         }
@@ -61,14 +134,111 @@ impl Store {
         verify_vec_loaded(&conn)?;
         // Apply the base schema and the dim-parameterized `chunks_vec` DDL
         // in a single batch. vec0 requires the dim as a SQL literal, so it
-        // can't live in the static schema.sql file.
+        // can't live in the static schema.sql file. If `chunks_vec` already
+        // exists at a different dim, `IF NOT EXISTS` makes this a silent
+        // no-op — safe because the `skip_dim_check=true` (reembed) caller
+        // is about to drop and recreate it anyway, and the normal caller
+        // gets a hard refusal below.
         let full_schema = format!("{}\n{}", SCHEMA_SQL, vec_schema_ddl(embed_dim));
         conn.execute_batch(&full_schema)
             .map_err(|e| StoreError::Msg(format!("apply schema: {e}")))?;
         let s = Self { conn };
         s.set_meta("schema_version", SCHEMA_VERSION)?;
-        s.reconcile_embedding_dim(embed_dim)?;
+        if !skip_dim_check {
+            s.reconcile_embedding_dim(embed_dim)?;
+        }
         Ok(s)
+    }
+
+    /// Drop and recreate `chunks_fts` and `chunks_vec`, delete every row of
+    /// `chunks` / `files` / `embedding_cache`, and write the new embedding
+    /// fingerprint. Used by `--reembed` after [`Store::open_for_reembed`] —
+    /// the only supported way to change the embedding dim on an existing
+    /// DB, since `chunks_vec`'s dim is baked into its DDL.
+    ///
+    /// The wipe and the fingerprint write are atomic: all three meta keys
+    /// (`embedding_provider` / `embedding_model` / `embedding_dim`) are
+    /// upserted inside the transaction before `commit`. A crash after commit
+    /// leaves a wiped index whose fingerprint exactly matches the new config.
+    pub fn wipe_and_rebuild(
+        &self,
+        embed_dim: usize,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch("DROP TABLE IF EXISTS chunks_fts; DROP TABLE IF EXISTS chunks_vec;")?;
+        tx.execute("DELETE FROM chunks", [])?;
+        tx.execute("DELETE FROM files", [])?;
+        tx.execute("DELETE FROM embedding_cache", [])?;
+        // Recreates chunks_fts (IF NOT EXISTS in SCHEMA_SQL; chunks/files/
+        // embedding_cache/meta are no-ops since they still exist) and
+        // chunks_vec at the new dim.
+        tx.execute_batch(SCHEMA_SQL)
+            .map_err(|e| StoreError::Msg(format!("reapply base schema: {e}")))?;
+        tx.execute_batch(&vec_schema_ddl(embed_dim))
+            .map_err(|e| StoreError::Msg(format!("recreate chunks_vec: {e}")))?;
+        // Write the fingerprint inside the same transaction so the wipe and
+        // the new fingerprint are committed atomically.
+        write_fingerprint_in_tx(&tx, provider, model, embed_dim)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Compare the stored embedding fingerprint (`embedding_provider` /
+    /// `embedding_model` / `embedding_dim` in `meta`) against the effective
+    /// config. A DB with no fingerprint recorded yet (pre-existing
+    /// deployments, or a genuinely empty index) is [`FingerprintOutcome::Fresh`]
+    /// — the caller should adopt the current config as the fingerprint via
+    /// [`Store::set_fingerprint`] rather than error, so upgrading an
+    /// existing production DB never breaks on its own.
+    ///
+    /// A partial fingerprint (one or two of the three keys present but not
+    /// all) is also treated as `Fresh`. This can only arise from a crash
+    /// mid-`set_fingerprint` on a very old build; the correct recovery is
+    /// to adopt the current config and re-write a complete fingerprint.
+    pub fn check_fingerprint(
+        &self,
+        provider: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<FingerprintOutcome, StoreError> {
+        let stored_provider = self.get_meta("embedding_provider")?;
+        let stored_model = self.get_meta("embedding_model")?;
+        // Require all three keys to constitute a real fingerprint. Any
+        // missing key (including partial-write state) is treated as Fresh.
+        let (stored_provider, stored_model) = match (stored_provider, stored_model) {
+            (Some(p), Some(m)) => (p, m),
+            _ => return Ok(FingerprintOutcome::Fresh),
+        };
+        let stored_dim: usize = match self.get_meta("embedding_dim")?.and_then(|v| v.parse().ok()) {
+            Some(d) => d,
+            None => return Ok(FingerprintOutcome::Fresh),
+        };
+        if stored_provider == provider && stored_model == model && stored_dim == dim {
+            return Ok(FingerprintOutcome::Match);
+        }
+        Ok(FingerprintOutcome::Mismatch(format!(
+            "index built with provider={stored_provider} model={stored_model} dim={stored_dim}, \
+             config says provider={provider} model={model} dim={dim}; re-embed required: run with --reembed"
+        )))
+    }
+
+    /// Record the embedding fingerprint atomically. Called once, on a
+    /// genuinely fresh index (see [`FingerprintOutcome::Fresh`]) or
+    /// immediately after [`Store::wipe_and_rebuild`] (which writes it
+    /// directly). All three keys are upserted inside a single transaction
+    /// so a crash between writes cannot leave a partial fingerprint.
+    pub fn set_fingerprint(
+        &self,
+        provider: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        write_fingerprint_in_tx(&tx, provider, model, dim)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Ensure `meta.embedding_dim` agrees with `embed_dim`:
@@ -567,6 +737,46 @@ pub enum MigrationOutcome {
     Refused { offending_rows: u64 },
 }
 
+/// Result of comparing the stored embedding fingerprint against the
+/// effective config, from [`Store::check_fingerprint`] or
+/// [`FingerprintOutcome::from_peek`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FingerprintOutcome {
+    /// No fingerprint recorded yet — caller should adopt the current config.
+    Fresh,
+    /// Stored fingerprint matches the effective config.
+    Match,
+    /// Mismatch; the `String` names exactly which field(s) changed and both
+    /// old/new values, ready to surface as a startup error.
+    Mismatch(String),
+}
+
+impl FingerprintOutcome {
+    /// Derive an outcome from the raw `peek_fingerprint` result, using the
+    /// same equality semantics as [`Store::check_fingerprint`]. Allows
+    /// callers to decide how to open the store (normal vs reembed) based
+    /// solely on the outcome variant, without a second independent comparison
+    /// of the three fingerprint fields.
+    pub fn from_peek(
+        stored: Option<(String, String, usize)>,
+        provider: &str,
+        model: &str,
+        dim: usize,
+    ) -> Self {
+        match stored {
+            None => FingerprintOutcome::Fresh,
+            Some((sp, sm, sd)) if sp == provider && sm == model && sd == dim => {
+                FingerprintOutcome::Match
+            }
+            Some((sp, sm, sd)) => FingerprintOutcome::Mismatch(format!(
+                "index built with provider={sp} model={sm} dim={sd}, \
+                 config says provider={provider} model={model} dim={dim}; \
+                 re-embed required: run with --reembed"
+            )),
+        }
+    }
+}
+
 /// Minimal row projection used to hydrate a search hit. Kept in the store
 /// module so SQL column order stays colocated with the schema.
 #[derive(Debug, Clone)]
@@ -576,6 +786,30 @@ pub struct HitRow {
     pub heading: String,
     pub heading_path: String,
     pub content: String,
+}
+
+/// Upsert the three embedding fingerprint keys inside an open transaction.
+/// Both `wipe_and_rebuild` and `set_fingerprint` share this body so the
+/// SQL and key names live in one place.
+fn write_fingerprint_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    provider: &str,
+    model: &str,
+    dim: usize,
+) -> Result<(), StoreError> {
+    let dim_str = dim.to_string();
+    for (key, val) in [
+        ("embedding_provider", provider),
+        ("embedding_model", model),
+        ("embedding_dim", dim_str.as_str()),
+    ] {
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, val],
+        )?;
+    }
+    Ok(())
 }
 
 fn null_if_empty(s: &str) -> Option<&str> {
@@ -871,6 +1105,28 @@ mod tests {
         );
     }
 
+    /// The `SchemaDimMismatch` error message must offer `--reembed` as the
+    /// primary recovery path. Deleting the DB is a fallback, not the first
+    /// instruction — operators who have data they want to preserve should
+    /// reach for `--reembed` first.
+    #[test]
+    fn schema_dim_mismatch_message_names_reembed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.db");
+        {
+            let _s = Store::open(&path, 8).expect("first open");
+        }
+        let err = match Store::open(&path, 16) {
+            Err(e) => e,
+            Ok(_) => panic!("expected SchemaDimMismatch error"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--reembed"),
+            "SchemaDimMismatch message must name --reembed; got: {msg}"
+        );
+    }
+
     #[test]
     fn reopen_at_same_dim_ok() {
         let dir = TempDir::new().unwrap();
@@ -1057,6 +1313,277 @@ mod tests {
         assert_eq!(
             s.get_meta("path_schema_version").unwrap().as_deref(),
             Some(PATH_SCHEMA_VERSION)
+        );
+    }
+
+    // --- fingerprint guard -------------------------------------------
+
+    #[test]
+    fn fingerprint_fresh_on_new_db() {
+        let (_d, s) = open_temp();
+        let outcome = s
+            .check_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        assert_eq!(outcome, FingerprintOutcome::Fresh);
+    }
+
+    #[test]
+    fn fingerprint_matches_after_set() {
+        let (_d, s) = open_temp();
+        s.set_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        let outcome = s
+            .check_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        assert_eq!(outcome, FingerprintOutcome::Match);
+    }
+
+    #[test]
+    fn fingerprint_mismatch_provider_names_both_values() {
+        let (_d, s) = open_temp();
+        s.set_fingerprint("gemini", "gemini-embedding-001", 3072)
+            .unwrap();
+        let outcome = s.check_fingerprint("voyage", "voyage-4", 1024).unwrap();
+        let msg = match outcome {
+            FingerprintOutcome::Mismatch(m) => m,
+            other => panic!("expected Mismatch, got {other:?}"),
+        };
+        assert!(msg.contains("provider=gemini"), "{msg}");
+        assert!(msg.contains("provider=voyage"), "{msg}");
+        assert!(msg.contains("model=gemini-embedding-001"), "{msg}");
+        assert!(msg.contains("model=voyage-4"), "{msg}");
+        assert!(msg.contains("dim=3072"), "{msg}");
+        assert!(msg.contains("dim=1024"), "{msg}");
+        assert!(msg.contains("--reembed"), "{msg}");
+    }
+
+    #[test]
+    fn fingerprint_mismatch_model_only() {
+        let (_d, s) = open_temp();
+        s.set_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        let outcome = s
+            .check_fingerprint("gemini", "some-other-model", TEST_DIM)
+            .unwrap();
+        assert!(matches!(outcome, FingerprintOutcome::Mismatch(_)));
+    }
+
+    #[test]
+    fn fingerprint_mismatch_dim_only() {
+        let (_d, s) = open_temp();
+        s.set_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        let outcome = s
+            .check_fingerprint("gemini", "gemini-embedding-001", TEST_DIM + 1)
+            .unwrap();
+        assert!(matches!(outcome, FingerprintOutcome::Mismatch(_)));
+    }
+
+    #[test]
+    fn wipe_and_rebuild_clears_data_and_sets_fingerprint() {
+        let (_d, s) = open_temp();
+        let id = s
+            .upsert_chunk(&sample_chunk(0, "alpha", "h1"), "/v/a.md", 1)
+            .unwrap();
+        s.set_vector_for_chunk(id, &[0.0; TEST_DIM]).unwrap();
+        s.set_file_state("/v/a.md", "h1", 1).unwrap();
+        s.put_embedding_cache("h1", "m", "t", TEST_DIM, &[0.0; TEST_DIM])
+            .unwrap();
+
+        s.wipe_and_rebuild(16, "voyage", "voyage-4").unwrap();
+
+        assert_eq!(s.count_chunks().unwrap(), 0);
+        assert!(s.list_indexed_paths().unwrap().is_empty());
+        assert!(s.get_embedding_cache("h1").unwrap().is_none());
+        let outcome = s.check_fingerprint("voyage", "voyage-4", 16).unwrap();
+        assert_eq!(outcome, FingerprintOutcome::Match);
+        // chunks_vec must be usable at the new dim.
+        s.conn()
+            .execute(
+                "INSERT INTO chunks_vec(rowid, embedding) VALUES (1, ?1)",
+                params![encode_f32(&[0.0_f32; 16])],
+            )
+            .expect("insert at new dim");
+    }
+
+    /// All three fingerprint meta keys must be present immediately after
+    /// `wipe_and_rebuild` and match what was requested. They are written
+    /// inside the wipe transaction, so this also validates atomicity — there
+    /// is no post-commit window where any key can be absent.
+    #[test]
+    fn wipe_and_rebuild_fingerprint_is_atomic() {
+        let (_d, s) = open_temp();
+        s.wipe_and_rebuild(32, "voyage", "voyage-4-lite").unwrap();
+
+        assert_eq!(
+            s.get_meta("embedding_provider").unwrap().as_deref(),
+            Some("voyage"),
+            "embedding_provider not written"
+        );
+        assert_eq!(
+            s.get_meta("embedding_model").unwrap().as_deref(),
+            Some("voyage-4-lite"),
+            "embedding_model not written"
+        );
+        assert_eq!(
+            s.get_meta("embedding_dim").unwrap().as_deref(),
+            Some("32"),
+            "embedding_dim not written"
+        );
+        let outcome = s.check_fingerprint("voyage", "voyage-4-lite", 32).unwrap();
+        assert_eq!(
+            outcome,
+            FingerprintOutcome::Match,
+            "fingerprint check should match after wipe_and_rebuild"
+        );
+    }
+
+    // --- peek_fingerprint ------------------------------------------------
+
+    /// `peek_fingerprint` on a non-existent path returns `None` immediately
+    /// without creating the file.
+    #[test]
+    fn peek_fingerprint_none_for_nonexistent_path() {
+        let dir = TempDir::new().unwrap();
+        let result = Store::peek_fingerprint(dir.path().join("no-such.db")).unwrap();
+        assert!(result.is_none(), "expected None for missing DB");
+    }
+
+    /// After `set_fingerprint` on an open store, `peek_fingerprint` on the
+    /// same path (with the store dropped) returns the exact same triple.
+    #[test]
+    fn peek_fingerprint_returns_written_triple() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.db");
+        {
+            let s = Store::open(&path, TEST_DIM).unwrap();
+            s.set_fingerprint("voyage", "voyage-4", TEST_DIM).unwrap();
+        }
+        let result = Store::peek_fingerprint(&path).unwrap();
+        assert_eq!(
+            result,
+            Some(("voyage".into(), "voyage-4".into(), TEST_DIM)),
+            "peek_fingerprint should return the stored triple"
+        );
+    }
+
+    /// When only 2 of the 3 fingerprint keys are present (`embedding_provider`
+    /// and `embedding_model` but not `embedding_dim`), `peek_fingerprint` must
+    /// return `None`. The partial-key branch is what `FingerprintOutcome::from_peek`
+    /// maps to `Fresh`, so a wrong return here would let a corrupted DB slip
+    /// through as a dim=0 Mismatch.
+    #[test]
+    fn peek_fingerprint_returns_none_for_partial_keys() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.db");
+        {
+            // open_for_reembed skips reconcile_embedding_dim, so embedding_dim
+            // is not written to meta. Write only provider and model manually.
+            let s = Store::open_for_reembed(&path, TEST_DIM).unwrap();
+            s.set_meta("embedding_provider", "gemini").unwrap();
+            s.set_meta("embedding_model", "gemini-embedding-001")
+                .unwrap();
+        }
+        let result = Store::peek_fingerprint(&path).unwrap();
+        assert!(
+            result.is_none(),
+            "2-of-3 fingerprint keys must return None, got: {result:?}"
+        );
+    }
+
+    /// When only 1 of the 3 fingerprint keys is present, `peek_fingerprint`
+    /// must also return `None`.
+    #[test]
+    fn peek_fingerprint_returns_none_for_single_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.db");
+        {
+            // open_for_reembed skips reconcile_embedding_dim so embedding_dim
+            // is absent; write only embedding_provider.
+            let s = Store::open_for_reembed(&path, TEST_DIM).unwrap();
+            s.set_meta("embedding_provider", "gemini").unwrap();
+        }
+        let result = Store::peek_fingerprint(&path).unwrap();
+        assert!(
+            result.is_none(),
+            "1-of-3 fingerprint keys must return None, got: {result:?}"
+        );
+    }
+
+    // --- provider-only mismatch ------------------------------------------
+
+    /// `check_fingerprint` must detect a provider change even when model and
+    /// dim are identical. This exercises the branch that was untested by the
+    /// E2E test (which changed the dim, not just the provider).
+    #[test]
+    fn fingerprint_mismatch_provider_only() {
+        let (_d, s) = open_temp();
+        s.set_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        // Same model and dim as stored, only the provider differs.
+        let outcome = s
+            .check_fingerprint("voyage", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        assert!(
+            matches!(outcome, FingerprintOutcome::Mismatch(_)),
+            "provider-only change must produce Mismatch, got: {outcome:?}"
+        );
+        let msg = match outcome {
+            FingerprintOutcome::Mismatch(m) => m,
+            _ => unreachable!(),
+        };
+        assert!(msg.contains("provider=gemini"), "{msg}");
+        assert!(msg.contains("provider=voyage"), "{msg}");
+        assert!(msg.contains("--reembed"), "{msg}");
+    }
+
+    /// A DB with only `embedding_provider` written (partial fingerprint from
+    /// a hypothetical crash mid-`set_fingerprint`) must be treated as
+    /// `Fresh`, not `Mismatch`. This prevents confusing error messages with
+    /// fabricated empty-string field values.
+    #[test]
+    fn partial_fingerprint_is_fresh() {
+        let (_d, s) = open_temp();
+        // Write only the first of the three fingerprint keys directly.
+        s.set_meta("embedding_provider", "gemini").unwrap();
+        let outcome = s
+            .check_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            FingerprintOutcome::Fresh,
+            "one key present but not all three must be treated as Fresh"
+        );
+    }
+
+    /// All three fingerprint meta keys must be present immediately after
+    /// `set_fingerprint`, with no window where any key can be absent.
+    /// Mirrors `wipe_and_rebuild_fingerprint_is_atomic`.
+    #[test]
+    fn set_fingerprint_writes_all_three_keys() {
+        let (_d, s) = open_temp();
+        s.set_fingerprint("voyage", "voyage-4", 1024).unwrap();
+
+        assert_eq!(
+            s.get_meta("embedding_provider").unwrap().as_deref(),
+            Some("voyage"),
+            "embedding_provider not written"
+        );
+        assert_eq!(
+            s.get_meta("embedding_model").unwrap().as_deref(),
+            Some("voyage-4"),
+            "embedding_model not written"
+        );
+        assert_eq!(
+            s.get_meta("embedding_dim").unwrap().as_deref(),
+            Some("1024"),
+            "embedding_dim not written"
+        );
+        let outcome = s.check_fingerprint("voyage", "voyage-4", 1024).unwrap();
+        assert_eq!(
+            outcome,
+            FingerprintOutcome::Match,
+            "fingerprint check must Match after set_fingerprint"
         );
     }
 }

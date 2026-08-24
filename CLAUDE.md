@@ -11,15 +11,19 @@ docindex-server/
 ├── Cargo.toml              # crate manifest (edition 2024, MSRV 1.90)
 ├── rust-toolchain.toml     # pin stable channel
 ├── src/
-│   ├── main.rs             # thin binary entry point (calls server::run)
+│   ├── main.rs             # docindex binary entry point (calls server::run)
 │   ├── lib.rs              # re-exports public modules
-│   ├── config.rs           # env parsing + validation
+│   ├── config.rs           # layered config: flags > env > TOML file > defaults
+│   ├── config/
+│   │   └── file.rs         # TOML discovery, injectable file-reader, *_env indirection
 │   ├── server.rs           # wires config → store → embedder → indexer → watcher → HTTP
 │   ├── walk.rs             # initial full-tree scan + content-hash diff
 │   ├── chunk.rs            # heading-aware markdown chunker (pure)
 │   ├── embed/
 │   │   ├── mod.rs          # Embedder trait + AnyEmbedder enum, task-type constants
+│   │   ├── registry.rs     # EmbedProvider enum + static model registry, validation
 │   │   ├── gemini.rs       # Gemini REST client (reqwest + rustls)
+│   │   ├── voyage.rs       # Voyage AI REST client (reqwest + rustls)
 │   │   └── fake.rs         # Deterministic fake for tests
 │   ├── indexer/
 │   │   └── mod.rs          # single pipeline: walk/watch → chunk → embed → store
@@ -32,22 +36,30 @@ docindex-server/
 │   │   ├── auth.rs         # bearer middleware (constant-time compare)
 │   │   ├── error.rs        # ApiError + IntoResponse
 │   │   └── handlers.rs     # /health /search /similar
-│   └── store/
-│       ├── mod.rs          # rusqlite + sqlite-vec wiring, upsert/delete/meta
-│       ├── schema.sql      # canonical schema (schema_version=2)
-│       └── vec.rs          # little-endian f32 (de)serialization
+│   ├── store/
+│   │   ├── mod.rs          # rusqlite + sqlite-vec wiring, upsert/delete/meta, fingerprint guard
+│   │   ├── schema.sql      # canonical schema (schema_version=2)
+│   │   └── vec.rs          # little-endian f32 (de)serialization
+│   ├── cli/
+│   │   ├── mod.rs          # re-exports for the docindex-search binary
+│   │   ├── config.rs       # CLI config layering (flags > env > cli.toml > defaults)
+│   │   ├── client.rs       # HTTP client against a running docindex server
+│   │   └── output.rs       # human-readable hit formatting
+│   └── bin/
+│       └── search.rs       # docindex-search binary entry point
 ├── tests/                  # Python/pytest harness (spawn_server + E2E suites)
 ├── docs/
 │   ├── ARCHITECTURE.md     # system design
-│   └── deployment.md       # systemd user unit, Tailscale, UFW, upgrades
+│   └── deployment.md       # systemd user unit, Tailscale, UFW, upgrades, reembed
 └── Makefile                # cargo wrappers
 
 Obsidian mobile ──Tailscale──►  docindex-server  ──►  SQLite (index.db)
                                       │
                                       ├─ watches vault (Syncthing-synced)
                                       ├─ chunks markdown
-                                      ├─ calls Gemini embeddings
+                                      ├─ calls Gemini or Voyage embeddings
                                       └─ serves /health /search /similar
+                docindex-search CLI ──Tailscale──►  docindex-server
 ```
 
 **Deployment:** single static Rust binary (musl or aarch64-linux), systemd user service on Hetzner, bound to Tailscale interface.
@@ -56,13 +68,16 @@ Obsidian mobile ──Tailscale──►  docindex-server  ──►  SQLite (in
 
 | Path | Purpose |
 |---|---|
-| `src/main.rs` | Thin binary: build multi-thread tokio runtime, init tracing, call `server::run` |
-| `src/server.rs` | Wires store + embedder + indexer + watcher + axum; graceful SIGTERM/SIGINT shutdown |
-| `src/config.rs` | Env var parsing + validation; rejects `0.0.0.0` and bare loopback unless `DOCINDEX_ALLOW_LOOPBACK=true` |
+| `src/main.rs` | Thin binary: parse `--config`/`--reembed`, build tokio runtime, init tracing, call `server::run` |
+| `src/server.rs` | Wires store + embedder + indexer + watcher + axum; fingerprint guard on open; graceful SIGTERM/SIGINT shutdown |
+| `src/config.rs` | Layered config (flags > env > TOML file > defaults); `Config::from_env` is a thin env-only wrapper; rejects `0.0.0.0` and bare loopback unless `allow_loopback` |
+| `src/config/file.rs` | TOML file discovery (`--config`/`$DOCINDEX_CONFIG`/well-known paths), injectable `FileReader`, `*_env` indirection, world-readable secret warning |
+| `src/embed/registry.rs` | `EmbedProvider` enum + static model table (gemini/voyage/fake); validates provider/model/dim/key with actionable errors |
 | `src/walk.rs` | Full-tree scan, `content_hash` diff, feeds dirty set to indexer |
 | `src/chunk.rs` | Heading-aware chunker (H1/H2/H3 + ~500-token fallback, 50-token overlap) |
-| `src/embed/mod.rs` | `Embedder` trait (native async fn), `AnyEmbedder` enum, `EmbedError`, task-type constants |
+| `src/embed/mod.rs` | `Embedder` trait (native async fn), `AnyEmbedder` enum (Gemini/Voyage/Fake), `EmbedError`, task-type constants |
 | `src/embed/gemini.rs` | Gemini embeddings client; retries on 429/5xx, x-goog-api-key header |
+| `src/embed/voyage.rs` | Voyage embeddings client; Retry-After-aware 429 handling, 128-input batch chunking, index-ordered response |
 | `src/embed/fake.rs` | Deterministic fake embedder for tests (sha256-seeded, L2-normalized) |
 | `src/indexer/mod.rs` | `run(ctx, rx)` + `initial_scan(ctx, tx)`; cache-first batched embedding; content-hash short-circuit |
 | `src/watch/mod.rs` | `notify` recursive watcher + in-house debounce (500ms polled) with relevance filter |
@@ -71,14 +86,18 @@ Obsidian mobile ──Tailscale──►  docindex-server  ──►  SQLite (in
 | `src/api/auth.rs` | Constant-time bearer check |
 | `src/api/error.rs` | `ApiError` → `{error, code}` JSON; `From<SearchError>` maps to 400/404 |
 | `src/api/handlers.rs` | `/health`, `/search`, `/similar` handlers |
-| `src/store/mod.rs` | SQLite handle + `sqlite-vec` auto-extension load, chunk/FTS/vec upsert, `files` diff, search helpers |
+| `src/store/mod.rs` | SQLite handle + `sqlite-vec` auto-extension load, chunk/FTS/vec upsert, `files` diff, search helpers, `peek_fingerprint`/`wipe_and_rebuild` |
 | `src/store/schema.sql` | Canonical schema (chunks, chunks_fts, chunks_vec `vec0` cosine, embedding_cache, files, meta) |
 | `src/store/vec.rs` | Little-endian f32 encode/decode for vector BLOBs |
+| `src/cli/config.rs` | `docindex-search` config layering (flags > env > `cli.toml` > defaults) |
+| `src/cli/client.rs` | HTTP client wrapping `/health` `/search` `/similar`; maps status → `ClientError` |
+| `src/cli/output.rs` | Human-readable hit formatting (rank, score, path, heading, truncated snippet) |
+| `src/bin/search.rs` | `docindex-search` CLI: search/similar/health subcommands, exit codes |
 | `tests/conftest.py` | Shared fixtures + `spawn_server` context manager |
-| `tests/suites/test_*.py` | E2E suites: health, auth, search, similar, watcher, phase1 smoke |
-| `tests/run_tests.py` | Python pytest runner; builds the bin, runs suites/ |
+| `tests/suites/test_*.py` | E2E suites: health, auth, search, similar, watcher, phase1 smoke, config file, voyage, cli, fingerprint |
+| `tests/run_tests.py` | Python pytest runner; builds both bins, passes `DOCINDEX_BIN`/`DOCINDEX_SEARCH_BIN`, runs suites/ |
 | `docs/ARCHITECTURE.md` | Full system design |
-| `docs/deployment.md` | systemd unit, Tailscale, UFW, build + upgrade |
+| `docs/deployment.md` | systemd unit, Tailscale, UFW, build + upgrade, reembed |
 
 > The table above reflects the intended layout. When files are added/moved, update this section **in the same commit**.
 
@@ -91,13 +110,15 @@ Obsidian mobile ──Tailscale──►  docindex-server  ──►  SQLite (in
 - **SQLite:** `rusqlite` 0.34 with `bundled` + `load_extension` features (statically linked libsqlite3)
 - **Vector search:** `sqlite-vec` 0.1.x — **loaded as a real SQLite extension** via `sqlite3_auto_extension`, exposing the `vec0` virtual table (`distance_metric=cosine`)
 - **FTS:** SQLite FTS5 (compiled into the bundled libsqlite3), `tokenize='porter unicode61'`
-- **Embeddings:** Google `gemini-embedding-001` at native dim 3072 by default (Matryoshka-truncatable via `DOCINDEX_EMBED_DIM` — 768 is a smaller tradeoff for tiny scale), task-asymmetric (doc/query). `AnyEmbedder` enum for static dispatch (native async fn in traits → not dyn-compatible).
+- **Embeddings:** provider/model registry (`src/embed/registry.rs`) — Google `gemini-embedding-001` (native 3072, Matryoshka to 768/1536) or Voyage AI's `voyage-4` family (native 1024, Matryoshka to 256/512/2048), task-asymmetric (doc/query). `AnyEmbedder` enum for static dispatch (native async fn in traits → not dyn-compatible).
+- **CLI parsing:** `clap` (derive) for both binaries
+- **Config files:** `toml` (server.toml / cli.toml), layered under env vars per `src/config.rs` / `src/cli/config.rs`
 - **Hashing:** `sha2` + `hex`
 - **Filesystem walker:** `walkdir`
 - **File watcher:** `notify` 8 with in-house debounce (default 5s, overridable via `DOCINDEX_DEBOUNCE_MS`)
-- **Errors:** `thiserror::Error` per module (`ConfigError`, `WalkError`, `EmbedError`, `StoreError`, `IndexerError`, `SearchError`, `ApiError`); `anyhow` only in `main.rs`/`server.rs`
+- **Errors:** `thiserror::Error` per module (`ConfigError`, `WalkError`, `EmbedError`, `RegistryError`, `StoreError`, `IndexerError`, `SearchError`, `ApiError`, `ClientError`); `anyhow` only in `main.rs`/`server.rs`
 - **Logging:** `tracing` + `tracing-subscriber` (JSON in prod via `DOCINDEX_LOG_FORMAT=json`, text in dev)
-- **Config:** env vars only (12-factor); no config files
+- **Config:** layered — CLI flags > env vars > TOML file > built-in defaults; env-only mode (today's production) keeps working unchanged
 - **Tests:** `cargo test` for unit/integration; Python `pytest` harness in `tests/` for end-to-end via `spawn_server`
 - **Deployment:** single static binary, systemd user service on Hetzner
 
@@ -124,10 +145,11 @@ Every hit carries three scores:
 
 ## Lifecycle
 
-1. `main.rs` builds a multi-thread tokio runtime, parses `Config`, inits `tracing`.
+1. `main.rs` parses `--config`/`--reembed` flags, builds a multi-thread tokio runtime, loads the layered `Config`, inits `tracing`.
 2. `server::run(cfg)`:
+   - Resolves the store's embedding fingerprint via `Store::peek_fingerprint` before opening — a mismatch without `--reembed` refuses startup naming every changed field; with `--reembed` it opens via `Store::open_for_reembed` + `wipe_and_rebuild`.
    - Opens the `Store`, wraps in `Arc<Mutex<Store>>`.
-   - Builds an `AnyEmbedder` (`gemini` or `fake`) from `cfg.embed_backend`.
+   - Builds an `AnyEmbedder` (`Gemini`/`Voyage`/`Fake`) from `cfg.embed_provider` via the registry.
    - Creates `mpsc::unbounded_channel::<PathBuf>` for dirty paths.
    - Spawns the indexer task (`indexer::run`, drains rx).
    - Spawns the watcher (`watch::run`, emits into tx) and the initial scan (`indexer::initial_scan`, emits into tx).
@@ -137,7 +159,7 @@ Every hit carries three scores:
 
 ## Ranking (Hybrid)
 
-1. Embed query with task type `RETRIEVAL_QUERY` (Gemini).
+1. Embed query with task type `RETRIEVAL_QUERY` (Gemini) / `query` (Voyage).
 2. Top-30 via cosine (`chunks_vec MATCH ? AND k = ?`).
 3. Top-30 via BM25 (`FTS5`, `bm25(chunks_fts)`).
 4. **Reciprocal Rank Fusion** (k=60, `search::RRF_K`) over the two lists. Ties broken by id ascending (deterministic).
@@ -194,10 +216,11 @@ CREATE TABLE files (
 );
 
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
--- meta keys: embedding_model, embedding_dim, schema_version, last_full_scan
+-- meta keys: embedding_provider, embedding_model, embedding_dim,
+-- schema_version, last_full_scan, path_schema_version
 ```
 
-**Embedding cache** is keyed by `content_hash` — renaming/moving a file with identical content never re-embeds. **`files`** keeps a per-path SHA256 + mtime so the startup scan can skip unchanged files without touching `chunks`.
+**Embedding cache** is keyed by `content_hash` — renaming/moving a file with identical content never re-embeds. **`files`** keeps a per-path SHA256 + mtime so the startup scan can skip unchanged files without touching `chunks`. **`meta.embedding_provider`/`embedding_model`/`embedding_dim`** are the index fingerprint checked on every boot — see "Index fingerprint guard" in `docs/ARCHITECTURE.md`.
 
 ## Coding Standards
 

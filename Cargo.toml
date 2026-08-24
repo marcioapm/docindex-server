@@ -15,9 +15,14 @@ path = "src/lib.rs"
 name = "docindex"
 path = "src/main.rs"
 
+[[bin]]
+name = "docindex-search"
+path = "src/bin/search.rs"
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 hex = "0.4"
 notify = "8"
@@ -27,8 +32,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sqlite-vec = "0.1.6"
+terminal_size = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+toml = "1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
@@ -38,6 +45,7 @@ walkdir = "2"
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

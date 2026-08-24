@@ -4,18 +4,44 @@
 //! hand off to the server.
 
 use anyhow::{Context, Result};
-use docindex::{Config, server};
+use clap::Parser;
+use docindex::{
+    Config,
+    config::{self, ConfigFlags},
+    server,
+};
 use tracing_subscriber::{EnvFilter, fmt};
 
+/// docindex — semantic + BM25 search server for a markdown vault.
+#[derive(Parser, Debug)]
+#[command(name = "docindex", version)]
+struct Cli {
+    /// Path to a server TOML config file. Overrides $DOCINDEX_CONFIG and
+    /// the well-known search locations.
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
+    /// Wipe chunks/vectors/FTS rows and rebuild the index when the stored
+    /// embedding fingerprint (provider/model/dim) no longer matches the
+    /// effective config.
+    #[arg(long)]
+    reembed: bool,
+}
+
 fn main() -> Result<()> {
+    let cli = Cli::parse();
     // Multi-thread runtime: one thread for the HTTP executor, another for
     // the indexer + watcher tasks. spawn_blocking offloads SQL regardless.
     let rt = tokio::runtime::Runtime::new().context("build tokio runtime")?;
-    rt.block_on(run())
+    rt.block_on(run(cli))
 }
 
-async fn run() -> Result<()> {
-    let cfg = Config::from_env().context("load config")?;
+async fn run(cli: Cli) -> Result<()> {
+    let flags = ConfigFlags {
+        config_path: cli.config,
+        reembed: cli.reembed,
+    };
+    let cfg = Config::load(&|k| std::env::var(k).ok(), &config::os_file_reader, &flags)
+        .context("load config")?;
     init_tracing(&cfg.log_format);
     server::run(cfg).await
 }

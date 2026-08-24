@@ -39,6 +39,21 @@ def docindex_bin() -> pathlib.Path:
     return candidate
 
 
+@pytest.fixture(scope="session")
+def docindex_search_bin() -> pathlib.Path:
+    """Absolute path to the docindex-search binary (release build)."""
+    env_bin = os.environ.get("DOCINDEX_SEARCH_BIN")
+    if env_bin:
+        p = pathlib.Path(env_bin)
+        if not p.exists():
+            pytest.skip(f"DOCINDEX_SEARCH_BIN={p} not found")
+        return p
+    candidate = REPO_ROOT / "target" / "release" / "docindex-search"
+    if not candidate.exists():
+        pytest.skip("docindex-search binary not built; run tests/run_tests.py")
+    return candidate
+
+
 @pytest.fixture
 def vault_dir(tmp_path: pathlib.Path) -> pathlib.Path:
     d = tmp_path / "vault"
@@ -61,7 +76,7 @@ def base_env(vault_dir: pathlib.Path, db_path: pathlib.Path) -> dict[str, str]:
         {
             "DOCINDEX_VAULT_DIR": str(vault_dir),
             "DOCINDEX_DB_PATH": str(db_path),
-            "DOCINDEX_LISTEN": "100.83.46.59:7777",
+            "DOCINDEX_LISTEN": "100.64.0.1:7777",
             "DOCINDEX_BEARER": "test-bearer",
             "GEMINI_API_KEY": "test-key",
             "DOCINDEX_EMBED_MODEL": "gemini-embedding-001",

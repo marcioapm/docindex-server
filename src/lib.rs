@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod chunk;
+pub mod cli;
 pub mod config;
 pub mod embed;
 pub mod indexer;

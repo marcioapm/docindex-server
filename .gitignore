@@ -17,3 +17,6 @@ tests/__pycache__/
 tests/suites/__pycache__/
 .pytest_cache/
 *.pyc
+
+# Agent working docs (briefs, review findings) — never published
+.taskdocs/

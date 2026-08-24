@@ -10,6 +10,8 @@
 
 pub mod fake;
 pub mod gemini;
+pub mod registry;
+pub mod voyage;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -18,6 +20,7 @@ use thiserror::Error;
 
 pub use fake::Fake;
 pub use gemini::Gemini;
+pub use voyage::Voyage;
 
 /// Used when embedding chunks for indexing.
 pub const TASK_RETRIEVAL_DOCUMENT: &str = "RETRIEVAL_DOCUMENT";
@@ -60,6 +63,7 @@ pub trait Embedder: Send + Sync {
 #[derive(Clone)]
 pub enum AnyEmbedder {
     Gemini(Arc<Gemini>),
+    Voyage(Arc<Voyage>),
     Fake(Arc<Fake>),
 }
 
@@ -67,6 +71,7 @@ impl AnyEmbedder {
     pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         match self {
             Self::Gemini(g) => g.embed_documents(texts).await,
+            Self::Voyage(v) => v.embed_documents(texts).await,
             Self::Fake(f) => f.embed_documents(texts).await,
         }
     }
@@ -74,6 +79,7 @@ impl AnyEmbedder {
     pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
         match self {
             Self::Gemini(g) => g.embed_query(text).await,
+            Self::Voyage(v) => v.embed_query(text).await,
             Self::Fake(f) => f.embed_query(text).await,
         }
     }

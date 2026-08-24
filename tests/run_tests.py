@@ -27,14 +27,19 @@ def run(cmd: list[str], **kwargs) -> int:
 def main() -> int:
     print(f"repo root: {REPO_ROOT}", flush=True)
     bin_path = REPO_ROOT / "target" / "release" / "docindex"
+    search_bin_path = REPO_ROOT / "target" / "release" / "docindex-search"
     if run(["cargo", "build", "--release", "--manifest-path", str(REPO_ROOT / "Cargo.toml")]) != 0:
         return 1
     if not bin_path.exists():
         print(f"binary not found at {bin_path}", file=sys.stderr)
         return 1
+    if not search_bin_path.exists():
+        print(f"binary not found at {search_bin_path}", file=sys.stderr)
+        return 1
 
     env = os.environ.copy()
     env["DOCINDEX_BIN"] = str(bin_path)
+    env["DOCINDEX_SEARCH_BIN"] = str(search_bin_path)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
 
     if shutil.which("uv"):
