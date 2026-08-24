@@ -225,3 +225,25 @@ def test_cli_missing_config_is_exit_1(docindex_search_bin):
     assert r.returncode == 1
     assert r.stdout == ""
     assert r.stderr != ""
+
+
+def test_cli_similar_unindexed_path_is_exit_2(spawn_server, docindex_search_bin, tmp_path):
+    """similar on a path not in the index must return exit 2 (ClientError::Server 404)."""
+    vault = _write_vault(tmp_path)
+    server = spawn_server(vault)
+    server.wait_for_chunks(len(VAULT_FILES))
+
+    r = _run_cli(
+        docindex_search_bin,
+        [
+            "similar",
+            "nonexistent/not-indexed.md",
+            "--server",
+            server.base_url,
+            "--token",
+            server.bearer,
+        ],
+    )
+    assert r.returncode == 2, f"expected exit 2 (server error/not found), got {r.returncode}; stderr={r.stderr!r}"
+    assert r.stdout == ""
+    assert r.stderr != ""
