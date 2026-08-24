@@ -28,12 +28,7 @@ use crate::{
 /// graceful shutdown on SIGINT/SIGTERM or a bind error).
 pub async fn run(cfg: Config) -> Result<()> {
     let embedder = build_embedder(&cfg)?;
-    let store = if cfg.reembed {
-        Store::open_for_reembed(&cfg.db_path, cfg.embed_dim).context("open store")?
-    } else {
-        Store::open(&cfg.db_path, cfg.embed_dim).context("open store")?
-    };
-    check_or_apply_fingerprint(&store, &cfg)?;
+    let store = open_store_with_fingerprint_check(&cfg)?;
     // Rewrite any pre-0.2.0 absolute paths to vault-relative form. Idempotent
     // across restarts; a mismatch between the DB's paths and the configured
     // vault_dir is surfaced as a refusal (logged, not fatal) so operators can
@@ -138,31 +133,50 @@ pub async fn run(cfg: Config) -> Result<()> {
     res
 }
 
-/// Compare the store's embedding fingerprint against the effective config.
-/// A fresh (never-fingerprinted) DB adopts the current config. `--reembed`
-/// wipes and rebuilds instead of erroring on a mismatch.
-fn check_or_apply_fingerprint(store: &Store, cfg: &Config) -> Result<()> {
+/// Open the store, resolving the embedding fingerprint (provider/model/dim)
+/// *before* the dim gets baked into `chunks_vec`'s DDL.
+///
+/// - No prior fingerprint (fresh DB, or pre-fingerprint upgrade): open
+///   normally and adopt the current config as the fingerprint.
+/// - Fingerprint matches: open normally.
+/// - Fingerprint mismatches and `--reembed` is not set: refuse with a
+///   message naming every changed field and both values.
+/// - Fingerprint mismatches and `--reembed` is set: open in reembed mode
+///   (skips the low-level dim refusal) and wipe + rebuild at the new dim.
+fn open_store_with_fingerprint_check(cfg: &Config) -> Result<Store> {
     let provider = cfg.embed_provider.as_str();
     let model = &cfg.embed_model;
     let dim = cfg.embed_dim;
-    match store
-        .check_fingerprint(provider, model, dim)
-        .context("check embedding fingerprint")?
-    {
-        crate::store::FingerprintOutcome::Match => Ok(()),
-        crate::store::FingerprintOutcome::Fresh => store
-            .set_fingerprint(provider, model, dim)
-            .context("set embedding fingerprint"),
-        crate::store::FingerprintOutcome::Mismatch(msg) => {
-            if cfg.reembed {
-                warn!(reason = %msg, "fingerprint mismatch; --reembed set, wiping and rebuilding");
+
+    let stored = Store::peek_fingerprint(&cfg.db_path).context("peek embedding fingerprint")?;
+    let mismatch = match &stored {
+        None => None,
+        Some((p, m, d)) if p == provider && m == model && *d == dim => None,
+        Some((p, m, d)) => Some(format!(
+            "index built with provider={p} model={m} dim={d}, config says \
+             provider={provider} model={model} dim={dim}; re-embed required: run with --reembed"
+        )),
+    };
+
+    match mismatch {
+        None => {
+            let store = Store::open(&cfg.db_path, dim).context("open store")?;
+            if stored.is_none() {
                 store
-                    .wipe_and_rebuild(dim, provider, model)
-                    .context("wipe and rebuild index for --reembed")
-            } else {
-                Err(anyhow!("{msg}"))
+                    .set_fingerprint(provider, model, dim)
+                    .context("set embedding fingerprint")?;
             }
+            Ok(store)
         }
+        Some(msg) if cfg.reembed => {
+            warn!(reason = %msg, "fingerprint mismatch; --reembed set, wiping and rebuilding");
+            let store = Store::open_for_reembed(&cfg.db_path, dim).context("open store")?;
+            store
+                .wipe_and_rebuild(dim, provider, model)
+                .context("wipe and rebuild index for --reembed")?;
+            Ok(store)
+        }
+        Some(msg) => Err(anyhow!("{msg}")),
     }
 }
 

@@ -39,6 +39,21 @@ def docindex_bin() -> pathlib.Path:
     return candidate
 
 
+@pytest.fixture(scope="session")
+def docindex_search_bin() -> pathlib.Path:
+    """Absolute path to the docindex-search binary (release build)."""
+    env_bin = os.environ.get("DOCINDEX_SEARCH_BIN")
+    if env_bin:
+        p = pathlib.Path(env_bin)
+        if not p.exists():
+            pytest.skip(f"DOCINDEX_SEARCH_BIN={p} not found")
+        return p
+    candidate = REPO_ROOT / "target" / "release" / "docindex-search"
+    if not candidate.exists():
+        pytest.skip("docindex-search binary not built; run tests/run_tests.py")
+    return candidate
+
+
 @pytest.fixture
 def vault_dir(tmp_path: pathlib.Path) -> pathlib.Path:
     d = tmp_path / "vault"

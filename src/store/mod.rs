@@ -46,11 +46,67 @@ pub struct Store {
 }
 
 impl Store {
+    /// Read the embedding fingerprint (`embedding_provider` / `embedding_model`
+    /// / `embedding_dim` in `meta`) without applying the dim-specific
+    /// `chunks_vec` DDL. Used by callers that need to decide *how* to open
+    /// (normal vs. `--reembed`) before the dim gets baked into a virtual
+    /// table — `chunks_vec`'s `CREATE VIRTUAL TABLE IF NOT EXISTS` would
+    /// otherwise silently keep whatever dim the table already has.
+    ///
+    /// Returns `None` for a DB file that doesn't exist yet, or exists but
+    /// has never had a fingerprint written (fresh index).
+    pub fn peek_fingerprint(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<(String, String, usize)>, StoreError> {
+        if !path.as_ref().exists() {
+            return Ok(None);
+        }
+        register_sqlite_vec()?;
+        let conn = Connection::open(path.as_ref())?;
+        init_pragmas(&conn)?;
+        // `meta` lives in the base schema, not the dim-parameterized part —
+        // safe to apply without ever touching `chunks_vec`.
+        conn.execute_batch(SCHEMA_SQL)
+            .map_err(|e| StoreError::Msg(format!("apply base schema: {e}")))?;
+        let provider: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'embedding_provider'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let model: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'embedding_model'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let dim: Option<usize> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'embedding_dim'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|v| v.parse().ok());
+        Ok(match (provider, model, dim) {
+            (Some(p), Some(m), Some(d)) => Some((p, m, d)),
+            _ => None,
+        })
+    }
+
     /// Open (or create) the SQLite DB at `path`. Registers `sqlite-vec` as
     /// an auto-extension exactly once per process, applies the base schema,
     /// renders + applies the `chunks_vec` DDL with `embed_dim` baked into
     /// `FLOAT[...]`, and enforces that `meta.embedding_dim` matches
     /// `embed_dim` (refusing to start on mismatch).
+    ///
+    /// Callers that need the unified `provider=.../model=.../dim=...`
+    /// fingerprint mismatch message (rather than this lower-level dim-only
+    /// refusal) should call [`Store::peek_fingerprint`] first and only
+    /// reach `open` once they know the dim will match — see
+    /// `server::check_or_apply_fingerprint`.
     pub fn open(path: impl AsRef<Path>, embed_dim: usize) -> Result<Self, StoreError> {
         Self::open_internal(path, embed_dim, false)
     }
