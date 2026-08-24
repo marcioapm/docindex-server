@@ -40,7 +40,7 @@ impl EmbedProvider {
     /// Default model id for this provider when none is configured.
     pub fn default_model(&self) -> &'static str {
         match self {
-            EmbedProvider::Gemini => "gemini-embedding-001",
+            EmbedProvider::Gemini => "gemini-embedding-2",
             EmbedProvider::Voyage => "voyage-4",
             EmbedProvider::Fake => "fake",
         }
@@ -63,6 +63,14 @@ impl fmt::Display for EmbedProvider {
     }
 }
 
+/// How a model represents PDF input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfMode {
+    None,
+    Native,
+    Raster,
+}
+
 /// One registered model: its provider, native/allowed dims, and the
 /// provider-specific task labels used for document vs. query embedding.
 #[derive(Debug, Clone)]
@@ -73,6 +81,8 @@ pub struct ModelInfo {
     pub allowed_dims: &'static [usize],
     pub doc_task: &'static str,
     pub query_task: &'static str,
+    pub media_capable: bool,
+    pub pdf_mode: PdfMode,
 }
 
 /// Gemini's Matryoshka-truncatable dims for `gemini-embedding-001`.
@@ -90,6 +100,18 @@ static MODELS: &[ModelInfo] = &[
         allowed_dims: GEMINI_DIMS,
         doc_task: "RETRIEVAL_DOCUMENT",
         query_task: "RETRIEVAL_QUERY",
+        media_capable: false,
+        pdf_mode: PdfMode::None,
+    },
+    ModelInfo {
+        provider: EmbedProvider::Gemini,
+        model: "gemini-embedding-2",
+        native_dim: 3072,
+        allowed_dims: GEMINI_DIMS,
+        doc_task: "document",
+        query_task: "query",
+        media_capable: true,
+        pdf_mode: PdfMode::Native,
     },
     ModelInfo {
         provider: EmbedProvider::Voyage,
@@ -98,6 +120,8 @@ static MODELS: &[ModelInfo] = &[
         allowed_dims: VOYAGE_DIMS,
         doc_task: "document",
         query_task: "query",
+        media_capable: false,
+        pdf_mode: PdfMode::None,
     },
     ModelInfo {
         provider: EmbedProvider::Voyage,
@@ -106,6 +130,8 @@ static MODELS: &[ModelInfo] = &[
         allowed_dims: VOYAGE_DIMS,
         doc_task: "document",
         query_task: "query",
+        media_capable: false,
+        pdf_mode: PdfMode::None,
     },
     ModelInfo {
         provider: EmbedProvider::Voyage,
@@ -114,6 +140,8 @@ static MODELS: &[ModelInfo] = &[
         allowed_dims: VOYAGE_DIMS,
         doc_task: "document",
         query_task: "query",
+        media_capable: false,
+        pdf_mode: PdfMode::None,
     },
     ModelInfo {
         provider: EmbedProvider::Voyage,
@@ -122,6 +150,8 @@ static MODELS: &[ModelInfo] = &[
         allowed_dims: VOYAGE_DIMS,
         doc_task: "document",
         query_task: "query",
+        media_capable: false,
+        pdf_mode: PdfMode::None,
     },
     ModelInfo {
         provider: EmbedProvider::Voyage,
@@ -130,6 +160,18 @@ static MODELS: &[ModelInfo] = &[
         allowed_dims: VOYAGE_DIMS,
         doc_task: "document",
         query_task: "query",
+        media_capable: false,
+        pdf_mode: PdfMode::None,
+    },
+    ModelInfo {
+        provider: EmbedProvider::Voyage,
+        model: "voyage-multimodal-3.5",
+        native_dim: 1024,
+        allowed_dims: VOYAGE_DIMS,
+        doc_task: "document",
+        query_task: "query",
+        media_capable: true,
+        pdf_mode: PdfMode::Raster,
     },
 ];
 
@@ -144,6 +186,8 @@ fn fake_model(model: &'static str) -> ModelInfo {
         allowed_dims: &[],
         doc_task: "document",
         query_task: "query",
+        media_capable: true,
+        pdf_mode: PdfMode::Raster,
     }
 }
 
@@ -342,10 +386,7 @@ mod tests {
 
     #[test]
     fn default_models_per_provider() {
-        assert_eq!(
-            EmbedProvider::Gemini.default_model(),
-            "gemini-embedding-001"
-        );
+        assert_eq!(EmbedProvider::Gemini.default_model(), "gemini-embedding-2");
         assert_eq!(EmbedProvider::Voyage.default_model(), "voyage-4");
     }
 
@@ -365,6 +406,7 @@ mod tests {
             "voyage-4-large",
             "voyage-context-4",
             "voyage-code-3",
+            "voyage-multimodal-3.5",
         ] {
             assert!(models.contains(&m), "missing {m} in {models:?}");
         }

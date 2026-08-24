@@ -8,13 +8,17 @@
 
 use std::time::Duration;
 
+use base64::Engine;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use super::EmbedError;
+use super::{EmbedError, EmbedInput, Embedder, MediaPart};
 
-/// Max inputs per Voyage embeddings request. Larger batches are chunked.
+/// Max inputs per Voyage text embeddings request. Larger batches are chunked.
 pub const MAX_BATCH: usize = 128;
+/// Max content items per Voyage multimodal embeddings request.
+const MAX_MULTIMODAL_BATCH: usize = 4;
+const VOYAGE_MULTIMODAL_MODEL: &str = "voyage-multimodal-3.5";
 
 /// Upper bound on the `Retry-After` sleep duration. Prevents a hostile or
 /// misconfigured endpoint from stalling indexing indefinitely via a crafted
@@ -54,7 +58,7 @@ impl Voyage {
         })
     }
 
-    async fn embed_batch(
+    async fn embed_text_batch(
         &self,
         texts: &[String],
         input_type: &str,
@@ -70,7 +74,62 @@ impl Voyage {
             input_type: input_type.to_string(),
             output_dimension: self.dim,
         };
+        self.send_request(&url, &body, texts.len()).await
+    }
 
+    async fn embed_text(
+        &self,
+        texts: &[String],
+        input_type: &str,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.len() <= MAX_BATCH {
+            return self.embed_text_batch(texts, input_type).await;
+        }
+        let mut out = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(MAX_BATCH) {
+            out.extend(self.embed_text_batch(chunk, input_type).await?);
+        }
+        Ok(out)
+    }
+
+    async fn embed_multimodal_batch(
+        &self,
+        inputs: &[EmbedInput],
+        input_type: &str,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let url = format!("{}/v1/multimodalembeddings", self.base_url);
+        let body = MultimodalEmbedRequest {
+            model: self.model.clone(),
+            inputs: inputs.iter().map(multimodal_input).collect(),
+            input_type: input_type.to_string(),
+            truncation: false,
+            output_dimension: self.dim,
+        };
+        self.send_request(&url, &body, inputs.len()).await
+    }
+
+    async fn embed_multimodal(
+        &self,
+        inputs: &[EmbedInput],
+        input_type: &str,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let mut out = Vec::with_capacity(inputs.len());
+        for batch in inputs.chunks(MAX_MULTIMODAL_BATCH) {
+            out.extend(self.embed_multimodal_batch(batch, input_type).await?);
+        }
+        Ok(out)
+    }
+
+    async fn send_request<T: Serialize>(
+        &self,
+        url: &str,
+        body: &T,
+        input_count: usize,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
         let attempts = self.max_retries.saturating_add(1);
         let mut delay = self.base_delay;
         let mut last_err: EmbedError = EmbedError::Http("no attempts".into());
@@ -82,10 +141,10 @@ impl Voyage {
             }
             let resp = match self
                 .client
-                .post(&url)
+                .post(url)
                 .header("Authorization", format!("Bearer {}", self.api_key))
                 .header("Content-Type", "application/json")
-                .json(&body)
+                .json(body)
                 .send()
                 .await
             {
@@ -103,28 +162,7 @@ impl Voyage {
                 .map_err(|e| EmbedError::Http(format!("read body: {e}")))?;
 
             if status.is_success() {
-                let parsed: EmbedResponse = serde_json::from_slice(&raw)
-                    .map_err(|e| EmbedError::Decode(format!("decode: {e}")))?;
-                let mut data = parsed.data;
-                data.sort_by_key(|d| d.index);
-                if data.len() != texts.len() {
-                    return Err(EmbedError::Decode(format!(
-                        "response has {} embeddings for {} inputs",
-                        data.len(),
-                        texts.len()
-                    )));
-                }
-                let mut out = Vec::with_capacity(data.len());
-                for d in data {
-                    if d.embedding.len() != self.dim {
-                        return Err(EmbedError::DimMismatch {
-                            got: d.embedding.len(),
-                            want: self.dim,
-                        });
-                    }
-                    out.push(d.embedding);
-                }
-                return Ok(out);
+                return decode_embeddings(&raw, input_count, self.dim);
             }
 
             let message = parse_api_error(&raw).unwrap_or_else(|| {
@@ -144,17 +182,6 @@ impl Voyage {
         Err(EmbedError::RetriesExhausted(format!("{last_err}")))
     }
 
-    async fn embed(&self, texts: &[String], input_type: &str) -> Result<Vec<Vec<f32>>, EmbedError> {
-        if texts.len() <= MAX_BATCH {
-            return self.embed_batch(texts, input_type).await;
-        }
-        let mut out = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(MAX_BATCH) {
-            out.extend(self.embed_batch(chunk, input_type).await?);
-        }
-        Ok(out)
-    }
-
     /// Validate struct-level invariants once per logical request. Cheaper
     /// than checking inside the inner per-batch loop, and ensures the error
     /// is surfaced before any HTTP traffic occurs.
@@ -171,18 +198,99 @@ impl Voyage {
         Ok(())
     }
 
-    pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    pub async fn embed_documents(
+        &self,
+        inputs: &[EmbedInput],
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
         self.validate_config()?;
-        self.embed(texts, "document").await
+        if self.is_multimodal_model() {
+            self.embed_multimodal(inputs, "document").await
+        } else {
+            self.embed_text(&text_inputs(inputs)?, "document").await
+        }
     }
 
     pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
         self.validate_config()?;
-        let texts = [text.to_string()];
-        let mut out = self.embed(&texts, "query").await?;
-        out.pop()
+        let out = if self.is_multimodal_model() {
+            self.embed_multimodal(&[EmbedInput::text(text)], "query")
+                .await?
+        } else {
+            self.embed_text(&[text.to_string()], "query").await?
+        };
+        out.into_iter()
+            .next()
             .ok_or_else(|| EmbedError::Decode("empty response for single query".into()))
     }
+
+    fn is_multimodal_model(&self) -> bool {
+        self.model == VOYAGE_MULTIMODAL_MODEL
+    }
+}
+
+impl Embedder for Voyage {
+    async fn embed_documents(&self, inputs: &[EmbedInput]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Voyage::embed_documents(self, inputs).await
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        Voyage::embed_query(self, text).await
+    }
+}
+
+fn text_inputs(inputs: &[EmbedInput]) -> Result<Vec<String>, EmbedError> {
+    inputs
+        .iter()
+        .map(|input| match input {
+            EmbedInput::Text(text) => Ok(text.clone()),
+            EmbedInput::Media(_) => Err(EmbedError::Config(
+                "Voyage text embedding models do not support media inputs".into(),
+            )),
+        })
+        .collect()
+}
+
+fn multimodal_input(input: &EmbedInput) -> MultimodalInput {
+    let content = match input {
+        EmbedInput::Text(text) => vec![MultimodalContent::Text { text: text.clone() }],
+        EmbedInput::Media(parts) => parts.iter().map(media_content).collect(),
+    };
+    MultimodalInput { content }
+}
+
+fn media_content(part: &MediaPart) -> MultimodalContent {
+    let data = base64::engine::general_purpose::STANDARD.encode(&part.bytes);
+    MultimodalContent::ImageBase64 {
+        image_base64: format!("data:{};base64,{data}", part.mime_type),
+    }
+}
+
+fn decode_embeddings(
+    raw: &[u8],
+    input_count: usize,
+    dim: usize,
+) -> Result<Vec<Vec<f32>>, EmbedError> {
+    let parsed: EmbedResponse =
+        serde_json::from_slice(raw).map_err(|e| EmbedError::Decode(format!("decode: {e}")))?;
+    let mut data = parsed.data;
+    data.sort_by_key(|d| d.index);
+    if data.len() != input_count {
+        return Err(EmbedError::Decode(format!(
+            "response has {} embeddings for {input_count} inputs",
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(data.len());
+    for datum in data {
+        if datum.embedding.len() != dim {
+            return Err(EmbedError::DimMismatch {
+                got: datum.embedding.len(),
+                want: dim,
+            });
+        }
+        out.push(datum.embedding);
+    }
+    Ok(out)
 }
 
 /// Extract `Retry-After` from a response, if present and a valid integer
@@ -229,6 +337,27 @@ struct EmbedRequest {
     output_dimension: usize,
 }
 
+#[derive(Serialize)]
+struct MultimodalEmbedRequest {
+    model: String,
+    inputs: Vec<MultimodalInput>,
+    input_type: String,
+    truncation: bool,
+    output_dimension: usize,
+}
+
+#[derive(Serialize)]
+struct MultimodalInput {
+    content: Vec<MultimodalContent>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MultimodalContent {
+    Text { text: String },
+    ImageBase64 { image_base64: String },
+}
+
 #[derive(Deserialize)]
 struct EmbedResponse {
     data: Vec<EmbedDatum>,
@@ -251,6 +380,7 @@ struct ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embed::MediaPart;
     use serde_json::json;
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -289,7 +419,10 @@ mod tests {
             .mount(&server)
             .await;
         let v = test_voyage(&server, 0, Duration::from_millis(1));
-        let out = v.embed_documents(&["hello".to_string()]).await.expect("ok");
+        let out = v
+            .embed_documents(&[EmbedInput::text("hello")])
+            .await
+            .expect("ok");
         assert_eq!(out, vec![vec![0.1_f32, 0.2, 0.3, 0.4]]);
     }
 
@@ -314,6 +447,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multimodal_documents_serialize_text_and_media() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/multimodalembeddings"))
+            .and(header("Authorization", "Bearer test-key"))
+            .and(body_json(json!({
+                "model": "voyage-multimodal-3.5",
+                "inputs": [
+                    { "content": [{ "type": "text", "text": "hello" }] },
+                    { "content": [{ "type": "image_base64", "image_base64": "data:image/png;base64,AQI=" }] },
+                ],
+                "input_type": "document",
+                "truncation": false,
+                "output_dimension": 4,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "embedding": [2.0, 0.0, 0.0, 0.0], "index": 1 },
+                    { "embedding": [1.0, 0.0, 0.0, 0.0], "index": 0 },
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let mut v = test_voyage(&server, 0, Duration::from_millis(1));
+        v.model = VOYAGE_MULTIMODAL_MODEL.into();
+        let out = v
+            .embed_documents(&[
+                EmbedInput::text("hello"),
+                EmbedInput::Media(vec![MediaPart {
+                    mime_type: "image/png".into(),
+                    bytes: vec![1, 2],
+                }]),
+            ])
+            .await
+            .expect("multimodal document embeddings");
+        assert_eq!(out[0], vec![1.0_f32, 0.0, 0.0, 0.0]);
+        assert_eq!(out[1], vec![2.0_f32, 0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn multimodal_query_uses_text_content() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/multimodalembeddings"))
+            .and(body_json(json!({
+                "model": "voyage-multimodal-3.5",
+                "inputs": [{ "content": [{ "type": "text", "text": "q" }] }],
+                "input_type": "query",
+                "truncation": false,
+                "output_dimension": 4,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "embedding": [1.0, 0.0, 0.0, 0.0], "index": 0 }]
+            })))
+            .mount(&server)
+            .await;
+        let mut v = test_voyage(&server, 0, Duration::from_millis(1));
+        v.model = VOYAGE_MULTIMODAL_MODEL.into();
+        assert_eq!(
+            v.embed_query("q").await.unwrap(),
+            vec![1.0_f32, 0.0, 0.0, 0.0]
+        );
+    }
+
+    #[tokio::test]
+    async fn multimodal_documents_batch_sequentially_in_groups_of_four() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/multimodalembeddings"))
+            .and(body_multimodal_input_len(4))
+            .respond_with(multimodal_response(1.0))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/multimodalembeddings"))
+            .and(body_multimodal_input_len(1))
+            .respond_with(multimodal_response(2.0))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut v = test_voyage(&server, 0, Duration::from_millis(1));
+        v.model = VOYAGE_MULTIMODAL_MODEL.into();
+        let inputs: Vec<_> = (0..5)
+            .map(|i| EmbedInput::text(format!("text-{i}")))
+            .collect();
+        let out = v.embed_documents(&inputs).await.unwrap();
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0], vec![1.0_f32, 0.0, 0.0, 0.0]);
+        assert_eq!(out[4], vec![2.0_f32, 0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn text_models_reject_media_without_http_request() {
+        let server = MockServer::start().await;
+        let v = test_voyage(&server, 0, Duration::from_millis(1));
+        let err = v
+            .embed_documents(&[EmbedInput::Media(vec![MediaPart {
+                mime_type: "image/png".into(),
+                bytes: vec![1, 2],
+            }])])
+            .await
+            .expect_err("media must be rejected by text-only Voyage models");
+        assert!(matches!(err, EmbedError::Config(_)));
+    }
+
+    fn multimodal_response(value: f32) -> impl wiremock::Respond {
+        move |req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let count = body["inputs"].as_array().unwrap().len();
+            let data: Vec<_> = (0..count)
+                .map(|index| json!({ "embedding": [value, 0.0, 0.0, 0.0], "index": index }))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "data": data }))
+        }
+    }
+
+    fn body_multimodal_input_len(n: usize) -> impl wiremock::Match {
+        struct LenMatch(usize);
+        impl wiremock::Match for LenMatch {
+            fn matches(&self, req: &wiremock::Request) -> bool {
+                serde_json::from_slice::<serde_json::Value>(&req.body)
+                    .ok()
+                    .and_then(|body| body["inputs"].as_array().map(Vec::len))
+                    == Some(self.0)
+            }
+        }
+        LenMatch(n)
+    }
+    #[tokio::test]
     async fn out_of_order_index_is_reordered() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -327,7 +590,7 @@ mod tests {
             .await;
         let v = test_voyage(&server, 0, Duration::from_millis(1));
         let out = v
-            .embed_documents(&["a".to_string(), "b".to_string()])
+            .embed_documents(&[EmbedInput::text("a"), EmbedInput::text("b")])
             .await
             .unwrap();
         assert_eq!(out[0], vec![1.0_f32, 0.0, 0.0, 0.0]);
@@ -418,8 +681,10 @@ mod tests {
             .mount(&server)
             .await;
         let v = test_voyage(&server, 0, Duration::from_millis(1));
-        let texts: Vec<String> = (0..133).map(|i| format!("text-{i}")).collect();
-        let out = v.embed_documents(&texts).await.expect("ok");
+        let inputs: Vec<_> = (0..133)
+            .map(|i| EmbedInput::text(format!("text-{i}")))
+            .collect();
+        let out = v.embed_documents(&inputs).await.expect("ok");
         assert_eq!(out.len(), 133);
         assert_eq!(out[0], vec![1.0_f32, 0.0, 0.0, 0.0]);
         assert_eq!(out[132], vec![2.0_f32, 0.0, 0.0, 0.0]);
