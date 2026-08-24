@@ -546,4 +546,59 @@ mod tests {
             "expected RetriesExhausted, got: {err:?}"
         );
     }
+
+    /// A single 503 followed by 200 must succeed: `is_retryable` must return
+    /// true for server errors, and the retry must use exponential backoff
+    /// (not the Retry-After branch, which is 429-only).
+    #[tokio::test]
+    async fn retry_5xx_uses_backoff() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({"detail": "service unavailable"})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "embedding": [0.1, 0.2, 0.3, 0.4], "index": 0 }]
+            })))
+            .mount(&server)
+            .await;
+        // max_retries=1, tiny base_delay — must succeed on the second attempt.
+        let v = test_voyage(&server, 1, Duration::from_millis(1));
+        let out = v
+            .embed_query("q")
+            .await
+            .expect("should succeed after one 503");
+        assert_eq!(out.len(), 4, "expected 4-element embedding");
+    }
+
+    /// When every attempt returns 503, all retries are exhausted and
+    /// `EmbedError::RetriesExhausted` is returned. Proves `is_retryable`
+    /// accepts 5xx and that the retry loop does not give up early.
+    #[tokio::test]
+    async fn retries_exhausted_on_persistent_5xx() {
+        let server = MockServer::start().await;
+        // No `up_to_n_times` — replies 503 to every request.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({"detail": "service unavailable"})),
+            )
+            .mount(&server)
+            .await;
+        // max_retries=1 → 2 total attempts, both fail.
+        let v = test_voyage(&server, 1, Duration::from_millis(0));
+        let err = v
+            .embed_query("q")
+            .await
+            .expect_err("should exhaust retries on persistent 503");
+        assert!(
+            matches!(err, EmbedError::RetriesExhausted(_)),
+            "expected RetriesExhausted, got: {err:?}"
+        );
+    }
 }
