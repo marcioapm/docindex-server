@@ -59,15 +59,6 @@ impl Voyage {
         texts: &[String],
         input_type: &str,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
-        if self.api_key.is_empty() {
-            return Err(EmbedError::Config("api_key is empty".into()));
-        }
-        if self.model.is_empty() {
-            return Err(EmbedError::Config("model is empty".into()));
-        }
-        if self.dim == 0 {
-            return Err(EmbedError::Config("dim must be > 0".into()));
-        }
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -146,10 +137,8 @@ impl Voyage {
             if !is_retryable(status) {
                 return Err(last_err);
             }
-            if status == StatusCode::TOO_MANY_REQUESTS
-                && let Some(ra) = retry_after
-            {
-                delay = ra.min(RETRY_AFTER_MAX);
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                delay = effective_retry_delay(retry_after, delay);
             }
         }
         Err(EmbedError::RetriesExhausted(format!("{last_err}")))
@@ -166,11 +155,29 @@ impl Voyage {
         Ok(out)
     }
 
+    /// Validate struct-level invariants once per logical request. Cheaper
+    /// than checking inside the inner per-batch loop, and ensures the error
+    /// is surfaced before any HTTP traffic occurs.
+    fn validate_config(&self) -> Result<(), EmbedError> {
+        if self.api_key.is_empty() {
+            return Err(EmbedError::Config("api_key is empty".into()));
+        }
+        if self.model.is_empty() {
+            return Err(EmbedError::Config("model is empty".into()));
+        }
+        if self.dim == 0 {
+            return Err(EmbedError::Config("dim must be > 0".into()));
+        }
+        Ok(())
+    }
+
     pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.validate_config()?;
         self.embed(texts, "document").await
     }
 
     pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        self.validate_config()?;
         let texts = [text.to_string()];
         let mut out = self.embed(&texts, "query").await?;
         out.pop()
@@ -186,6 +193,19 @@ fn retry_after_delay(resp: &reqwest::Response) -> Option<Duration> {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs)
+}
+
+/// Choose the sleep duration for the next retry attempt.
+///
+/// When the server supplies a `Retry-After` header (`retry_after = Some(ra)`),
+/// use `ra` clamped to `RETRY_AFTER_MAX` so a hostile header can't stall
+/// indexing indefinitely. When no header is present, use the exponential
+/// `backoff` accumulated by the caller.
+pub(crate) fn effective_retry_delay(retry_after: Option<Duration>, backoff: Duration) -> Duration {
+    match retry_after {
+        Some(ra) => ra.min(RETRY_AFTER_MAX),
+        None => backoff,
+    }
 }
 
 fn is_retryable(status: StatusCode) -> bool {
@@ -430,52 +450,37 @@ mod tests {
         assert!(matches!(err, EmbedError::Api { status: 400, .. }));
     }
 
-    /// `Retry-After: 100000` must be clamped to RETRY_AFTER_MAX (60s), not
-    /// used verbatim. We verify this by (a) asserting the constant equals
-    /// the spec, and (b) using a tiny Retry-After value that the clamp still
-    /// accepts, confirming the clamping branch is taken and the retry
-    /// ultimately succeeds.
-    #[tokio::test]
-    async fn retry_after_is_capped_at_60s() {
-        // Verify the cap constant matches the specification.
+    /// `effective_retry_delay` must clamp a large `Retry-After` to
+    /// `RETRY_AFTER_MAX`. This test proves the clamp is load-bearing:
+    /// deleting the `.min(RETRY_AFTER_MAX)` inside `effective_retry_delay`
+    /// would return `Duration::from_secs(100_000)` instead of
+    /// `RETRY_AFTER_MAX`, failing the assertion below.
+    #[test]
+    fn retry_after_capped_at_max_by_pure_fn() {
+        // Value far exceeding RETRY_AFTER_MAX — without the clamp the fn
+        // returns this verbatim, breaking the assertion.
+        let large = Duration::from_secs(100_000);
         assert_eq!(
+            effective_retry_delay(Some(large), Duration::from_secs(1)),
             RETRY_AFTER_MAX,
-            Duration::from_secs(60),
-            "RETRY_AFTER_MAX must be 60s per spec"
+            "retry_after > RETRY_AFTER_MAX must be clamped to RETRY_AFTER_MAX"
         );
+        // Below-cap value is passed through unchanged.
+        assert_eq!(
+            effective_retry_delay(Some(Duration::from_secs(5)), Duration::from_secs(1)),
+            Duration::from_secs(5),
+        );
+        // No Retry-After header: falls back to the supplied backoff delay.
+        assert_eq!(
+            effective_retry_delay(None, Duration::from_secs(2)),
+            Duration::from_secs(2),
+        );
+    }
 
-        // Verify the clamping branch: use Retry-After: 0 (min(0, 60) = 0s
-        // sleep) so the retry is instant. Without the clamping logic, a
-        // large Retry-After like 100000 would replace the delay directly
-        // rather than being capped. Here we confirm the retry loop succeeds
-        // when the header is present, proving the assignment path is taken.
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(429)
-                    .insert_header("Retry-After", "0")
-                    .set_body_json(json!({"error": "rate limited"})),
-            )
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [{ "embedding": [0.5, 0.5, 0.5, 0.5], "index": 0 }]
-            })))
-            .mount(&server)
-            .await;
-        let v = test_voyage(&server, 2, Duration::from_secs(30));
-        // base_delay is 30s but Retry-After: 0 → min(0s, 60s) = 0s sleep,
-        // so the retry happens immediately and the test finishes quickly.
-        let start = std::time::Instant::now();
-        let out = v.embed_query("q").await.expect("success after retry");
-        assert_eq!(out.len(), 4);
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "Retry-After:0 + cap must complete quickly; elapsed={:?}",
-            start.elapsed()
-        );
+    /// Constant-sanity check: `RETRY_AFTER_MAX` is spec'd at 60 s.
+    #[test]
+    fn retry_after_max_constant_is_60s() {
+        assert_eq!(RETRY_AFTER_MAX, Duration::from_secs(60));
     }
 
     #[tokio::test]
