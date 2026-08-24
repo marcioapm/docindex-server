@@ -630,9 +630,10 @@ impl Store {
         // floats sort correctly by their bit representation; cosine distance
         // is always ≥ 0, so this encoding is safe.
         //
-        // Tie-break: larger rowid sorts higher, so on eviction we remove the
-        // entry with the largest rowid among equally-distant candidates,
-        // keeping results deterministic regardless of scan order.
+        // Tie-break: the eviction condition uses strict `<`, so a new entry
+        // with the same distance as the current worst is not admitted. Among
+        // equally-distant candidates the first-scanned (lowest rowid, earliest
+        // in table order) is retained; higher-rowid duplicates are discarded.
         let mut heap: BinaryHeap<(u32, i64)> = BinaryHeap::with_capacity(k + 1);
 
         let mut rows = stmt.query([])?;
@@ -1476,7 +1477,7 @@ mod tests {
             let y: f32 = (0.05f32).sqrt();
             [x, y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         };
-        s.set_vector_for_chunk(id_near2, &near2_vec).unwrap(); // dist ≈ 0.05
+        s.set_vector_for_chunk(id_near2, &near2_vec).unwrap(); // dist ≈ 0.025
         s.set_vector_for_chunk(id_near1, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             .unwrap(); // dist ≈ 0.0
 

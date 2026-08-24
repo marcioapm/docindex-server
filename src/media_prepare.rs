@@ -208,10 +208,11 @@ fn decode_image(
             let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
                 .map_err(|_| MediaPrepareError::ImageDecode { path: path.into() })?;
             let mut frames = decoder.into_frames();
-            // Decode only the first frame; check for a second without
-            // decoding its pixel data — `next()` on the lazy iterator
-            // advances the parser just enough to determine whether a frame
-            // boundary exists.
+            // Decode the first frame to obtain the pixel buffer, then advance
+            // the iterator once more to check whether a second frame exists.
+            // The second `next()` decodes one additional frame but not the
+            // rest; `is_some()` on its result determines whether the GIF is
+            // animated without exhausting the full frame sequence.
             let first = frames
                 .next()
                 .ok_or_else(|| MediaPrepareError::ImageDecode { path: path.into() })?
@@ -579,9 +580,9 @@ mod tests {
         assert_eq!(pixel.get_pixel(0, 0).0, [255, 0, 0, 255]);
     }
 
-    /// A single-frame GIF must not be marked truncated — the lazy iterator
-    /// probes for a second frame (returning None) without loading any extra
-    /// pixel data.
+    /// A single-frame GIF must not be marked truncated. The frame iterator
+    /// returns None on the second call, so `animated` is false and
+    /// `truncated_animation` is not set.
     #[test]
     fn static_gif_is_not_marked_truncated() {
         let prepared = prepare_media(
