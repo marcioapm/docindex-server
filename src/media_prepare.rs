@@ -708,6 +708,7 @@ mod tests {
             "expected PdfUnsupported, got: {display}"
         );
     }
+
     /// Build a minimal but structurally valid single-page PDF in memory.
     fn minimal_one_page_pdf() -> Vec<u8> {
         b"%PDF-1.4\n\
@@ -813,6 +814,36 @@ mod tests {
         assert_eq!(parts[0].mime_type, "application/pdf");
         // Chunk range covers the whole document: [0, 1).
         assert_eq!(prepared.chunks[0].metadata.page_range, Some((0, 1)));
+    }
+
+    /// A 3-page PDF with pdf_pages_per_chunk=6: the whole document fits in a
+    /// single range (0,3) which is ≤6 pages, so the passthrough condition
+    /// fires and the original bytes are sent unchanged.  This pins the intent
+    /// of the single-range passthrough: not "single page" but "whole document
+    /// fits within one chunk".
+    #[test]
+    fn native_three_page_pdf_with_large_pages_per_chunk_passes_through_original_bytes() {
+        let pdf = minimal_n_page_pdf(3);
+        let model = media_model(PdfMode::Native);
+        let opts = PrepareOptions {
+            pdf_pages_per_chunk: 6,
+            ..PrepareOptions::default()
+        };
+        let prepared = prepare_media("three.pdf", &pdf, &model, opts).unwrap();
+        assert_eq!(
+            prepared.chunks.len(),
+            1,
+            "3-page PDF with pages_per_chunk=6 must yield one chunk"
+        );
+        let EmbedInput::Media(parts) = &prepared.chunks[0].input else {
+            panic!("expected Media input");
+        };
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].bytes, pdf,
+            "3-page PDF must pass through original bytes when it fits in one chunk"
+        );
+        assert_eq!(prepared.chunks[0].metadata.page_range, Some((0, 3)));
     }
 
     /// Multi-page PDF with pdf_pages_per_chunk=1: each page is a separate

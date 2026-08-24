@@ -11,6 +11,8 @@ use super::{
 };
 
 const GEMINI_EMBEDDING_2: &str = "gemini-embedding-2";
+// 16 inputs per batch is a pragmatic bound on base64-encoded request body
+// size for typical document chunks, not a documented API limit.
 const EMBEDDING_2_BATCH_SIZE: usize = 16;
 
 /// Embedder backed by Google's Generative Language REST API.
