@@ -235,9 +235,10 @@ where
             .collect(),
         None => resp.hits,
     };
+    let is_empty = hits.is_empty();
 
     if format == OutputFormat::Json {
-        match serde_json::to_string(&docindex::cli::client::SearchResponse { hits: hits.clone() }) {
+        match serde_json::to_string(&docindex::cli::client::SearchResponse { hits }) {
             Ok(s) => println!("{s}"),
             Err(e) => {
                 eprintln!("docindex-search: encode response: {e}");
@@ -251,7 +252,7 @@ where
         }
     }
 
-    if hits.is_empty() {
+    if is_empty {
         ExitCode::from(4)
     } else {
         ExitCode::from(0)

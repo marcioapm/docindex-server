@@ -130,18 +130,31 @@ fn well_known_cli_paths(lookup: &Lookup<'_>) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn parse_server_toml(path: &Path, content: &FileContent) -> Result<ServerFile, FileConfigError> {
+fn parse_toml<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    content: &FileContent,
+) -> Result<T, FileConfigError> {
     toml::from_str(&content.text).map_err(|e| FileConfigError::Parse {
         path: path.to_path_buf(),
         source: e,
     })
 }
 
-fn parse_cli_toml(path: &Path, content: &FileContent) -> Result<CliFile, FileConfigError> {
-    toml::from_str(&content.text).map_err(|e| FileConfigError::Parse {
+fn read_required<T, F>(
+    reader: &FileReader<'_>,
+    path: &Path,
+    has_inline_secret: F,
+) -> Result<(PathBuf, T), FileConfigError>
+where
+    T: for<'de> Deserialize<'de>,
+    F: Fn(&T) -> bool,
+{
+    let content = reader(path).ok_or_else(|| FileConfigError::NotFound {
         path: path.to_path_buf(),
-        source: e,
-    })
+    })?;
+    let parsed: T = parse_toml(path, &content)?;
+    warn_world_readable_secret(path, &content, has_inline_secret(&parsed));
+    Ok((path.to_path_buf(), parsed))
 }
 
 /// Locate + parse the server config file per the documented search order:
@@ -157,33 +170,21 @@ pub fn find_server_config(
     config_flag: Option<&Path>,
 ) -> Result<Option<(PathBuf, ServerFile)>, FileConfigError> {
     if let Some(p) = config_flag {
-        return read_server_required(reader, p).map(Some);
+        return read_required(reader, p, server_has_inline_secret).map(Some);
     }
     if let Some(v) = lookup("DOCINDEX_CONFIG")
         && !v.is_empty()
     {
-        return read_server_required(reader, &PathBuf::from(v)).map(Some);
+        return read_required(reader, &PathBuf::from(v), server_has_inline_secret).map(Some);
     }
     for p in well_known_server_paths(lookup) {
         if let Some(content) = reader(&p) {
-            let parsed = parse_server_toml(&p, &content)?;
+            let parsed: ServerFile = parse_toml(&p, &content)?;
             warn_world_readable_secret(&p, &content, server_has_inline_secret(&parsed));
             return Ok(Some((p, parsed)));
         }
     }
     Ok(None)
-}
-
-fn read_server_required(
-    reader: &FileReader<'_>,
-    path: &Path,
-) -> Result<(PathBuf, ServerFile), FileConfigError> {
-    let content = reader(path).ok_or_else(|| FileConfigError::NotFound {
-        path: path.to_path_buf(),
-    })?;
-    let parsed = parse_server_toml(path, &content)?;
-    warn_world_readable_secret(path, &content, server_has_inline_secret(&parsed));
-    Ok((path.to_path_buf(), parsed))
 }
 
 /// Locate + parse the CLI config file per: `--config` flag >
@@ -194,33 +195,21 @@ pub fn find_cli_config(
     config_flag: Option<&Path>,
 ) -> Result<Option<(PathBuf, CliFile)>, FileConfigError> {
     if let Some(p) = config_flag {
-        return read_cli_required(reader, p).map(Some);
+        return read_required(reader, p, cli_has_inline_secret).map(Some);
     }
     if let Some(v) = lookup("DOCINDEX_CLI_CONFIG")
         && !v.is_empty()
     {
-        return read_cli_required(reader, &PathBuf::from(v)).map(Some);
+        return read_required(reader, &PathBuf::from(v), cli_has_inline_secret).map(Some);
     }
     for p in well_known_cli_paths(lookup) {
         if let Some(content) = reader(&p) {
-            let parsed = parse_cli_toml(&p, &content)?;
+            let parsed: CliFile = parse_toml(&p, &content)?;
             warn_world_readable_secret(&p, &content, cli_has_inline_secret(&parsed));
             return Ok(Some((p, parsed)));
         }
     }
     Ok(None)
-}
-
-fn read_cli_required(
-    reader: &FileReader<'_>,
-    path: &Path,
-) -> Result<(PathBuf, CliFile), FileConfigError> {
-    let content = reader(path).ok_or_else(|| FileConfigError::NotFound {
-        path: path.to_path_buf(),
-    })?;
-    let parsed = parse_cli_toml(path, &content)?;
-    warn_world_readable_secret(path, &content, cli_has_inline_secret(&parsed));
-    Ok((path.to_path_buf(), parsed))
 }
 
 fn server_has_inline_secret(f: &ServerFile) -> bool {
