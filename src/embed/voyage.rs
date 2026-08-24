@@ -166,7 +166,8 @@ impl Voyage {
                 return decode_embeddings(&raw, input_count, self.dim);
             }
 
-            let message = parse_api_error(&raw).unwrap_or_else(|| sanitise_error_body(&raw));
+            let raw_msg = parse_api_error(&raw).unwrap_or_else(|| sanitise_error_body(&raw));
+            let message = sanitise_error_message(&raw_msg);
             last_err = EmbedError::Api {
                 status: status.as_u16(),
                 message,
@@ -328,18 +329,25 @@ fn parse_api_error(raw: &[u8]) -> Option<String> {
     }
 }
 
-/// Build a bounded, single-line excerpt from a raw response body for use in
-/// error messages and logs. Caps at 200 bytes and replaces control characters
-/// (newlines, tabs, etc.) with spaces so the excerpt stays on one log line.
+/// Decode a raw response body into a bounded, single-line excerpt suitable
+/// for error messages and logs. The byte slice is decoded as UTF-8 (replacing
+/// invalid sequences), then forwarded to `sanitise_error_message`.
 fn sanitise_error_body(raw: &[u8]) -> String {
-    const MAX_BYTES: usize = 200;
-    let truncated = &raw[..raw.len().min(MAX_BYTES)];
-    let text = String::from_utf8_lossy(truncated);
-    let single_line: String = text
+    let text = String::from_utf8_lossy(raw);
+    sanitise_error_message(&text)
+}
+
+/// Truncate `msg` to at most 200 characters (not bytes, so no mid-codepoint
+/// split) and replace every control character with a space, keeping the result
+/// on a single log line. Appends "…" when the input was longer.
+fn sanitise_error_message(msg: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let truncated: String = msg.chars().take(MAX_CHARS).collect();
+    let single_line: String = truncated
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    if raw.len() > MAX_BYTES {
+    if msg.chars().count() > MAX_CHARS {
         format!("{single_line}…")
     } else {
         single_line
@@ -883,5 +891,85 @@ mod tests {
             matches!(err, EmbedError::RetriesExhausted(_)),
             "expected RetriesExhausted, got: {err:?}"
         );
+    }
+
+    /// A valid JSON error body with a 5000-character `detail` field
+    /// containing embedded newlines must be truncated to ≤ 200 characters
+    /// with control characters replaced. This exercises the parsed-JSON
+    /// branch of `send_request` (the path where `parse_api_error` succeeds).
+    #[tokio::test]
+    async fn parsed_json_error_detail_is_sanitised_and_bounded() {
+        let server = MockServer::start().await;
+        // Build a detail string: 5000 'a' chars with newlines every 100 chars.
+        let long_detail: String = (0..5000)
+            .map(|i| if i % 100 == 99 { '\n' } else { 'a' })
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"detail": long_detail})))
+            .mount(&server)
+            .await;
+        let v = test_voyage(&server, 0, Duration::from_millis(1));
+        let err = v.embed_query("q").await.expect_err("should fail on 400");
+        let EmbedError::Api { message, status } = err else {
+            panic!("expected Api error, got: {err:?}");
+        };
+        assert_eq!(status, 400);
+        // The message must be bounded.
+        assert!(
+            message.chars().count() <= 202, // 200 chars + optional "…"
+            "sanitised message must be ≤ 202 chars, got {} chars: {message:?}",
+            message.chars().count()
+        );
+        // No control characters — newlines from the detail field must be spaces.
+        assert!(
+            !message.chars().any(|c| c.is_control()),
+            "sanitised message must not contain control characters: {message:?}"
+        );
+    }
+
+    /// An unparseable response body (not valid JSON) must still produce a
+    /// bounded, control-character-free error message via the fallback branch.
+    #[tokio::test]
+    async fn unparseable_error_body_is_sanitised_and_bounded() {
+        let server = MockServer::start().await;
+        // Raw body: 5000 'b' chars with embedded newlines — not valid JSON.
+        let raw_body: String = (0..5000)
+            .map(|i| if i % 100 == 99 { '\n' } else { 'b' })
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(raw_body))
+            .mount(&server)
+            .await;
+        let v = test_voyage(&server, 0, Duration::from_millis(1));
+        let err = v.embed_query("q").await.expect_err("should fail on 503");
+        // 503 is retryable but max_retries=0 → one attempt → RetriesExhausted wrapping the Api message.
+        let EmbedError::RetriesExhausted(wrapped) = err else {
+            panic!("expected RetriesExhausted, got: {err:?}");
+        };
+        // The inner message is the formatted Api error; extract the message portion.
+        // Regardless of wrapping, no segment of the log output should be unbounded
+        // or contain raw control characters from the response body.
+        assert!(
+            !wrapped.chars().any(|c| c.is_control()),
+            "error string must not contain control characters: {wrapped:?}"
+        );
+    }
+
+    /// `sanitise_error_message` must truncate at a character boundary, not a
+    /// byte boundary. A multi-byte UTF-8 sequence (e.g. 4-byte emoji) must
+    /// never be split, producing U+FFFD in the output.
+    #[test]
+    fn sanitise_error_message_truncates_at_char_boundary() {
+        // Each emoji is 4 bytes; 201 of them exceed the 200-char cap.
+        let input: String = "🦀".repeat(201);
+        let out = sanitise_error_message(&input);
+        // Must not contain the replacement character.
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "truncation must not split a multi-byte codepoint: {out:?}"
+        );
+        // The truncated portion must be exactly 200 chars plus the ellipsis.
+        let without_ellipsis: String = out.chars().filter(|&c| c != '…').collect();
+        assert_eq!(without_ellipsis.chars().count(), 200);
     }
 }
