@@ -11,8 +11,7 @@ use super::{
 };
 
 const GEMINI_EMBEDDING_2: &str = "gemini-embedding-2";
-// 16 inputs per batch is a pragmatic bound on base64-encoded request body
-// size for typical document chunks, not a documented API limit.
+// Pragmatic batch size bound based on base64-encoded request body size.
 const EMBEDDING_2_BATCH_SIZE: usize = 16;
 
 /// Embedder backed by Google's Generative Language REST API.
@@ -114,8 +113,7 @@ impl Gemini {
         Err(EmbedError::RetriesExhausted(format!("{last_err}")))
     }
 
-    /// Legacy `gemini-embedding-001` request. Its endpoint and taskType
-    /// behavior intentionally remain unchanged.
+    /// Legacy `gemini-embedding-001` uses `embedContent` with `taskType`.
     async fn embed_legacy(&self, text: &str, task_type: &str) -> Result<Vec<f32>, EmbedError> {
         let url = format!(
             "{}/v1beta/models/{}:embedContent",
@@ -535,7 +533,7 @@ mod tests {
             .collect::<Vec<_>>();
         let output = gemini.embed_documents(&inputs).await.unwrap();
         assert_eq!(output.len(), 17);
-        // Two batches must have been sent: one of 16, one of 1.
+        // Two batches: first of 16, second of 1.
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(
             reqs.len(),
@@ -543,7 +541,6 @@ mod tests {
             "expected exactly 2 batch requests, got {}",
             reqs.len()
         );
-        // Batch sizes: first request has 16 items, second has 1.
         let first_count: usize = serde_json::from_slice::<serde_json::Value>(&reqs[0].body)
             .unwrap()["requests"]
             .as_array()
@@ -614,8 +611,7 @@ mod tests {
         ));
     }
 
-    /// Legacy model (gemini-embedding-001) must retry on 429 and succeed on
-    /// the subsequent attempt.
+    /// Legacy model (gemini-embedding-001) retries on 429 and succeeds.
     #[tokio::test]
     async fn legacy_retry_on_429() {
         let server = MockServer::start().await;
@@ -641,7 +637,7 @@ mod tests {
         assert_eq!(out.len(), 1);
     }
 
-    /// Legacy model must retry on 503 and succeed on the subsequent attempt.
+    /// Legacy model retries on 503 and succeeds.
     #[tokio::test]
     async fn legacy_retry_on_503() {
         let server = MockServer::start().await;
@@ -667,7 +663,7 @@ mod tests {
         assert_eq!(out.len(), 1);
     }
 
-    /// Legacy model must fail fast on a 4xx other than 429 — no retries.
+    /// Legacy model fails fast on a 4xx other than 429 — no retries.
     #[tokio::test]
     async fn legacy_fail_fast_on_4xx() {
         let server = MockServer::start().await;
@@ -747,7 +743,6 @@ mod tests {
             "dim=0 must produce Config error"
         );
 
-        // No HTTP requests must have been sent for any of the above.
         assert_eq!(
             server.received_requests().await.unwrap().len(),
             0,

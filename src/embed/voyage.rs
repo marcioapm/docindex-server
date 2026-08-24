@@ -1,10 +1,8 @@
 //! Voyage AI embeddings client.
 //!
-//! Mirrors the Gemini client's retry/backoff and `EmbedError` mapping.
 //! Voyage's free-tier limits are per-minute; `Retry-After` (when present)
-//! is honored verbatim, otherwise backoff starts at 1s (not the Gemini
-//! client's 200ms) so a burst of 429s doesn't exhaust retries before the
-//! window resets.
+//! is honored verbatim, otherwise backoff starts at 1s so a burst of 429s
+//! doesn't exhaust retries before the window resets.
 
 use std::time::Duration;
 
@@ -182,9 +180,7 @@ impl Voyage {
         Err(EmbedError::RetriesExhausted(format!("{last_err}")))
     }
 
-    /// Validate struct-level invariants once per logical request. Cheaper
-    /// than checking inside the inner per-batch loop, and ensures the error
-    /// is surfaced before any HTTP traffic occurs.
+    /// Validate struct-level invariants before any HTTP traffic.
     fn validate_config(&self) -> Result<(), EmbedError> {
         if self.api_key.is_empty() {
             return Err(EmbedError::Config("api_key is empty".into()));
@@ -305,10 +301,8 @@ fn retry_after_delay(resp: &reqwest::Response) -> Option<Duration> {
 
 /// Choose the sleep duration for the next retry attempt.
 ///
-/// When the server supplies a `Retry-After` header (`retry_after = Some(ra)`),
-/// use `ra` clamped to `RETRY_AFTER_MAX` so a hostile header can't stall
-/// indexing indefinitely. When no header is present, use the exponential
-/// `backoff` accumulated by the caller.
+/// Prefers a `Retry-After` header (clamped to `RETRY_AFTER_MAX`) over the
+/// exponential backoff accumulated by the caller.
 pub(crate) fn effective_retry_delay(retry_after: Option<Duration>, backoff: Duration) -> Duration {
     match retry_after {
         Some(ra) => ra.min(RETRY_AFTER_MAX),
@@ -743,27 +737,19 @@ mod tests {
         assert!(matches!(err, EmbedError::Api { status: 400, .. }));
     }
 
-    /// `effective_retry_delay` must clamp a large `Retry-After` to
-    /// `RETRY_AFTER_MAX`. This test proves the clamp is load-bearing:
-    /// deleting the `.min(RETRY_AFTER_MAX)` inside `effective_retry_delay`
-    /// would return `Duration::from_secs(100_000)` instead of
-    /// `RETRY_AFTER_MAX`, failing the assertion below.
+    /// `effective_retry_delay` clamps `Retry-After` to `RETRY_AFTER_MAX`.
     #[test]
     fn retry_after_capped_at_max_by_pure_fn() {
-        // Value far exceeding RETRY_AFTER_MAX — without the clamp the fn
-        // returns this verbatim, breaking the assertion.
         let large = Duration::from_secs(100_000);
         assert_eq!(
             effective_retry_delay(Some(large), Duration::from_secs(1)),
             RETRY_AFTER_MAX,
             "retry_after > RETRY_AFTER_MAX must be clamped to RETRY_AFTER_MAX"
         );
-        // Below-cap value is passed through unchanged.
         assert_eq!(
             effective_retry_delay(Some(Duration::from_secs(5)), Duration::from_secs(1)),
             Duration::from_secs(5),
         );
-        // No Retry-After header: falls back to the supplied backoff delay.
         assert_eq!(
             effective_retry_delay(None, Duration::from_secs(2)),
             Duration::from_secs(2),
@@ -893,10 +879,8 @@ mod tests {
         );
     }
 
-    /// A valid JSON error body with a 5000-character `detail` field
-    /// containing embedded newlines must be truncated to ≤ 200 characters
-    /// with control characters replaced. This exercises the parsed-JSON
-    /// branch of `send_request` (the path where `parse_api_error` succeeds).
+    /// A long JSON error `detail` is truncated to ≤ 200 chars, control
+    /// characters replaced. Exercises the parsed-JSON branch of `send_request`.
     #[tokio::test]
     async fn parsed_json_error_detail_is_sanitised_and_bounded() {
         let server = MockServer::start().await;
@@ -927,8 +911,8 @@ mod tests {
         );
     }
 
-    /// An unparseable response body (not valid JSON) must still produce a
-    /// bounded, control-character-free error message via the fallback branch.
+    /// An unparseable response body produces a bounded, control-character-free
+    /// error message via the fallback branch.
     #[tokio::test]
     async fn unparseable_error_body_is_sanitised_and_bounded() {
         let server = MockServer::start().await;
@@ -942,33 +926,27 @@ mod tests {
             .await;
         let v = test_voyage(&server, 0, Duration::from_millis(1));
         let err = v.embed_query("q").await.expect_err("should fail on 503");
-        // 503 is retryable but max_retries=0 → one attempt → RetriesExhausted wrapping the Api message.
+        // 503 is retryable but max_retries=0 → RetriesExhausted wrapping the Api message.
         let EmbedError::RetriesExhausted(wrapped) = err else {
             panic!("expected RetriesExhausted, got: {err:?}");
         };
         // The inner message is the formatted Api error; extract the message portion.
-        // Regardless of wrapping, no segment of the log output should be unbounded
-        // or contain raw control characters from the response body.
         assert!(
             !wrapped.chars().any(|c| c.is_control()),
             "error string must not contain control characters: {wrapped:?}"
         );
     }
 
-    /// `sanitise_error_message` must truncate at a character boundary, not a
-    /// byte boundary. A multi-byte UTF-8 sequence (e.g. 4-byte emoji) must
-    /// never be split, producing U+FFFD in the output.
+    /// `sanitise_error_message` truncates at a character boundary, not a byte
+    /// boundary — multi-byte codepoints must never be split.
     #[test]
     fn sanitise_error_message_truncates_at_char_boundary() {
-        // Each emoji is 4 bytes; 201 of them exceed the 200-char cap.
         let input: String = "🦀".repeat(201);
         let out = sanitise_error_message(&input);
-        // Must not contain the replacement character.
         assert!(
             !out.contains('\u{FFFD}'),
             "truncation must not split a multi-byte codepoint: {out:?}"
         );
-        // The truncated portion must be exactly 200 chars plus the ellipsis.
         let without_ellipsis: String = out.chars().filter(|&c| c != '…').collect();
         assert_eq!(without_ellipsis.chars().count(), 200);
     }
