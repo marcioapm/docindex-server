@@ -8,7 +8,7 @@ Files with extension `.md` or `.txt` (case-insensitive) anywhere under the confi
 ## Stack
 - **Language:** Rust (edition 2024, MSRV 1.90)
 - **Storage:** SQLite (`rusqlite`, bundled) + [sqlite-vec](https://github.com/asg017/sqlite-vec) (vectors, `vec0` cosine) + FTS5 (BM25)
-- **Embeddings:** provider/model registry (below) — Google `gemini-embedding-001`, Voyage AI's `voyage-4` family, or a deterministic `fake` backend for tests
+- **Embeddings:** provider/model registry (below) — Google `gemini-embedding-2` (default; text+image+PDF), `gemini-embedding-001` (text-only, explicit legacy), Voyage AI `voyage-multimodal-3.5` (text+image+PDF), Voyage text family (`voyage-4` family), or a deterministic `fake` backend for tests
 - **Async runtime:** `tokio` (multi-thread)
 - **HTTP server:** `axum` 0.8
 - **HTTP client:** `reqwest` + rustls
@@ -19,15 +19,17 @@ Files with extension `.md` or `.txt` (case-insensitive) anywhere under the confi
 
 ## Supported providers / models
 
-| Provider | Model | Native dim | Allowed dims | Doc task | Query task |
-|---|---|---|---|---|---|
-| `gemini` | `gemini-embedding-001` (default) | 3072 | 768, 1536, 3072 | `RETRIEVAL_DOCUMENT` | `RETRIEVAL_QUERY` |
-| `voyage` | `voyage-4` (default) | 1024 | 256, 512, 1024, 2048 | `document` | `query` |
-| `voyage` | `voyage-4-lite` | 1024 | 256, 512, 1024, 2048 | `document` | `query` |
-| `voyage` | `voyage-4-large` | 1024 | 256, 512, 1024, 2048 | `document` | `query` |
-| `voyage` | `voyage-context-4` | 1024 | 256, 512, 1024, 2048 | `document` | `query` |
-| `voyage` | `voyage-code-3` | 1024 | 256, 512, 1024, 2048 | `document` | `query` |
-| `fake` | any name | — | any | `document` | `query` |
+| Provider | Model | Native dim | Allowed dims | Media | Doc task | Query task |
+|---|---|---|---|---|---|---|
+| `gemini` | `gemini-embedding-2` (**default**) | 3072 | 768, 1536, 3072 | text+image+PDF | text prefix | text prefix |
+| `gemini` | `gemini-embedding-001` | 3072 | 768, 1536, 3072 | text only | `RETRIEVAL_DOCUMENT` | `RETRIEVAL_QUERY` |
+| `voyage` | `voyage-4` (**default**) | 1024 | 256, 512, 1024, 2048 | text only | `document` | `query` |
+| `voyage` | `voyage-4-lite` | 1024 | 256, 512, 1024, 2048 | text only | `document` | `query` |
+| `voyage` | `voyage-4-large` | 1024 | 256, 512, 1024, 2048 | text only | `document` | `query` |
+| `voyage` | `voyage-context-4` | 1024 | 256, 512, 1024, 2048 | text only | `document` | `query` |
+| `voyage` | `voyage-code-3` | 1024 | 256, 512, 1024, 2048 | text only | `document` | `query` |
+| `voyage` | `voyage-multimodal-3.5` | 1024 | 256, 512, 1024, 2048 | text+image+PDF | `document` | `query` |
+| `fake` | any name | — | any | text+image+PDF | `document` | `query` |
 
 Smaller allowed dims are Matryoshka truncations — cheaper to store and search, small quality tradeoff. `fake` is deterministic (sha256-seeded, L2-normalized) and used only in tests / dev without a real API key.
 
@@ -56,29 +58,31 @@ allow_loopback   = false
 
 [embed]
 provider  = "gemini"                # gemini | voyage | fake
-model     = "gemini-embedding-001"  # optional; provider default when omitted
+model     = "gemini-embedding-2"    # stable default; 001 remains explicit text-only compatibility
+# Switching an existing gemini-embedding-001 DB requires --reembed.
 dim       = 3072                    # optional; model native dim when omitted
 api_key   = "..."                   # or api_key_env = "GEMINI_API_KEY"
 base_url  = "https://..."           # optional override (proxy/mock); NOT part of the index fingerprint
 
 [media]
-# Opt-in foundation only: this release selects eligible assets but does not
-# record them as indexed or embed images/PDFs until provider adapters land.
+# Opt-in image/PDF indexing. Requires a media-capable model.
 enabled = false
 include = ["Attachments/**", "Papers/**"]
 exclude = ["**/Private/**", "**/Thumbnails/**"]
 exclude_types = ["audio", "video"] # image | pdf | audio | video
 max_file_mb = 20
-pdf_pages_per_chunk = 6
+pdf_pages_per_chunk = 1              # Google recommends one PDF page for quality
 pdf_dpi = 150
 ```
 
-### Media foundation
-Media is opt-in and defaults off. This phase provides only selection, metadata, schema, and ranking groundwork; it **does not yet embed images or PDFs**. Eligible media remains pending and is not recorded as indexed until provider support lands in the next commit series, so do not enable media expecting usable image/PDF results today.
+### Media indexing
+Media is opt-in and defaults off. Images (`png`, `jpg`, `jpeg`, `webp`, `gif`) and PDFs are indexed when `[media].enabled = true` and the configured model is media-capable: Gemini `gemini-embedding-2`, Voyage `voyage-multimodal-3.5`, or the offline fake provider. Startup rejects media with legacy Gemini `gemini-embedding-001` or Voyage text models rather than leaving files perpetually dirty. `gemini-embedding-2` is the stable Gemini default; migrating an existing 001 index requires a complete `--reembed`, because vector spaces never coexist.
 
-When enabled, phase-1 media extensions are images (`png`, `jpg`, `jpeg`, `webp`, `gif`) and PDFs (`pdf`). Text (`md`, `txt`) remains always eligible. Paths are vault-relative and normalized to `/` before matching. An empty `include` admits all supported media; a nonempty `include` admits matching paths only; `exclude` removes matching paths and always wins. `exclude_types` can contain `image`, `pdf`, `audio`, and `video`; audio/video are accepted for forward compatibility but are not scanned in this phase.
+Image format is detected from bytes, not filenames. PNG/JPEG inputs are retained when within the pixel limit; GIF/WebP use their first frame as PNG, and oversized images are downscaled before embedding. PDFs default to **one page per chunk** because Google recommends one page for quality and it avoids silent context truncation. Gemini receives page-subset PDFs; Voyage receives rendered page PNGs. These provider details are internal: all indexed results share the one vector space of the configured model.
 
-`max_file_mb` is an eligibility limit: changing it adds or prunes files at the next startup reconciliation based on their observed size, without changing the effective hash of still-eligible files. The media processing profile used in effective media hashes contains `media-v1`, `max_file_mb`, `pdf_pages_per_chunk`, and `pdf_dpi`; changing any of those settings makes still-eligible media dirty at the next scan. Include/exclude/type changes are eligibility-only and reconcile by add/prune without changing a file hash. Provider/model/dim changes still require `--reembed`.
+Text (`md`, `txt`) remains always eligible. Paths are vault-relative and normalized to `/` before matching. An empty `include` admits all supported media; a nonempty `include` admits matching paths only; `exclude` removes matching paths and always wins. `exclude_types` can contain `image`, `pdf`, `audio`, and `video`; audio/video are accepted as reserved exclusion labels but are not indexed.
+
+`max_file_mb` is an eligibility limit. The media processing profile used in effective media hashes contains `media-v1`, `max_file_mb`, `pdf_pages_per_chunk`, and `pdf_dpi`; changing it reindexes still-eligible media at the next scan. Include/exclude/type changes are eligibility-only. Provider/model/dim changes require `--reembed`. Provider pricing and usage tiers are account-specific; consult the provider's official pricing before enabling a paid model.
 
 ### CLI config file (`docindex-search`)
 Search order: `--config <path>` > `$DOCINDEX_CLI_CONFIG` > `~/.config/docindex/cli.toml`.
@@ -100,12 +104,13 @@ See `.env.example` for the full list. Provider/model/dim: `DOCINDEX_EMBED` (`gem
 
 ```sh
 docindex-search "some query"              # default subcommand = search
+docindex-search "diagram architecture" --media # server-side image/PDF-only search
 docindex-search search "q" -n 5 --json
 docindex-search similar path/to/note.md
 docindex-search health
 ```
 
-Flags: `-n/--limit`, `--json` (emit the server response verbatim), `--server <url>`, `--token <tok>`, `--config <path>`, `--path-filter <prefix>` (client-side filter on returned `path`).
+Flags: `-n/--limit`, `--media` (server-side image/PDF-only ranking; search queries only), `--json` (emit the server response verbatim), `--server <url>`, `--token <tok>`, `--config <path>`, `--path-filter <prefix>` (client-side filter on returned `path`).
 
 Human output, one hit per line, snippet truncated to terminal width (or 200 chars):
 ```
@@ -119,8 +124,8 @@ Human output, one hit per line, snippet truncated to terminal width (or 200 char
 ```
 GET  /health                          -> without/invalid bearer: { ok, authenticated: false }
                                       -> valid bearer: { ok, authenticated: true, indexed_chunks, last_reindex_ms, embedding_model, dim }
-POST /search   { query, limit=10 }    -> { hits: [{ path, title, heading_path, snippet, score, score_rrf, score_normalized, chunk_id }] }
-POST /similar  { path,  limit=10 }    -> same shape
+POST /search   { query, limit=10, media_only=false } -> { hits: [{ path, title, heading_path, snippet, score, score_rrf, score_normalized, chunk_id, media_type, mime_type, media_start, media_end, media_unit, truncated }] }
+POST /similar  { path,  limit=10 }                    -> same shape
 ```
 `/health` always returns `200 OK`: without a valid bearer it is a liveness probe only and must not be used to verify credentials; with `Authorization: Bearer $DOCINDEX_BEARER`, it returns operational detail and `authenticated: true`. `/search` and `/similar` require the bearer and return `401` for missing or invalid credentials. `limit` is clamped to [1, 50]. Errors return `{error, code}` JSON.
 

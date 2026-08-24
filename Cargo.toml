@@ -22,11 +22,14 @@ path = "src/bin/search.rs"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 globset = "0.4"
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 notify = "8"
+pdf_oxide = { version = "=0.3.77", default-features = false, features = ["rendering"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.34", features = ["bundled", "load_extension"] }
 serde = { version = "1", features = ["derive"] }

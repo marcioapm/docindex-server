@@ -13,16 +13,17 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::{
     chunk::{self, Chunk},
-    embed::{AnyEmbedder, EmbedError, TASK_RETRIEVAL_DOCUMENT},
+    embed::registry,
+    embed::{AnyEmbedder, EmbedError, EmbedInput, MEDIA_DOCUMENT_TASK, TASK_RETRIEVAL_DOCUMENT},
     media::{MediaPolicy, MediaType},
-    store::{Store, StoreError},
+    media_prepare::{MediaPrepareError, PrepareOptions, prepare_media},
+    store::{FileReplacement, PreparedEmbeddingCacheEntry, Store, StoreError},
     walk,
 };
 
@@ -38,6 +39,10 @@ pub enum IndexerError {
     Store(#[from] StoreError),
     #[error("indexer: embed: {0}")]
     Embed(#[from] EmbedError),
+    #[error("indexer: media preparation: {0}")]
+    MediaPrepare(#[from] MediaPrepareError),
+    #[error("indexer: model registry: {0}")]
+    Registry(#[from] registry::RegistryError),
     #[error("indexer: join: {0}")]
     Join(#[from] tokio::task::JoinError),
 }
@@ -126,8 +131,7 @@ pub async fn initial_scan(
             let guard = store
                 .lock()
                 .map_err(|e| IndexerError::Msg(format!("store lock: {e}")))?;
-            guard.delete_chunks_for_path(&p)?;
-            guard.delete_file_state(&p)?;
+            guard.remove_file(&p)?;
             Ok(())
         })
         .await??;
@@ -181,8 +185,7 @@ async fn reindex_one(ctx: &IndexerCtx, rel_path: &Path) -> Result<(), IndexerErr
                 let guard = store
                     .lock()
                     .map_err(|e| IndexerError::Msg(format!("store lock: {e}")))?;
-                guard.delete_chunks_for_path(&p)?;
-                guard.delete_file_state(&p)?;
+                guard.remove_file(&p)?;
                 Ok(())
             })
             .await??;
@@ -203,33 +206,26 @@ async fn reindex_one(ctx: &IndexerCtx, rel_path: &Path) -> Result<(), IndexerErr
             let guard = store
                 .lock()
                 .map_err(|e| IndexerError::Msg(format!("store lock: {e}")))?;
-            guard.delete_chunks_for_path(&p)?;
-            guard.delete_file_state(&p)?;
+            guard.remove_file(&p)?;
             Ok(())
         })
         .await??;
+        bump_reindex(ctx);
         return Ok(());
     };
-    if media_type != MediaType::Text {
-        // Without a provider adapter there are no chunks or vectors to commit.
-        // Preserve any pre-existing media rows; `files` state is written only
-        // after a complete index update, so this path stays dirty for adapters.
-        return Ok(());
-    }
     let mtime_ns = meta
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos() as i64)
         .unwrap_or(0);
+    // Read and prepare everything before making any store mutation. This keeps
+    // a decode/embed failure from destroying the prior indexed representation.
     let bytes = std::fs::read(&abs_path)?;
-    let file_hash = {
-        let mut h = Sha256::new();
-        h.update(&bytes);
-        hex::encode(h.finalize())
-    };
+    let file_hash = ctx.media_policy.effective_file_hash(&bytes, media_type);
 
-    // Skip if the stored file hash matches — same bytes, same chunks.
+    // Skip if the effective hash matches. For media this incorporates the
+    // preparation policy, so policy changes correctly force a reindex.
     let stored = {
         let store = ctx.store.clone();
         let p = path_str.clone();
@@ -248,54 +244,104 @@ async fn reindex_one(ctx: &IndexerCtx, rel_path: &Path) -> Result<(), IndexerErr
         return Ok(());
     }
 
-    let chunks = chunk::split(&bytes);
-    if chunks.is_empty() {
-        // Empty file: wipe any prior chunks and record the file_hash so we
-        // don't keep re-processing it.
-        let store = ctx.store.clone();
-        let p = path_str.clone();
-        let hash_c = file_hash.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), IndexerError> {
-            let guard = store
-                .lock()
-                .map_err(|e| IndexerError::Msg(format!("store lock: {e}")))?;
-            guard.delete_chunks_for_path(&p)?;
-            guard.set_file_state(&p, &hash_c, mtime_ns)?;
-            Ok(())
-        })
-        .await??;
-        bump_reindex(ctx);
-        return Ok(());
-    }
+    let (chunks, inputs) = match media_type {
+        MediaType::Text => {
+            let chunks = chunk::split(&bytes);
+            let inputs = chunks
+                .iter()
+                .map(|chunk| EmbedInput::Text(chunk.content.clone()))
+                .collect();
+            (chunks, inputs)
+        }
+        _ => {
+            let provider = match &ctx.embedder {
+                AnyEmbedder::Gemini(_) => registry::EmbedProvider::Gemini,
+                AnyEmbedder::Voyage(_) => registry::EmbedProvider::Voyage,
+                AnyEmbedder::Fake(_) => registry::EmbedProvider::Fake,
+            };
+            let mut model = registry::lookup(provider, &ctx.embed_model)?;
+            // The deterministic fake embedder accepts typed media inputs so
+            // offline tests exercise the same preparation pipeline.
+            if provider == registry::EmbedProvider::Fake {
+                model.media_capable = true;
+            }
+            let prepared = prepare_media(
+                rel_path,
+                &bytes,
+                &model,
+                PrepareOptions {
+                    pdf_pages_per_chunk: ctx.media_policy.pdf_pages_per_chunk,
+                    pdf_dpi: ctx.media_policy.pdf_dpi,
+                    ..PrepareOptions::default()
+                },
+            )?;
+            let mut chunks = Vec::with_capacity(prepared.chunks.len());
+            let mut inputs = Vec::with_capacity(prepared.chunks.len());
+            for prepared_chunk in prepared.chunks {
+                let metadata = prepared_chunk.metadata;
+                chunks.push(Chunk {
+                    idx: metadata.chunk_index,
+                    heading: String::new(),
+                    heading_path: String::new(),
+                    content: String::new(),
+                    content_hash: metadata.cache_key,
+                    tokens: 0,
+                    media_type: prepared.media_type,
+                    mime_type: Some(metadata.mime_type),
+                    media_start: metadata.page_range.map(|(start, _)| start as i64),
+                    media_end: metadata.page_range.map(|(_, end)| end as i64),
+                    media_unit: metadata.page_range.map(|_| "page".to_owned()),
+                    truncated: metadata.truncated_animation,
+                });
+                inputs.push(prepared_chunk.input);
+            }
+            (chunks, inputs)
+        }
+    };
 
-    // Resolve embeddings (cache-first).
-    let (embeddings, cached_count, embedded_count) = resolve_embeddings(ctx, &chunks).await?;
-
-    // Persist: delete existing chunks for path, re-insert, set vectors,
-    // update file_state, update last_reindex. Each store op is short; we
-    // take the lock once per op via spawn_blocking.
+    // Resolve all cache hits and typed misses before atomically replacing the
+    // file. Fresh cache entries are committed with the file replacement.
+    let (embeddings, fresh_embeddings, cached_count, embedded_count) =
+        resolve_embeddings(ctx, &chunks, &inputs).await?;
+    let chunk_count = chunks.len();
+    let cache_model = ctx.embed_model.clone();
+    let cache_dim = ctx.embed_dim;
     let store = ctx.store.clone();
     let path_c = path_str.clone();
     let hash_c = file_hash.clone();
-    let chunks_c = chunks.clone();
-    let embeddings_c = embeddings.clone();
     tokio::task::spawn_blocking(move || -> Result<(), IndexerError> {
+        let cache_entries: Vec<PreparedEmbeddingCacheEntry<'_>> = fresh_embeddings
+            .iter()
+            .map(|(index, embedding)| PreparedEmbeddingCacheEntry {
+                content_hash: &chunks[*index].content_hash,
+                model: &cache_model,
+                task_type: if media_type == MediaType::Text {
+                    TASK_RETRIEVAL_DOCUMENT
+                } else {
+                    MEDIA_DOCUMENT_TASK
+                },
+                dim: cache_dim,
+                embedding,
+            })
+            .collect();
         let guard = store
             .lock()
             .map_err(|e| IndexerError::Msg(format!("store lock: {e}")))?;
-        guard.delete_chunks_for_path(&path_c)?;
-        for (i, c) in chunks_c.iter().enumerate() {
-            let id = guard.upsert_chunk(c, &path_c, mtime_ns)?;
-            guard.set_vector_for_chunk(id, &embeddings_c[i])?;
-        }
-        guard.set_file_state(&path_c, &hash_c, mtime_ns)?;
+        guard.replace_file(FileReplacement {
+            path: &path_c,
+            content_hash: &hash_c,
+            mtime_ns,
+            chunks: &chunks,
+            embeddings: &embeddings,
+            cache_entries: &cache_entries,
+        })?;
         Ok(())
     })
     .await??;
 
     info!(
         path = %path_str,
-        chunks = chunks.len(),
+        chunks = chunk_count,
         embedded = embedded_count,
         cached = cached_count,
         "reindexed"
@@ -304,94 +350,70 @@ async fn reindex_one(ctx: &IndexerCtx, rel_path: &Path) -> Result<(), IndexerErr
     Ok(())
 }
 
-/// Fetch embeddings for every chunk: cache hits come back instantly, cache
-/// misses are batched into a single embedder call.
+/// Fetch embeddings for typed document inputs. Cache misses are batched and
+/// returned as prepared cache entries; this function never mutates the store.
 async fn resolve_embeddings(
     ctx: &IndexerCtx,
     chunks: &[Chunk],
-) -> Result<(Vec<Vec<f32>>, usize, usize), IndexerError> {
-    let hashes: Vec<String> = chunks.iter().map(|c| c.content_hash.clone()).collect();
-
-    // Lookup cache.
+    inputs: &[EmbedInput],
+) -> Result<(Vec<Vec<f32>>, Vec<(usize, Vec<f32>)>, usize, usize), IndexerError> {
+    if chunks.len() != inputs.len() {
+        return Err(IndexerError::Msg("chunk/input count mismatch".into()));
+    }
+    let hashes: Vec<String> = chunks
+        .iter()
+        .map(|chunk| chunk.content_hash.clone())
+        .collect();
     let cached: Vec<Option<Vec<f32>>> = {
         let store = ctx.store.clone();
-        let hashes_c = hashes.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<Option<Vec<f32>>>, IndexerError> {
+        let hashes = hashes.clone();
+        tokio::task::spawn_blocking(move || -> Result<_, IndexerError> {
             let guard = store
                 .lock()
                 .map_err(|e| IndexerError::Msg(format!("store lock: {e}")))?;
-            let mut out = Vec::with_capacity(hashes_c.len());
-            for h in &hashes_c {
-                out.push(guard.get_embedding_cache(h)?);
-            }
-            Ok(out)
+            hashes
+                .iter()
+                .map(|hash| guard.get_embedding_cache(hash).map_err(IndexerError::from))
+                .collect()
         })
         .await??
     };
-
-    let mut to_embed_texts: Vec<String> = Vec::new();
-    let mut to_embed_indexes: Vec<usize> = Vec::new();
-    for (i, hit) in cached.iter().enumerate() {
-        if hit.is_none() {
-            to_embed_texts.push(chunks[i].content.clone());
-            to_embed_indexes.push(i);
-        }
-    }
-
-    let embedded_count = to_embed_texts.len();
-    let cached_count = chunks.len() - embedded_count;
-
-    let fresh: Vec<Vec<f32>> = if to_embed_texts.is_empty() {
+    let missing: Vec<usize> = cached
+        .iter()
+        .enumerate()
+        .filter_map(|(index, hit)| hit.is_none().then_some(index))
+        .collect();
+    let cached_count = chunks.len() - missing.len();
+    let fresh = if missing.is_empty() {
         Vec::new()
     } else {
-        ctx.embedder.embed_documents(&to_embed_texts).await?
+        let missing_inputs: Vec<EmbedInput> =
+            missing.iter().map(|&index| inputs[index].clone()).collect();
+        ctx.embedder.embed_documents(&missing_inputs).await?
     };
-
-    if fresh.len() != to_embed_texts.len() {
+    if fresh.len() != missing.len() {
         return Err(IndexerError::Msg(format!(
             "embedder returned {} vectors for {} inputs",
             fresh.len(),
-            to_embed_texts.len()
+            missing.len()
         )));
     }
-
-    // Populate cache for fresh ones.
-    if !fresh.is_empty() {
-        let store = ctx.store.clone();
-        let model = ctx.embed_model.clone();
-        let dim = ctx.embed_dim;
-        let fresh_pairs: Vec<(String, Vec<f32>)> = to_embed_indexes
-            .iter()
-            .zip(fresh.iter())
-            .map(|(i, v)| (chunks[*i].content_hash.clone(), v.clone()))
-            .collect();
-        tokio::task::spawn_blocking(move || -> Result<(), IndexerError> {
-            let guard = store
-                .lock()
-                .map_err(|e| IndexerError::Msg(format!("store lock: {e}")))?;
-            for (hash, v) in fresh_pairs {
-                guard.put_embedding_cache(&hash, &model, TASK_RETRIEVAL_DOCUMENT, dim, &v)?;
-            }
-            Ok(())
-        })
-        .await??;
-    }
-
-    // Assemble final vector list in chunk order.
-    let mut out: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
-    let mut fresh_iter = fresh.into_iter();
-    for (i, hit) in cached.into_iter().enumerate() {
+    let mut embeddings = Vec::with_capacity(chunks.len());
+    let mut fresh_iter = fresh.iter();
+    for hit in &cached {
         match hit {
-            Some(v) => out.push(v),
-            None => {
-                let v = fresh_iter.next().ok_or_else(|| {
-                    IndexerError::Msg(format!("missing fresh embedding for chunk {i}"))
-                })?;
-                out.push(v);
-            }
+            Some(embedding) => embeddings.push(embedding.clone()),
+            None => embeddings.push(
+                fresh_iter
+                    .next()
+                    .ok_or_else(|| IndexerError::Msg("missing fresh embedding".into()))?
+                    .clone(),
+            ),
         }
     }
-    Ok((out, cached_count, embedded_count))
+    let embedded_count = missing.len();
+    let fresh_embeddings = missing.into_iter().zip(fresh).collect();
+    Ok((embeddings, fresh_embeddings, cached_count, embedded_count))
 }
 
 fn bump_reindex(ctx: &IndexerCtx) {
@@ -423,29 +445,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foundation_media_remains_dirty_without_marking_file_state() {
+    async fn fake_png_reindex_records_file_state_without_fts_rows() {
         let dir = TempDir::new().unwrap();
         let vault = dir.path().join("vault");
         std::fs::create_dir_all(&vault).unwrap();
-        std::fs::write(vault.join("image.png"), b"not decoded in foundation").unwrap();
-        std::fs::write(vault.join("note.md"), b"# Note\n\ntext\n").unwrap();
+        image::RgbaImage::new(1, 1)
+            .save(vault.join("image.png"))
+            .unwrap();
         let mut ctx = mk_ctx(dir.path());
-        ctx.media_policy = MediaPolicy::new(true, &[], &[], &[], 20, 6, 150).unwrap();
+        ctx.embed_model = "gemini-embedding-2".into();
+        ctx.media_policy = MediaPolicy::new(true, &[], &[], &[], 20, 1, 150).unwrap();
 
         reindex_one(&ctx, Path::new("image.png")).await.unwrap();
-        reindex_one(&ctx, Path::new("note.md")).await.unwrap();
-        {
-            let store = ctx.store.lock().unwrap();
-            assert!(store.get_file_state("image.png").unwrap().is_none());
-            assert!(store.get_file_state("note.md").unwrap().is_some());
-            assert!(store.count_chunks().unwrap() >= 1);
-        }
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let (_, dirty, _) = initial_scan(&ctx, &tx).await.unwrap();
-        assert_eq!(dirty, 1, "only unindexed media should remain dirty");
-        assert_eq!(rx.try_recv().unwrap(), PathBuf::from("image.png"));
-        assert!(rx.try_recv().is_err());
+        let store = ctx.store.lock().unwrap();
+        assert!(store.get_file_state("image.png").unwrap().is_some());
+        assert_eq!(store.count_chunks().unwrap(), 1);
+        assert!(
+            store.search_fts("image", 10).unwrap().is_empty(),
+            "media chunks must not be added to FTS"
+        );
     }
 
     #[tokio::test]
@@ -570,6 +588,57 @@ mod tests {
         assert!(
             format!("{err}").contains("absolute"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// When a file is rejected by the media policy, `reindex_one` must remove
+    /// it from the store, call `bump_reindex`, and return `Ok(())`.
+    #[tokio::test]
+    async fn disallowed_file_calls_bump_reindex_and_removes_state() {
+        let dir = TempDir::new().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+
+        image::RgbaImage::new(1, 1)
+            .save(vault.join("photo.png"))
+            .unwrap();
+
+        let mut ctx = mk_ctx(dir.path());
+        ctx.embed_model = "gemini-embedding-2".into();
+        // Index with media enabled so a file-state row exists.
+        ctx.media_policy = MediaPolicy::new(true, &[], &[], &[], 20, 1, 150).unwrap();
+        reindex_one(&ctx, Path::new("photo.png")).await.unwrap();
+        let file_state_before = ctx
+            .store
+            .lock()
+            .unwrap()
+            .get_file_state("photo.png")
+            .unwrap();
+        assert!(
+            file_state_before.is_some(),
+            "file must be indexed before the policy change"
+        );
+
+        ctx.last_reindex_ms.store(0, Ordering::Relaxed);
+        ctx.media_policy = MediaPolicy::default(); // media disabled → png rejected
+
+        let before_ms = ctx.last_reindex_ms.load(Ordering::Relaxed);
+        reindex_one(&ctx, Path::new("photo.png")).await.unwrap();
+        let after_ms = ctx.last_reindex_ms.load(Ordering::Relaxed);
+
+        assert!(
+            after_ms > before_ms,
+            "bump_reindex must update last_reindex_ms on the disallowed-file path"
+        );
+        let file_state_after = ctx
+            .store
+            .lock()
+            .unwrap()
+            .get_file_state("photo.png")
+            .unwrap();
+        assert!(
+            file_state_after.is_none(),
+            "disallowed file must be removed from the store"
         );
     }
 }

@@ -266,6 +266,16 @@ impl Config {
             }
         };
 
+        if media_policy.is_enabled() {
+            match registry::lookup(embed_provider, &embed_model) {
+                Ok(info) if !info.media_capable => errs.push(format!(
+                    "media.enabled requires a multimodal embedding model; {embed_provider}/{embed_model} is text-only. Valid multimodal choices: gemini/gemini-embedding-2, voyage/voyage-multimodal-3.5"
+                )),
+                Err(error) => errs.push(error.to_string()),
+                Ok(_) => {}
+            }
+        }
+
         if !errs.is_empty() {
             return Err(ConfigError::Invalid(errs.join("; ")));
         }
@@ -624,7 +634,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = base_env(&dir);
         let c = Config::from_lookup(&lookup(&env)).expect("valid");
-        assert_eq!(c.embed_model, "gemini-embedding-001");
+        assert_eq!(c.embed_model, "gemini-embedding-2");
         assert_eq!(c.embed_dim, 3072);
         assert_eq!(c.log_format, "json");
         assert_eq!(c.debounce, Duration::from_millis(5000));
@@ -937,6 +947,39 @@ mod tests {
                 .to_string();
             assert!(error.contains(required), "{error}");
         }
+    }
+
+    #[test]
+    fn media_enabled_rejects_text_only_embedding_model() {
+        let dir = TempDir::new().unwrap();
+        let d = dir.path().display();
+        let mut files = HashMap::new();
+        files.insert(
+            PathBuf::from("/media.toml"),
+            file::FileContent {
+                text: format!(
+                    "vault_dir = \"{d}\"\ndb_path = \"{d}/index.db\"\nlisten = \"100.64.0.1:7777\"\nbearer = \"secret\"\n[embed]\nprovider = \"gemini\"\nmodel = \"gemini-embedding-001\"\napi_key = \"key\"\n[media]\nenabled = true\n"
+                ),
+                mode: None,
+            },
+        );
+        let reader = file_reader_for(files);
+        let flags = ConfigFlags {
+            config_path: Some(PathBuf::from("/media.toml")),
+            reembed: false,
+        };
+
+        let error = Config::load(&empty_lookup(), &reader, &flags)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("media.enabled requires a multimodal embedding model"),
+            "{error}"
+        );
+        assert!(
+            error.contains("gemini/gemini-embedding-001 is text-only"),
+            "{error}"
+        );
     }
 
     // --- TOML layering ---------------------------------------------------

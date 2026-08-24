@@ -1,12 +1,4 @@
 //! Embedder trait and implementations.
-//!
-//! Gemini uses task-asymmetric embeddings: documents with
-//! `RETRIEVAL_DOCUMENT`, queries with `RETRIEVAL_QUERY`. Getting this wrong
-//! silently degrades ranking quality — the vectors still parse, they are
-//! just miscalibrated. Output is Matryoshka-truncated to the configured
-//! dim (`DOCINDEX_EMBED_DIM`, default 3072 — the model's native size; 768
-//! is a smaller Matryoshka truncation that trades a little quality for
-//! disk/ANN cost at tiny scale).
 
 pub mod fake;
 pub mod gemini;
@@ -22,10 +14,29 @@ pub use fake::Fake;
 pub use gemini::Gemini;
 pub use voyage::Voyage;
 
-/// Used when embedding chunks for indexing.
 pub const TASK_RETRIEVAL_DOCUMENT: &str = "RETRIEVAL_DOCUMENT";
-/// Used when embedding a user query for search.
 pub const TASK_RETRIEVAL_QUERY: &str = "RETRIEVAL_QUERY";
+pub const MEDIA_DOCUMENT_TASK: &str = "document";
+
+/// A provider-neutral document embedding input. Media bytes are deliberately
+/// not `Debug` so they cannot accidentally be emitted in logs or errors.
+#[derive(Clone)]
+pub enum EmbedInput {
+    Text(String),
+    Media(Vec<MediaPart>),
+}
+
+#[derive(Clone)]
+pub struct MediaPart {
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+impl EmbedInput {
+    pub fn text(value: impl Into<String>) -> Self {
+        Self::Text(value.into())
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum EmbedError {
@@ -43,23 +54,15 @@ pub enum EmbedError {
     RetriesExhausted(String),
 }
 
-/// Produce float32 vectors for document chunks or user queries.
-///
-/// Uses native `async fn` in trait; callers keep the returned futures on the
-/// local runtime and do not need a Send bound for Phase 1 wiring.
 pub trait Embedder: Send + Sync {
     fn embed_documents(
         &self,
-        texts: &[String],
+        inputs: &[EmbedInput],
     ) -> impl Future<Output = Result<Vec<Vec<f32>>, EmbedError>> + Send;
 
     fn embed_query(&self, text: &str) -> impl Future<Output = Result<Vec<f32>, EmbedError>> + Send;
 }
 
-/// Erased embedder for runtime selection. Native `async fn` in traits is not
-/// dyn-compatible, so we enumerate the known implementations and static-
-/// dispatch in a match — callers get `Clone + Send + Sync` without pulling
-/// in `async_trait`.
 #[derive(Clone)]
 pub enum AnyEmbedder {
     Gemini(Arc<Gemini>),
@@ -68,12 +71,23 @@ pub enum AnyEmbedder {
 }
 
 impl AnyEmbedder {
-    pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    pub async fn embed_documents(
+        &self,
+        inputs: &[EmbedInput],
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
         match self {
-            Self::Gemini(g) => g.embed_documents(texts).await,
-            Self::Voyage(v) => v.embed_documents(texts).await,
-            Self::Fake(f) => f.embed_documents(texts).await,
+            Self::Gemini(g) => g.embed_documents(inputs).await,
+            Self::Voyage(v) => v.embed_documents(inputs).await,
+            Self::Fake(f) => f.embed_documents(inputs).await,
         }
+    }
+
+    pub async fn embed_text_documents(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let inputs: Vec<_> = texts.iter().cloned().map(EmbedInput::Text).collect();
+        self.embed_documents(&inputs).await
     }
 
     pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {

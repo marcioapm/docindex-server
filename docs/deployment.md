@@ -39,9 +39,11 @@ DOCINDEX_DB_PATH=/home/docindex/index.db
 DOCINDEX_LISTEN=100.64.0.1:7777
 DOCINDEX_BEARER=<random 32-char secret>
 GEMINI_API_KEY=<from Google AI Studio>
-DOCINDEX_EMBED_MODEL=gemini-embedding-001
-# 3072 is gemini-embedding-001's native dim. 768/1536 are valid Matryoshka
+DOCINDEX_EMBED_MODEL=gemini-embedding-2
+# 3072 is gemini-embedding-2's native dim. 768/1536 are valid Matryoshka
 # truncations if you want to trade a little quality for disk/ANN cost.
+# To migrate from gemini-embedding-001 run once with --reembed; this wipes
+# all vectors/chunks and rebuilds the index from scratch.
 DOCINDEX_EMBED_DIM=3072
 DOCINDEX_DEBOUNCE_MS=5000
 DOCINDEX_HTTP_TIMEOUT_MS=30000
@@ -174,10 +176,14 @@ against that fingerprint:
 - mismatch → refuses to start, naming every changed field and both values:
 
   ```
-  index built with provider=gemini model=gemini-embedding-001 dim=3072,
+  index built with provider=gemini model=gemini-embedding-2 dim=3072,
   config says provider=voyage model=voyage-4 dim=1024; re-embed required:
   run with --reembed
   ```
+
+To migrate from Gemini `gemini-embedding-001` to the stable `gemini-embedding-2`
+(required for image/PDF indexing): update `DOCINDEX_EMBED_MODEL` and run with
+`--reembed`. The two models exist in separate vector spaces; they cannot coexist.
 
 To switch provider/model/dim (e.g. gemini 3072 → voyage-4 1024, or just a
 dim change like 768 → 3072):

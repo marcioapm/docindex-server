@@ -64,6 +64,9 @@ struct GlobalArgs {
     /// Path to a CLI TOML config file.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Return only image/PDF results using server-side dense media ranking.
+    #[arg(long, global = true)]
+    media: bool,
     /// Client-side filter: only show hits whose path starts with this
     /// prefix.
     #[arg(long, global = true)]
@@ -78,6 +81,7 @@ impl std::fmt::Debug for GlobalArgs {
             .field("server", &self.server)
             .field("token", &"[redacted]")
             .field("config", &self.config)
+            .field("media", &self.media)
             .field("path_filter", &self.path_filter)
             .finish()
     }
@@ -111,6 +115,7 @@ fn merge(base: GlobalArgs, over: GlobalArgs) -> GlobalArgs {
         server: over.server.or(base.server),
         token: over.token.or(base.token),
         config: over.config.or(base.config),
+        media: over.media || base.media,
         path_filter: over.path_filter.or(base.path_filter),
     }
 }
@@ -142,6 +147,11 @@ async fn run(cli: Cli) -> ExitCode {
             ("search", cli.bare_query.join(" "), cli.global)
         }
     };
+
+    if global.media && verb != "search" {
+        eprintln!("docindex-search: --media is valid only with a search query");
+        return ExitCode::from(1);
+    }
 
     let flags = CliFlags {
         config_path: global.config.clone(),
@@ -184,7 +194,7 @@ async fn run(cli: Cli) -> ExitCode {
                 return ExitCode::from(1);
             }
             run_search_like(cfg.format, global.path_filter.as_deref(), || {
-                client.search(&arg, cfg.limit)
+                client.search(&arg, cfg.limit, global.media)
             })
             .await
         }
@@ -312,5 +322,31 @@ mod tests {
         let dbg = format!("{cli:?}");
         assert!(!dbg.contains("hidden"), "token must not appear: {dbg}");
         assert!(dbg.contains("[redacted]"), "expected [redacted] in: {dbg}");
+    }
+
+    #[test]
+    fn media_flag_parses_for_search() {
+        let cli = Cli::try_parse_from(["docindex-search", "search", "sunset", "--media"]).unwrap();
+
+        match cli.command {
+            Some(Command::Search { args, .. }) => assert!(args.media),
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn media_flag_parses_for_bare_query() {
+        let cli = Cli::try_parse_from(["docindex-search", "--media", "sunset"]).unwrap();
+
+        assert!(cli.global.media);
+        assert_eq!(cli.bare_query, ["sunset"]);
+    }
+
+    #[tokio::test]
+    async fn media_flag_is_rejected_for_similar_before_config_loading() {
+        let cli =
+            Cli::try_parse_from(["docindex-search", "similar", "note.md", "--media"]).unwrap();
+
+        assert_eq!(run(cli).await, ExitCode::from(1));
     }
 }

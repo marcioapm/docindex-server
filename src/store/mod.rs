@@ -33,6 +33,8 @@ pub enum StoreError {
     VecExtension(String),
     #[error("store: embedding_cache row dim mismatch: got {got}, want {want}")]
     CacheDimMismatch { got: usize, want: usize },
+    #[error("store: replace file has {chunks} chunks but {embeddings} embeddings")]
+    ReplaceEmbeddingCount { chunks: usize, embeddings: usize },
     #[error(
         "store: embedding_dim on disk is {stored}, config says {config} — run with --reembed to reindex at the new dim, or delete the index DB as a fallback."
     )]
@@ -311,6 +313,43 @@ impl Store {
         &self.conn
     }
 
+    /// Atomically replace every indexed row for one file. This includes old
+    /// chunks, FTS rows, vectors, prepared embedding-cache entries, and the
+    /// file-state bookkeeping row. If any statement fails, the prior file
+    /// index remains intact.
+    pub fn replace_file(&self, replacement: FileReplacement<'_>) -> Result<(), StoreError> {
+        if replacement.chunks.len() != replacement.embeddings.len() {
+            return Err(StoreError::ReplaceEmbeddingCount {
+                chunks: replacement.chunks.len(),
+                embeddings: replacement.embeddings.len(),
+            });
+        }
+        for entry in replacement.cache_entries {
+            validate_cache_entry(entry)?;
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        delete_chunks_for_path_in_tx(&tx, replacement.path)?;
+        for (chunk, embedding) in replacement.chunks.iter().zip(replacement.embeddings) {
+            let id = insert_chunk_in_tx(&tx, chunk, replacement.path, replacement.mtime_ns)?;
+            tx.execute(
+                "INSERT INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)",
+                params![id, encode_f32(embedding)],
+            )?;
+        }
+        for entry in replacement.cache_entries {
+            put_embedding_cache_in_tx(&tx, entry)?;
+        }
+        set_file_state_in_tx(
+            &tx,
+            replacement.path,
+            replacement.content_hash,
+            replacement.mtime_ns,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Insert or update the chunk at (`path`, `chunk.idx`) and keep
     /// `chunks_fts` in sync. Returns the stable `chunks.id` rowid.
     pub fn upsert_chunk(&self, c: &Chunk, path: &str, mtime_ns: i64) -> Result<i64, StoreError> {
@@ -387,34 +426,17 @@ impl Store {
     /// Remove every chunk for `path`, including FTS and vec rows.
     pub fn delete_chunks_for_path(&self, path: &str) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let rows: Vec<(i64, String, Option<String>, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT id, content, heading_path, media_type FROM chunks WHERE path = ?",
-            )?;
-            let mapped = stmt.query_map(params![path], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
-            let mut v = Vec::new();
-            for r in mapped {
-                v.push(r?);
-            }
-            v
-        };
-        for (id, content, heading_path, media_type) in &rows {
-            if media_type == "text" {
-                tx.execute(
-                    "INSERT INTO chunks_fts(chunks_fts, rowid, content, heading_path) VALUES('delete', ?1, ?2, ?3)",
-                    params![id, content, heading_path.clone().unwrap_or_default()],
-                )?;
-            }
-            tx.execute("DELETE FROM chunks_vec WHERE rowid = ?1", params![id])?;
-        }
-        tx.execute("DELETE FROM chunks WHERE path = ?1", params![path])?;
+        delete_chunks_for_path_in_tx(&tx, path)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically remove every indexed representation and bookkeeping state
+    /// for `path`. If any deletion fails, all prior rows remain intact.
+    pub fn remove_file(&self, path: &str) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        delete_chunks_for_path_in_tx(&tx, path)?;
+        tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
         tx.commit()?;
         Ok(())
     }
@@ -579,6 +601,65 @@ impl Store {
         Ok(out)
     }
 
+    /// Top-`k` media chunk rowids by cosine distance to `query` (ascending
+    /// distance). Streams every `(rowid, embedding)` pair from `chunks_vec`
+    /// joined to `chunks` on the media-type predicate and retains only the
+    /// best `k` results in a bounded max-heap — no `IN (…)` with unbounded
+    /// placeholders, no materialisation of all vectors.
+    ///
+    /// The returned order is dense over media only: rank-1 is the closest
+    /// media chunk, regardless of where it would rank among all chunk types.
+    pub fn search_media_vec(&self, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>, StoreError> {
+        use std::collections::BinaryHeap;
+
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Stream media vectors via a join; never materialise all rows or ids.
+        let mut stmt = self.conn.prepare(
+            "SELECT v.rowid, v.embedding \
+             FROM chunks_vec v \
+             JOIN chunks c ON c.id = v.rowid \
+             WHERE c.media_type != 'text'",
+        )?;
+
+        // Max-heap of (dist_bits, rowid): the root holds the LARGEST distance.
+        // When full, evict the worst to admit a closer candidate. IEEE 754
+        // positive floats compare correctly by bit representation; cosine
+        // distance is ≥ 0, so this encoding is safe. Ties retain the first
+        // scanned (lowest rowid).
+        let mut heap: BinaryHeap<(u32, i64)> = BinaryHeap::with_capacity(k + 1);
+
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let embedding =
+                decode_f32(&blob).map_err(|e| StoreError::Msg(format!("decode vec: {e}")))?;
+            let dist = cosine_distance(query, &embedding);
+            let dist_bits = dist.to_bits();
+
+            if heap.len() < k {
+                heap.push((dist_bits, rowid));
+            } else if let Some(&(top_bits, _)) = heap.peek()
+                && dist_bits < top_bits
+            {
+                // New entry is closer than the current worst; replace it.
+                heap.pop();
+                heap.push((dist_bits, rowid));
+            }
+        }
+
+        let mut results: Vec<(i64, f32)> = heap
+            .into_iter()
+            .map(|(bits, id)| (id, f32::from_bits(bits)))
+            .collect();
+        // Sort ascending by distance, then ascending by rowid for determinism.
+        results.sort_by(|(id_a, d_a), (id_b, d_b)| d_a.total_cmp(d_b).then(id_a.cmp(id_b)));
+        Ok(results)
+    }
+
     /// Top-`k` chunk rowids by BM25 over `chunks_fts` for the raw FTS5
     /// query string (ascending bm25 score — smaller is better per FTS5).
     pub fn search_fts(&self, query: &str, k: usize) -> Result<Vec<(i64, f64)>, StoreError> {
@@ -624,14 +705,34 @@ impl Store {
             .optional()?)
     }
 
-    /// All chunks for `path` (id, content). Used by /similar to build a
-    /// pseudo-query from the bag-of-words + average of stored vectors.
+    /// All chunks for `path` (id, content). Used by callers that need the
+    /// stored content without media metadata.
     pub fn chunks_for_path(&self, path: &str) -> Result<Vec<(i64, String)>, StoreError> {
         let mut stmt = self
             .conn
             .prepare("SELECT id, content FROM chunks WHERE path = ?1 ORDER BY chunk_idx")?;
         let rows = stmt.query_map(params![path], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// All chunks for `path` with media metadata. Used by /similar to restrict
+    /// its lexical bag to text chunks while retaining all vectors.
+    pub fn chunks_for_similar(&self, path: &str) -> Result<Vec<PathChunkRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, content, media_type FROM chunks WHERE path = ?1 ORDER BY chunk_idx",
+        )?;
+        let rows = stmt.query_map(params![path], |r| {
+            Ok(PathChunkRow {
+                id: r.get(0)?,
+                content: r.get(1)?,
+                media_type: r.get(2)?,
+            })
         })?;
         let mut out = Vec::new();
         for r in rows {
@@ -769,6 +870,29 @@ impl Store {
     }
 }
 
+/// All data needed to atomically replace one file's indexed representation.
+/// Embeddings must be ordered to match `chunks`; `cache_entries` can contain
+/// newly resolved document embeddings to persist with the replacement.
+#[derive(Debug, Clone, Copy)]
+pub struct FileReplacement<'a> {
+    pub path: &'a str,
+    pub content_hash: &'a str,
+    pub mtime_ns: i64,
+    pub chunks: &'a [Chunk],
+    pub embeddings: &'a [Vec<f32>],
+    pub cache_entries: &'a [PreparedEmbeddingCacheEntry<'a>],
+}
+
+/// A validated-at-commit embedding-cache write prepared by an indexer.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedEmbeddingCacheEntry<'a> {
+    pub content_hash: &'a str,
+    pub model: &'a str,
+    pub task_type: &'a str,
+    pub dim: usize,
+    pub embedding: &'a [f32],
+}
+
 /// Summary of a `migrate_paths_to_relative` call. Exposed so the caller (and
 /// tests) can distinguish a no-op from a real rewrite from a refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -825,6 +949,15 @@ impl FingerprintOutcome {
     }
 }
 
+/// One stored chunk used by /similar to form a vector mean and a text-only
+/// lexical bag.
+#[derive(Debug, Clone)]
+pub struct PathChunkRow {
+    pub id: i64,
+    pub content: String,
+    pub media_type: String,
+}
+
 /// Minimal row projection used to hydrate a search hit. Kept in the store
 /// module so SQL column order stays colocated with the schema.
 #[derive(Debug, Clone)]
@@ -864,6 +997,135 @@ fn write_fingerprint_in_tx(
         )?;
     }
     Ok(())
+}
+
+fn delete_chunks_for_path_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+) -> Result<(), StoreError> {
+    let rows: Vec<(i64, String, Option<String>, String)> = {
+        let mut stmt =
+            tx.prepare("SELECT id, content, heading_path, media_type FROM chunks WHERE path = ?")?;
+        let mapped = stmt.query_map(params![path], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row?);
+        }
+        rows
+    };
+    for (id, content, heading_path, media_type) in rows {
+        if media_type == "text" {
+            tx.execute(
+                "INSERT INTO chunks_fts(chunks_fts, rowid, content, heading_path) VALUES('delete', ?1, ?2, ?3)",
+                params![id, content, heading_path.unwrap_or_default()],
+            )?;
+        }
+        tx.execute("DELETE FROM chunks_vec WHERE rowid = ?1", params![id])?;
+    }
+    tx.execute("DELETE FROM chunks WHERE path = ?1", params![path])?;
+    Ok(())
+}
+
+fn insert_chunk_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    chunk: &Chunk,
+    path: &str,
+    mtime_ns: i64,
+) -> Result<i64, StoreError> {
+    tx.execute(
+        "INSERT INTO chunks(path, chunk_idx, heading, heading_path, content, content_hash, mtime_ns, tokens, media_type, mime_type, media_start, media_end, media_unit, truncated)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            path,
+            chunk.idx as i64,
+            null_if_empty(&chunk.heading),
+            null_if_empty(&chunk.heading_path),
+            chunk.content,
+            chunk.content_hash,
+            mtime_ns,
+            chunk.tokens as i64,
+            chunk.media_type.as_str(),
+            chunk.mime_type,
+            chunk.media_start,
+            chunk.media_end,
+            chunk.media_unit,
+            chunk.truncated as i64,
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    if chunk.media_type.as_str() == "text" {
+        tx.execute(
+            "INSERT INTO chunks_fts(rowid, content, heading_path) VALUES (?1, ?2, ?3)",
+            params![id, chunk.content, chunk.heading_path],
+        )?;
+    }
+    Ok(id)
+}
+
+fn validate_cache_entry(entry: &PreparedEmbeddingCacheEntry<'_>) -> Result<(), StoreError> {
+    if entry.embedding.len() != entry.dim {
+        return Err(StoreError::CacheDimMismatch {
+            got: entry.embedding.len(),
+            want: entry.dim,
+        });
+    }
+    Ok(())
+}
+
+fn put_embedding_cache_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    entry: &PreparedEmbeddingCacheEntry<'_>,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO embedding_cache(content_hash, model, task_type, dim, embedding, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))
+         ON CONFLICT(content_hash) DO UPDATE SET
+           model=excluded.model, task_type=excluded.task_type,
+           dim=excluded.dim, embedding=excluded.embedding, created_at=excluded.created_at",
+        params![
+            entry.content_hash,
+            entry.model,
+            entry.task_type,
+            entry.dim as i64,
+            encode_f32(entry.embedding),
+        ],
+    )?;
+    Ok(())
+}
+
+fn set_file_state_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    content_hash: &str,
+    mtime_ns: i64,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO files(path, content_hash, mtime_ns, indexed_at)
+         VALUES (?1, ?2, ?3, strftime('%s','now'))
+         ON CONFLICT(path) DO UPDATE SET
+           content_hash = excluded.content_hash,
+           mtime_ns = excluded.mtime_ns,
+           indexed_at = excluded.indexed_at",
+        params![path, content_hash, mtime_ns],
+    )?;
+    Ok(())
+}
+
+/// Cosine distance matching the `distance_metric=cosine` semantics of
+/// `sqlite-vec`'s `vec0` table: `1.0 - dot(a, b)` for unit vectors, with
+/// the result clamped to `[0.0, 2.0]`. For the Fake embedder and most real
+/// providers, embeddings are L2-normalised, so this is numerically equivalent
+/// to the kNN distance sqlite-vec computes internally.
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    (1.0 - dot).clamp(0.0, 2.0)
 }
 
 fn null_if_empty(s: &str) -> Option<&str> {
@@ -917,9 +1179,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Dim used by the store's own tests. Small and cheap — the behavior
-    /// under test (upsert, FTS sync, vec delete+insert, caching, reopen)
-    /// doesn't depend on the embedding size as long as it's consistent.
     const TEST_DIM: usize = 8;
 
     fn open_temp() -> (TempDir, Store) {
@@ -1038,6 +1297,213 @@ mod tests {
     }
 
     #[test]
+    fn media_vector_search_filters_text_and_preserves_dense_media_order() {
+        let (_d, s) = open_temp();
+        let text_id = s
+            .upsert_chunk(&sample_chunk(0, "text", "text-hash"), "note.md", 1)
+            .unwrap();
+        let mut image = sample_chunk(0, "image", "image-hash");
+        image.media_type = crate::media::MediaType::Image;
+        let image_id = s.upsert_chunk(&image, "image.png", 1).unwrap();
+        let mut pdf = sample_chunk(0, "pdf", "pdf-hash");
+        pdf.media_type = crate::media::MediaType::Pdf;
+        let pdf_id = s.upsert_chunk(&pdf, "paper.pdf", 1).unwrap();
+
+        s.set_vector_for_chunk(text_id, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        s.set_vector_for_chunk(image_id, &[0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        s.set_vector_for_chunk(pdf_id, &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let hits = s
+            .search_media_vec(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 10)
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![image_id, pdf_id]
+        );
+    }
+
+    /// `search_media_vec` with cap `k` returns exactly the `k` closest media
+    /// chunks in ascending-distance order. Chunks are inserted far-first so
+    /// the heap must evict twice; text chunks are excluded.
+    #[test]
+    fn search_media_vec_top_k_is_bounded_and_ordered() {
+        const CAP: usize = 2;
+        let (_d, s) = open_temp();
+
+        let text_id = s
+            .upsert_chunk(&sample_chunk(0, "text", "tx"), "t.md", 1)
+            .unwrap();
+        s.set_vector_for_chunk(text_id, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let make_image = |content: &str, hash: &str| {
+            let mut c = sample_chunk(0, content, hash);
+            c.media_type = crate::media::MediaType::Image;
+            c
+        };
+
+        // Insertion order: far first (dist=1.0), second-far (dist=0.5),
+        // near (dist≈0.025), closest (dist≈0.0). Heap fills after the first
+        // two, then evicts id_c when id_b arrives, and id_d when id_a arrives.
+        let id_c = s.upsert_chunk(&make_image("c", "hc"), "c.png", 1).unwrap(); // dist=1.0
+        let id_d = s.upsert_chunk(&make_image("d", "hd"), "d.png", 1).unwrap(); // dist=0.5
+        let id_b = s.upsert_chunk(&make_image("b", "hb"), "b.png", 1).unwrap(); // dist≈0.025
+        let id_a = s.upsert_chunk(&make_image("a", "ha"), "a.png", 1).unwrap(); // dist≈0.0
+
+        // cosine dist = 1 − dot(query, v) for unit vectors, query = [1,0,…]
+        s.set_vector_for_chunk(id_c, &[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        s.set_vector_for_chunk(id_d, &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        let near_vec = {
+            let x: f32 = (0.95f32).sqrt();
+            let y: f32 = (0.05f32).sqrt();
+            [x, y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        };
+        s.set_vector_for_chunk(id_b, &near_vec).unwrap();
+        s.set_vector_for_chunk(id_a, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let hits = s.search_media_vec(&query, CAP).unwrap();
+
+        assert_eq!(
+            hits.len(),
+            CAP,
+            "expected exactly {CAP} hits, got {}",
+            hits.len()
+        );
+
+        let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![id_a, id_b],
+            "top-2 must be id_a then id_b (closest first)"
+        );
+
+        assert!(
+            hits[0].1 <= hits[1].1,
+            "hits must be ordered ascending by distance: {:?}",
+            hits
+        );
+
+        let result_ids: std::collections::HashSet<i64> = hits.iter().map(|(id, _)| *id).collect();
+        assert!(
+            !result_ids.contains(&text_id),
+            "text chunk must be excluded"
+        );
+        assert!(
+            !result_ids.contains(&id_c),
+            "far chunk id_c must be evicted"
+        );
+        assert!(
+            !result_ids.contains(&id_d),
+            "far chunk id_d must be evicted"
+        );
+    }
+
+    /// Same correctness check as above but with chunks inserted in reverse
+    /// distance order: the table scan sees furthest first, closest last.
+    #[test]
+    fn search_media_vec_top_k_correct_when_furthest_inserted_first() {
+        const CAP: usize = 2;
+        let (_d, s) = open_temp();
+
+        let make_image = |content: &str, hash: &str| {
+            let mut c = sample_chunk(0, content, hash);
+            c.media_type = crate::media::MediaType::Image;
+            c
+        };
+
+        // Insert furthest-first so rowid order == descending distance.
+        let id_far1 = s
+            .upsert_chunk(&make_image("far1", "hfar1"), "far1.png", 1)
+            .unwrap();
+        let id_far2 = s
+            .upsert_chunk(&make_image("far2", "hfar2"), "far2.png", 1)
+            .unwrap();
+        let id_near2 = s
+            .upsert_chunk(&make_image("near2", "hnear2"), "near2.png", 1)
+            .unwrap();
+        let id_near1 = s
+            .upsert_chunk(&make_image("near1", "hnear1"), "near1.png", 1)
+            .unwrap();
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        s.set_vector_for_chunk(id_far1, &[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap(); // dist = 1.0
+        s.set_vector_for_chunk(id_far2, &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap(); // dist = 0.5
+        let near2_vec = {
+            let x: f32 = (0.95f32).sqrt();
+            let y: f32 = (0.05f32).sqrt();
+            [x, y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        };
+        s.set_vector_for_chunk(id_near2, &near2_vec).unwrap(); // dist ≈ 0.025
+        s.set_vector_for_chunk(id_near1, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap(); // dist ≈ 0.0
+
+        let hits = s.search_media_vec(&query, CAP).unwrap();
+
+        assert_eq!(
+            hits.len(),
+            CAP,
+            "expected exactly {CAP} hits, got {}",
+            hits.len()
+        );
+
+        let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![id_near1, id_near2],
+            "top-2 must be the two closest chunks regardless of insertion order; got {ids:?}"
+        );
+
+        assert!(
+            hits[0].1 <= hits[1].1,
+            "result must be sorted ascending by distance: {:?}",
+            hits
+        );
+    }
+
+    /// N > SQLITE_MAX_VARIABLE_NUMBER (999) media chunks must not produce a
+    /// "too many SQL variables" error — the streaming join avoids IN (…).
+    #[test]
+    fn search_media_vec_handles_many_media_chunks_without_variable_overflow() {
+        let (_d, s) = open_temp();
+        const N: usize = 1_100;
+
+        let make_image = |idx: usize| {
+            let mut c = sample_chunk(idx, "img content", &format!("h{idx}"));
+            c.media_type = crate::media::MediaType::Image;
+            c
+        };
+
+        for i in 0..N {
+            let id = s
+                .upsert_chunk(&make_image(i), &format!("img{i}.png"), 1)
+                .unwrap();
+            let mut v = [0.0f32; TEST_DIM];
+            v[i % TEST_DIM] = 1.0;
+            s.set_vector_for_chunk(id, &v).unwrap();
+        }
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let hits = s
+            .search_media_vec(&query, 10)
+            .expect("search must succeed with many media chunks");
+        assert_eq!(
+            hits.len(),
+            10,
+            "result count must equal the requested cap when candidates exceed it"
+        );
+    }
+
+    #[test]
     fn text_media_fts_transitions_remove_and_restore_terms() {
         let (_d, s) = open_temp();
         let path = "Attachments/item.png";
@@ -1150,13 +1616,15 @@ mod tests {
     }
 
     #[test]
-    fn delete_chunks_for_path_cleans_up() {
+    fn remove_file_cleans_up_chunks_vectors_fts_and_file_state() {
         let (_d, s) = open_temp();
+        let path = "/v/a.md";
         let id = s
-            .upsert_chunk(&sample_chunk(0, "searchable token", "h"), "/v/a.md", 1)
+            .upsert_chunk(&sample_chunk(0, "searchable token", "h"), path, 1)
             .unwrap();
         s.set_vector_for_chunk(id, &[0.0; TEST_DIM]).unwrap();
-        s.delete_chunks_for_path("/v/a.md").unwrap();
+        s.set_file_state(path, "file-hash", 1).unwrap();
+        s.remove_file(path).unwrap();
         let n: i64 = s
             .conn()
             .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
@@ -1180,6 +1648,211 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0);
+        assert!(s.get_file_state(path).unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_file_rolls_back_when_file_state_deletion_fails() {
+        let (_d, s) = open_temp();
+        let path = "note.md";
+        let id = s
+            .upsert_chunk(&sample_chunk(0, "prior searchable token", "h"), path, 1)
+            .unwrap();
+        s.set_vector_for_chunk(id, &[0.0; TEST_DIM]).unwrap();
+        s.set_file_state(path, "file-hash", 1).unwrap();
+        s.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_file_delete BEFORE DELETE ON files
+                 BEGIN SELECT RAISE(ABORT, 'forced file state delete failure'); END;",
+            )
+            .unwrap();
+
+        let err = s.remove_file(path).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            s.get_file_state(path).unwrap(),
+            Some(("file-hash".into(), 1))
+        );
+        assert_eq!(
+            s.chunks_for_path(path).unwrap(),
+            vec![(id, "prior searchable token".into())]
+        );
+        assert_eq!(
+            s.vectors_for_chunks(&[id]).unwrap(),
+            vec![(id, vec![0.0; TEST_DIM])]
+        );
+        assert_eq!(s.search_fts("prior", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replace_file_writes_chunks_vectors_cache_and_file_state_together() {
+        let (_d, s) = open_temp();
+        let chunks = vec![sample_chunk(
+            0,
+            "replacement searchable token",
+            "chunk-hash",
+        )];
+        let embeddings = vec![vec![0.25; TEST_DIM]];
+        let cache_entries = [PreparedEmbeddingCacheEntry {
+            content_hash: "chunk-hash",
+            model: "test-model",
+            task_type: "RETRIEVAL_DOCUMENT",
+            dim: TEST_DIM,
+            embedding: &embeddings[0],
+        }];
+
+        s.replace_file(FileReplacement {
+            path: "note.md",
+            content_hash: "file-hash",
+            mtime_ns: 42,
+            chunks: &chunks,
+            embeddings: &embeddings,
+            cache_entries: &cache_entries,
+        })
+        .unwrap();
+
+        assert_eq!(s.count_chunks().unwrap(), 1);
+        assert_eq!(
+            s.get_file_state("note.md").unwrap(),
+            Some(("file-hash".into(), 42))
+        );
+        assert_eq!(
+            s.get_embedding_cache("chunk-hash").unwrap(),
+            Some(embeddings[0].clone())
+        );
+        let (id, _) = s.chunks_for_path("note.md").unwrap().pop().unwrap();
+        assert_eq!(
+            s.vectors_for_chunks(&[id]).unwrap(),
+            vec![(id, embeddings[0].clone())]
+        );
+        assert_eq!(s.search_fts("replacement", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replace_file_rolls_back_when_vector_is_invalid() {
+        let (_d, s) = open_temp();
+        let old_chunks = vec![sample_chunk(0, "prior searchable token", "old-chunk-hash")];
+        let old_embeddings = vec![vec![0.5; TEST_DIM]];
+        s.replace_file(FileReplacement {
+            path: "note.md",
+            content_hash: "old-file-hash",
+            mtime_ns: 1,
+            chunks: &old_chunks,
+            embeddings: &old_embeddings,
+            cache_entries: &[],
+        })
+        .unwrap();
+        let (old_id, _) = s.chunks_for_path("note.md").unwrap().pop().unwrap();
+
+        let new_chunks = vec![sample_chunk(0, "new searchable token", "new-chunk-hash")];
+        let invalid_embeddings = vec![vec![0.0; TEST_DIM - 1]];
+        let err = s
+            .replace_file(FileReplacement {
+                path: "note.md",
+                content_hash: "new-file-hash",
+                mtime_ns: 2,
+                chunks: &new_chunks,
+                embeddings: &invalid_embeddings,
+                cache_entries: &[],
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(
+            s.get_file_state("note.md").unwrap(),
+            Some(("old-file-hash".into(), 1))
+        );
+        assert_eq!(
+            s.chunks_for_path("note.md").unwrap(),
+            vec![(old_id, "prior searchable token".into())]
+        );
+        assert_eq!(
+            s.vectors_for_chunks(&[old_id]).unwrap(),
+            vec![(old_id, old_embeddings[0].clone())]
+        );
+        assert_eq!(s.search_fts("prior", 10).unwrap().len(), 1);
+        assert_eq!(s.search_fts("new", 10).unwrap().len(), 0);
+    }
+
+    /// A failure inside `put_embedding_cache_in_tx` (after vectors are
+    /// written but before `set_file_state_in_tx`) must roll back the whole
+    /// transaction: old file state, old chunk, and old vector must all be
+    /// preserved, and the new cache entry must not appear.
+    #[test]
+    fn replace_file_rolls_back_when_cache_insert_fails() {
+        let (_d, s) = open_temp();
+        let old_chunks = vec![sample_chunk(0, "prior searchable token", "old-chunk-hash")];
+        let old_embeddings = vec![vec![0.5; TEST_DIM]];
+        s.replace_file(FileReplacement {
+            path: "note.md",
+            content_hash: "old-file-hash",
+            mtime_ns: 1,
+            chunks: &old_chunks,
+            embeddings: &old_embeddings,
+            cache_entries: &[],
+        })
+        .unwrap();
+        let (old_id, _) = s.chunks_for_path("note.md").unwrap().pop().unwrap();
+
+        // Install a trigger that aborts any INSERT into embedding_cache.
+        // This fires after the vector INSERT succeeds but before file state
+        // is written, exercising the cache-insert failure rollback path.
+        s.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_cache_insert BEFORE INSERT ON embedding_cache
+                 BEGIN SELECT RAISE(ABORT, 'forced cache insert failure'); END;",
+            )
+            .unwrap();
+
+        let new_chunks = vec![sample_chunk(0, "new searchable token", "new-chunk-hash")];
+        let new_embeddings = vec![vec![0.75; TEST_DIM]];
+        let cache_entries = [PreparedEmbeddingCacheEntry {
+            content_hash: "new-chunk-hash",
+            model: "test-model",
+            task_type: "RETRIEVAL_DOCUMENT",
+            dim: TEST_DIM,
+            embedding: &new_embeddings[0],
+        }];
+        let err = s
+            .replace_file(FileReplacement {
+                path: "note.md",
+                content_hash: "new-file-hash",
+                mtime_ns: 2,
+                chunks: &new_chunks,
+                embeddings: &new_embeddings,
+                cache_entries: &cache_entries,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "unexpected error: {err}"
+        );
+
+        // All prior state must be intact.
+        assert_eq!(
+            s.get_file_state("note.md").unwrap(),
+            Some(("old-file-hash".into(), 1))
+        );
+        assert_eq!(
+            s.chunks_for_path("note.md").unwrap(),
+            vec![(old_id, "prior searchable token".into())]
+        );
+        assert_eq!(
+            s.vectors_for_chunks(&[old_id]).unwrap(),
+            vec![(old_id, old_embeddings[0].clone())]
+        );
+        assert_eq!(s.search_fts("prior", 10).unwrap().len(), 1);
+        // The new cache entry must NOT have been committed.
+        assert!(
+            s.get_embedding_cache("new-chunk-hash").unwrap().is_none(),
+            "cache entry must not be present after rollback"
+        );
     }
 
     #[test]
@@ -1317,16 +1990,12 @@ mod tests {
 
     #[test]
     fn embedding_cache_swept_on_dim_change() {
-        // Any embedding_cache row whose stored dim doesn't match the
-        // currently-open dim is deleted on open. We can't actually reopen
-        // at a mismatched dim (SchemaDimMismatch would block that), so
-        // simulate the state by poking a stale row with `dim = 99` into
-        // the cache while open at dim=8, then closing and reopening.
+        // Simulate a stale row (dim=99) by bypassing put_embedding_cache,
+        // which would reject a mismatched dim.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("x.db");
         {
             let s = Store::open(&path, 8).expect("first open");
-            // Bypass the dim check inside put_embedding_cache.
             s.conn()
                 .execute(
                     "INSERT INTO embedding_cache(content_hash, model, task_type, dim, embedding, created_at) \
@@ -1335,7 +2004,6 @@ mod tests {
                 )
                 .unwrap();
         }
-        // Reopen at the same dim — sweep should delete the dim=99 row.
         let s = Store::open(&path, 8).expect("reopen");
         let n: i64 = s
             .conn()
@@ -1651,18 +2319,13 @@ mod tests {
         );
     }
 
-    /// When only 2 of the 3 fingerprint keys are present (`embedding_provider`
-    /// and `embedding_model` but not `embedding_dim`), `peek_fingerprint` must
-    /// return `None`. The partial-key branch is what `FingerprintOutcome::from_peek`
-    /// maps to `Fresh`, so a wrong return here would let a corrupted DB slip
-    /// through as a dim=0 Mismatch.
+    /// With 2-of-3 fingerprint keys present, `peek_fingerprint` returns `None`.
     #[test]
     fn peek_fingerprint_returns_none_for_partial_keys() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("x.db");
         {
-            // open_for_reembed skips reconcile_embedding_dim, so embedding_dim
-            // is not written to meta. Write only provider and model manually.
+            // open_for_reembed skips reconcile_embedding_dim; write only provider and model.
             let s = Store::open_for_reembed(&path, TEST_DIM).unwrap();
             s.set_meta("embedding_provider", "gemini").unwrap();
             s.set_meta("embedding_model", "gemini-embedding-001")
@@ -1675,15 +2338,13 @@ mod tests {
         );
     }
 
-    /// When only 1 of the 3 fingerprint keys is present, `peek_fingerprint`
-    /// must also return `None`.
+    /// With 1-of-3 fingerprint keys present, `peek_fingerprint` returns `None`.
     #[test]
     fn peek_fingerprint_returns_none_for_single_key() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("x.db");
         {
-            // open_for_reembed skips reconcile_embedding_dim so embedding_dim
-            // is absent; write only embedding_provider.
+            // open_for_reembed skips reconcile_embedding_dim.
             let s = Store::open_for_reembed(&path, TEST_DIM).unwrap();
             s.set_meta("embedding_provider", "gemini").unwrap();
         }
@@ -1696,15 +2357,12 @@ mod tests {
 
     // --- provider-only mismatch ------------------------------------------
 
-    /// `check_fingerprint` must detect a provider change even when model and
-    /// dim are identical. This exercises the branch that was untested by the
-    /// E2E test (which changed the dim, not just the provider).
+    /// `check_fingerprint` detects a provider change even when model and dim are unchanged.
     #[test]
     fn fingerprint_mismatch_provider_only() {
         let (_d, s) = open_temp();
         s.set_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
             .unwrap();
-        // Same model and dim as stored, only the provider differs.
         let outcome = s
             .check_fingerprint("voyage", "gemini-embedding-001", TEST_DIM)
             .unwrap();
@@ -1721,14 +2379,10 @@ mod tests {
         assert!(msg.contains("--reembed"), "{msg}");
     }
 
-    /// A DB with only `embedding_provider` written (partial fingerprint from
-    /// a hypothetical crash mid-`set_fingerprint`) must be treated as
-    /// `Fresh`, not `Mismatch`. This prevents confusing error messages with
-    /// fabricated empty-string field values.
+    /// A partial fingerprint (only `embedding_provider` written) is treated as `Fresh`.
     #[test]
     fn partial_fingerprint_is_fresh() {
         let (_d, s) = open_temp();
-        // Write only the first of the three fingerprint keys directly.
         s.set_meta("embedding_provider", "gemini").unwrap();
         let outcome = s
             .check_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
@@ -1740,9 +2394,7 @@ mod tests {
         );
     }
 
-    /// All three fingerprint meta keys must be present immediately after
-    /// `set_fingerprint`, with no window where any key can be absent.
-    /// Mirrors `wipe_and_rebuild_fingerprint_is_atomic`.
+    /// All three fingerprint meta keys are written atomically by `set_fingerprint`.
     #[test]
     fn set_fingerprint_writes_all_three_keys() {
         let (_d, s) = open_temp();
