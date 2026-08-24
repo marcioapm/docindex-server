@@ -963,9 +963,8 @@ mod tests {
     /// Confirm the per-chunk guard inside the extraction loop is reachable and
     /// independent from the single-range passthrough guard.
     ///
-    /// A 13-page PDF with pdf_pages_per_chunk=7 yields two ranges: (0,7) and
-    /// (6,7) — wait, that's wrong per step_by. Actually (0,7) and (7,13).
-    /// ranges.len() == 2, so the passthrough branch (`ranges.len() == 1 &&
+    /// A 13-page PDF with pdf_pages_per_chunk=7 yields ranges (0,7) and (7,13),
+    /// so ranges.len() == 2 and the passthrough branch (`ranges.len() == 1 &&
     /// ranges[0] == (0, page_count)`) is not entered. The first iteration of
     /// the extraction loop hits page_count_in_chunk = 7 > 6 and returns
     /// PdfChunkTooLarge from the loop body.
