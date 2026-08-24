@@ -144,9 +144,10 @@ pub async fn run(cfg: Config) -> Result<()> {
 /// - Fingerprint mismatches and `--reembed` is set: open in reembed mode
 ///   (skips the low-level dim refusal) and wipe + rebuild at the new dim.
 ///
-/// [`Store::check_fingerprint`] is the single source of truth for the
-/// comparison and mismatch message; this function delegates to it rather
-/// than re-implementing the comparison inline.
+/// The routing decision (normal open vs reembed open) and the mismatch
+/// message are both derived from `FingerprintOutcome::from_peek`, which
+/// applies the same comparison semantics as `Store::check_fingerprint`,
+/// so there is a single implementation of the equality rule.
 fn open_store_with_fingerprint_check(cfg: &Config) -> Result<Store> {
     let provider = cfg.embed_provider.as_str();
     let model = &cfg.embed_model;
@@ -157,20 +158,20 @@ fn open_store_with_fingerprint_check(cfg: &Config) -> Result<Store> {
     // low-level dim guard before we could surface the full fingerprint message.
     let stored = Store::peek_fingerprint(&cfg.db_path).context("peek embedding fingerprint")?;
 
-    // Open in reembed mode (skip dim check) when a mismatch is detected,
-    // so check_fingerprint can read the stored meta without being blocked
-    // by the SchemaDimMismatch guard. For fresh/match paths the normal open
-    // is used, which enforces the dim guard as belt-and-suspenders.
-    let is_mismatch =
-        matches!(&stored, Some((p, m, d)) if p != provider || m != model || *d != dim);
-    let store = if is_mismatch {
-        Store::open_for_reembed(&cfg.db_path, dim).context("open store")?
-    } else {
-        Store::open(&cfg.db_path, dim).context("open store")?
+    // Derive the routing decision from FingerprintOutcome so the comparison
+    // semantics (Fresh / Match / Mismatch) are not duplicated inline.
+    let peek_outcome = crate::store::FingerprintOutcome::from_peek(stored, provider, model, dim);
+    let store = match peek_outcome {
+        crate::store::FingerprintOutcome::Mismatch(_) => {
+            // Open without the dim guard so check_fingerprint can read meta
+            // before any reembed wipe.
+            Store::open_for_reembed(&cfg.db_path, dim).context("open store")?
+        }
+        _ => Store::open(&cfg.db_path, dim).context("open store")?,
     };
 
-    // Delegate all comparison + message logic to check_fingerprint — it is
-    // the single implementation of the fingerprint contract.
+    // check_fingerprint reads the live meta rows and produces the
+    // authoritative outcome, including the canonical mismatch message.
     match store
         .check_fingerprint(provider, model, dim)
         .context("check embedding fingerprint")?
