@@ -143,61 +143,69 @@ pub async fn run(cfg: Config) -> Result<()> {
 ///   message naming every changed field and both values.
 /// - Fingerprint mismatches and `--reembed` is set: open in reembed mode
 ///   (skips the low-level dim refusal) and wipe + rebuild at the new dim.
+///
+/// [`Store::check_fingerprint`] is the single source of truth for the
+/// comparison and mismatch message; this function delegates to it rather
+/// than re-implementing the comparison inline.
 fn open_store_with_fingerprint_check(cfg: &Config) -> Result<Store> {
     let provider = cfg.embed_provider.as_str();
     let model = &cfg.embed_model;
     let dim = cfg.embed_dim;
 
+    // Peek the stored fingerprint before the dim gets baked into chunks_vec's
+    // DDL — a mismatched dim passed to Store::open would be rejected by the
+    // low-level dim guard before we could surface the full fingerprint message.
     let stored = Store::peek_fingerprint(&cfg.db_path).context("peek embedding fingerprint")?;
-    let mismatch = match &stored {
-        None => None,
-        Some((p, m, d)) if p == provider && m == model && *d == dim => None,
-        Some((p, m, d)) => Some(format!(
-            "index built with provider={p} model={m} dim={d}, config says \
-             provider={provider} model={model} dim={dim}; re-embed required: run with --reembed"
-        )),
+
+    // Open in reembed mode (skip dim check) when a mismatch is detected,
+    // so check_fingerprint can read the stored meta without being blocked
+    // by the SchemaDimMismatch guard. For fresh/match paths the normal open
+    // is used, which enforces the dim guard as belt-and-suspenders.
+    let is_mismatch =
+        matches!(&stored, Some((p, m, d)) if p != provider || m != model || *d != dim);
+    let store = if is_mismatch {
+        Store::open_for_reembed(&cfg.db_path, dim).context("open store")?
+    } else {
+        Store::open(&cfg.db_path, dim).context("open store")?
     };
 
-    match mismatch {
-        None => {
-            let store = Store::open(&cfg.db_path, dim).context("open store")?;
-            if stored.is_none() {
-                store
-                    .set_fingerprint(provider, model, dim)
-                    .context("set embedding fingerprint")?;
-            }
+    // Delegate all comparison + message logic to check_fingerprint — it is
+    // the single implementation of the fingerprint contract.
+    match store
+        .check_fingerprint(provider, model, dim)
+        .context("check embedding fingerprint")?
+    {
+        crate::store::FingerprintOutcome::Fresh => {
+            store
+                .set_fingerprint(provider, model, dim)
+                .context("set embedding fingerprint")?;
             Ok(store)
         }
-        Some(msg) if cfg.reembed => {
+        crate::store::FingerprintOutcome::Match => Ok(store),
+        crate::store::FingerprintOutcome::Mismatch(msg) if cfg.reembed => {
             warn!(reason = %msg, "fingerprint mismatch; --reembed set, wiping and rebuilding");
-            let store = Store::open_for_reembed(&cfg.db_path, dim).context("open store")?;
             store
                 .wipe_and_rebuild(dim, provider, model)
                 .context("wipe and rebuild index for --reembed")?;
             Ok(store)
         }
-        Some(msg) => Err(anyhow!("{msg}")),
+        crate::store::FingerprintOutcome::Mismatch(msg) => Err(anyhow!("{msg}")),
     }
 }
 
 fn build_embedder(cfg: &Config) -> Result<AnyEmbedder> {
     match cfg.embed_provider {
         crate::embed::registry::EmbedProvider::Gemini => {
-            let g = Gemini::new(
+            let mut g = Gemini::new(
                 cfg.embed_api_key.clone(),
                 cfg.embed_model.clone(),
                 cfg.embed_dim,
                 cfg.http_timeout,
             )
             .map_err(|e| anyhow!("build gemini client: {e}"))?;
-            let g = if let Some(base_url) = &cfg.embed_base_url {
-                Gemini {
-                    base_url: base_url.clone(),
-                    ..g
-                }
-            } else {
-                g
-            };
+            if let Some(base_url) = &cfg.embed_base_url {
+                g.base_url = base_url.clone();
+            }
             Ok(AnyEmbedder::Gemini(Arc::new(g)))
         }
         crate::embed::registry::EmbedProvider::Voyage => {
