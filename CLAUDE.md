@@ -38,7 +38,7 @@ docindex-server/
 │   │   └── handlers.rs     # /health /search /similar
 │   ├── store/
 │   │   ├── mod.rs          # rusqlite + sqlite-vec wiring, upsert/delete/meta, fingerprint guard
-│   │   ├── schema.sql      # canonical schema (schema_version=2)
+│   │   ├── schema.sql      # canonical schema (schema_version=3)
 │   │   └── vec.rs          # little-endian f32 (de)serialization
 │   ├── cli/
 │   │   ├── mod.rs          # re-exports for the docindex-search binary
@@ -79,7 +79,7 @@ Obsidian mobile ──Tailscale──►  docindex-server  ──►  SQLite (in
 | `src/embed/gemini.rs` | Gemini embeddings client; retries on 429/5xx, x-goog-api-key header |
 | `src/embed/voyage.rs` | Voyage embeddings client; Retry-After-aware 429 handling, 128-input batch chunking, index-ordered response |
 | `src/embed/fake.rs` | Deterministic fake embedder for tests (sha256-seeded, L2-normalized) |
-| `src/indexer/mod.rs` | `run(ctx, rx)` + `initial_scan(ctx, tx)`; cache-first batched embedding; content-hash short-circuit |
+| `src/media_prepare.rs` | Byte-based image/PDF detection, provider-aware preparation (GIF/WebP→PNG, downscale, PDF subset/raster), deterministic cache keys |
 | `src/watch/mod.rs` | `notify` recursive watcher + in-house debounce (500ms polled) with relevance filter |
 | `src/search/mod.rs` | `search`, `similar`, `fuse_rrf` (pure), `fts_query_from_user`, snippet, limit clamp |
 | `src/api/mod.rs` | axum router: public `/health` + bearer-gated sub-router |
@@ -110,7 +110,7 @@ Obsidian mobile ──Tailscale──►  docindex-server  ──►  SQLite (in
 - **SQLite:** `rusqlite` 0.34 with `bundled` + `load_extension` features (statically linked libsqlite3)
 - **Vector search:** `sqlite-vec` 0.1.x — **loaded as a real SQLite extension** via `sqlite3_auto_extension`, exposing the `vec0` virtual table (`distance_metric=cosine`)
 - **FTS:** SQLite FTS5 (compiled into the bundled libsqlite3), `tokenize='porter unicode61'`
-- **Embeddings:** provider/model registry (`src/embed/registry.rs`) — Google `gemini-embedding-001` (native 3072, Matryoshka to 768/1536) or Voyage AI's `voyage-4` family (native 1024, Matryoshka to 256/512/2048), task-asymmetric (doc/query). `AnyEmbedder` enum for static dispatch (native async fn in traits → not dyn-compatible).
+- **Embeddings:** provider/model registry (`src/embed/registry.rs`) — Google `gemini-embedding-2` (default, text+image+PDF, native 3072, Matryoshka to 768/1536, no `taskType`) and `gemini-embedding-001` (text only, legacy), Voyage AI's `voyage-multimodal-3.5` (text+image+PDF, native 1024) and `voyage-4` text family (native 1024, Matryoshka to 256/512/2048), task-asymmetric where supported. `Fake` embedder for tests (SHA256-seeded, L2-normalized, media-capable). `AnyEmbedder` enum for static dispatch (native async fn in traits → not dyn-compatible). Typed inputs: `EmbedInput::Text` / `EmbedInput::Media(Vec<MediaPart>)` — bytes never logged.
 - **CLI parsing:** `clap` (derive) for both binaries
 - **Config files:** `toml` (server.toml / cli.toml), layered under env vars per `src/config.rs` / `src/cli/config.rs`
 - **Hashing:** `sha2` + `hex`
