@@ -108,9 +108,11 @@ mod tests {
         assert_ne!(q, d[0]);
     }
 
-    /// All outputs must be L2-normalised: ||v||² ≈ 1.0. If l2_normalize is
-    /// broken (e.g. zero-vector edge case or hashing producing all-zero
-    /// blocks), cosine distance in tests becomes meaningless.
+    fn norm_sq(v: &[f32]) -> f64 {
+        v.iter().map(|x| f64::from(*x) * f64::from(*x)).sum()
+    }
+
+    /// All outputs must be L2-normalised: ||v||² ≈ 1.0.
     #[tokio::test]
     async fn outputs_are_l2_normalised() {
         let f = Fake::new(16);
@@ -119,10 +121,10 @@ mod tests {
             .embed_documents(&[EmbedInput::text("hello world")])
             .await
             .unwrap()[0];
-        let doc_norm_sq: f64 = doc_vec.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
         assert!(
-            (doc_norm_sq - 1.0).abs() < 1e-5,
-            "document embedding must be L2-normalised: ||v||² = {doc_norm_sq}"
+            (norm_sq(doc_vec) - 1.0).abs() < 1e-5,
+            "document embedding must be L2-normalised: ||v||² = {}",
+            norm_sq(doc_vec)
         );
 
         let media_vec = &f
@@ -132,23 +134,17 @@ mod tests {
             }])])
             .await
             .unwrap()[0];
-        let media_norm_sq: f64 = media_vec
-            .iter()
-            .map(|x| f64::from(*x) * f64::from(*x))
-            .sum();
         assert!(
-            (media_norm_sq - 1.0).abs() < 1e-5,
-            "media embedding must be L2-normalised: ||v||² = {media_norm_sq}"
+            (norm_sq(media_vec) - 1.0).abs() < 1e-5,
+            "media embedding must be L2-normalised: ||v||² = {}",
+            norm_sq(media_vec)
         );
 
         let query_vec = f.embed_query("test query").await.unwrap();
-        let query_norm_sq: f64 = query_vec
-            .iter()
-            .map(|x| f64::from(*x) * f64::from(*x))
-            .sum();
         assert!(
-            (query_norm_sq - 1.0).abs() < 1e-5,
-            "query embedding must be L2-normalised: ||v||² = {query_norm_sq}"
+            (norm_sq(&query_vec) - 1.0).abs() < 1e-5,
+            "query embedding must be L2-normalised: ||v||² = {}",
+            norm_sq(&query_vec)
         );
     }
 }
