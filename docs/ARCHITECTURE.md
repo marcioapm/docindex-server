@@ -94,7 +94,7 @@ Keyed by `content_hash`. Rename/move of a chunk with identical text skips the AP
 
 ## Build / deployment
 - Static-ish Rust binary (rustls, no OpenSSL system dep; `rusqlite` bundles libsqlite3).
-- systemd user service on Hetzner. See `docs/deployment.md`.
+- systemd user service. See `docs/deployment.md`.
 - Binds to Tailscale IP.
 - UFW continues to block public ingress on the service port.
 

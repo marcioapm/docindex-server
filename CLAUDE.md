@@ -2,7 +2,7 @@
 
 > Tiny Rust server that indexes a markdown vault and serves semantic + BM25 search over a Tailscale-only HTTP API. Powers an Obsidian mobile plugin (and anything else that wants ranked retrieval).
 
-Read `README.md` for setup. Run `make run` to start locally; `systemctl --user status docindex-server` on Hetzner. Deployment details in `docs/deployment.md`.
+Read `README.md` for setup. Run `make run` to start locally; `systemctl --user status docindex-server` on the deployed host. Deployment details in `docs/deployment.md`.
 
 ## Architecture at a Glance
 
@@ -62,7 +62,7 @@ Obsidian mobile ──Tailscale──►  docindex-server  ──►  SQLite (in
                 docindex-search CLI ──Tailscale──►  docindex-server
 ```
 
-**Deployment:** single static Rust binary (musl or aarch64-linux), systemd user service on Hetzner, bound to Tailscale interface.
+**Deployment:** single static Rust binary (musl or aarch64-linux), systemd user service, bound to the Tailscale interface.
 
 ## Quick Reference
 
@@ -120,7 +120,7 @@ Obsidian mobile ──Tailscale──►  docindex-server  ──►  SQLite (in
 - **Logging:** `tracing` + `tracing-subscriber` (JSON in prod via `DOCINDEX_LOG_FORMAT=json`, text in dev)
 - **Config:** layered — CLI flags > env vars > TOML file > built-in defaults; env-only mode (today's production) keeps working unchanged
 - **Tests:** `cargo test` for unit/integration; Python `pytest` harness in `tests/` for end-to-end via `spawn_server`
-- **Deployment:** single static binary, systemd user service on Hetzner
+- **Deployment:** single static binary, systemd user service
 
 ## Endpoints
 
