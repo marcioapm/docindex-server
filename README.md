@@ -120,7 +120,7 @@ Heading-aware (H1/H2/H3), ~500-token fallback, 50-token overlap. Stored per chun
 - The index is fingerprinted with the `(provider, model, dim)` it was built with (`base_url` is excluded — pointing at a proxy/mock never invalidates a good index). A mismatch on startup refuses with an error naming every changed field and both values; pass `--reembed` to wipe chunks/vectors/FTS and rebuild at the new settings. See ["Changing the embedding dim, provider, or model"](docs/deployment.md#changing-the-embedding-dim-provider-or-model) in the deployment guide.
 
 ## Deployment
-- Host: Hetzner VPS, bound to Tailscale interface.
+- Host: any Linux VPS, bound to the Tailscale interface.
 - Process: systemd user service.
 - Config: TOML file and/or env vars (see [Config](#config) above and `.env.example`).
 - Full guide: [`docs/deployment.md`](docs/deployment.md).
