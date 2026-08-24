@@ -106,7 +106,7 @@ impl Store {
     /// fingerprint mismatch message (rather than this lower-level dim-only
     /// refusal) should call [`Store::peek_fingerprint`] first and only
     /// reach `open` once they know the dim will match — see
-    /// `server::check_or_apply_fingerprint`.
+    /// `server::open_store_with_fingerprint_check`.
     pub fn open(path: impl AsRef<Path>, embed_dim: usize) -> Result<Self, StoreError> {
         Self::open_internal(path, embed_dim, false)
     }
@@ -202,6 +202,11 @@ impl Store {
     /// — the caller should adopt the current config as the fingerprint via
     /// [`Store::set_fingerprint`] rather than error, so upgrading an
     /// existing production DB never breaks on its own.
+    ///
+    /// A partial fingerprint (one or two of the three keys present but not
+    /// all) is also treated as `Fresh`. This can only arise from a crash
+    /// mid-`set_fingerprint` on a very old build; the correct recovery is
+    /// to adopt the current config and re-write a complete fingerprint.
     pub fn check_fingerprint(
         &self,
         provider: &str,
@@ -210,14 +215,16 @@ impl Store {
     ) -> Result<FingerprintOutcome, StoreError> {
         let stored_provider = self.get_meta("embedding_provider")?;
         let stored_model = self.get_meta("embedding_model")?;
+        // Require all three keys to constitute a real fingerprint. Any
+        // missing key (including partial-write state) is treated as Fresh.
         let (stored_provider, stored_model) = match (stored_provider, stored_model) {
-            (None, None) => return Ok(FingerprintOutcome::Fresh),
-            (p, m) => (p.unwrap_or_default(), m.unwrap_or_default()),
+            (Some(p), Some(m)) => (p, m),
+            _ => return Ok(FingerprintOutcome::Fresh),
         };
-        let stored_dim: usize = self
-            .get_meta("embedding_dim")?
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(dim);
+        let stored_dim: usize = match self.get_meta("embedding_dim")?.and_then(|v| v.parse().ok()) {
+            Some(d) => d,
+            None => return Ok(FingerprintOutcome::Fresh),
+        };
         if stored_provider == provider && stored_model == model && stored_dim == dim {
             return Ok(FingerprintOutcome::Match);
         }
@@ -227,18 +234,30 @@ impl Store {
         )))
     }
 
-    /// Record the embedding fingerprint. Called once, on a genuinely fresh
-    /// index (see [`FingerprintOutcome::Fresh`]) or immediately after
-    /// [`Store::wipe_and_rebuild`] (which writes it directly).
+    /// Record the embedding fingerprint atomically. Called once, on a
+    /// genuinely fresh index (see [`FingerprintOutcome::Fresh`]) or
+    /// immediately after [`Store::wipe_and_rebuild`] (which writes it
+    /// directly). All three keys are upserted inside a single transaction
+    /// so a crash between writes cannot leave a partial fingerprint.
     pub fn set_fingerprint(
         &self,
         provider: &str,
         model: &str,
         dim: usize,
     ) -> Result<(), StoreError> {
-        self.set_meta("embedding_provider", provider)?;
-        self.set_meta("embedding_model", model)?;
-        self.set_meta("embedding_dim", &dim.to_string())?;
+        let tx = self.conn.unchecked_transaction()?;
+        for (key, val) in [
+            ("embedding_provider", provider),
+            ("embedding_model", model),
+            ("embedding_dim", &dim.to_string() as &str),
+        ] {
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, val],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -739,7 +758,8 @@ pub enum MigrationOutcome {
 }
 
 /// Result of comparing the stored embedding fingerprint against the
-/// effective config, from [`Store::check_fingerprint`].
+/// effective config, from [`Store::check_fingerprint`] or
+/// [`FingerprintOutcome::from_peek`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FingerprintOutcome {
     /// No fingerprint recorded yet — caller should adopt the current config.
@@ -749,6 +769,32 @@ pub enum FingerprintOutcome {
     /// Mismatch; the `String` names exactly which field(s) changed and both
     /// old/new values, ready to surface as a startup error.
     Mismatch(String),
+}
+
+impl FingerprintOutcome {
+    /// Derive an outcome from the raw `peek_fingerprint` result, using the
+    /// same equality semantics as [`Store::check_fingerprint`]. Allows
+    /// callers to decide how to open the store (normal vs reembed) based
+    /// solely on the outcome variant, without a second independent comparison
+    /// of the three fingerprint fields.
+    pub fn from_peek(
+        stored: Option<(String, String, usize)>,
+        provider: &str,
+        model: &str,
+        dim: usize,
+    ) -> Self {
+        match stored {
+            None => FingerprintOutcome::Fresh,
+            Some((sp, sm, sd)) if sp == provider && sm == model && sd == dim => {
+                FingerprintOutcome::Match
+            }
+            Some((sp, sm, sd)) => FingerprintOutcome::Mismatch(format!(
+                "index built with provider={sp} model={sm} dim={sd}, \
+                 config says provider={provider} model={model} dim={dim}; \
+                 re-embed required: run with --reembed"
+            )),
+        }
+    }
 }
 
 /// Minimal row projection used to hydrate a search hit. Kept in the store
@@ -1420,5 +1466,55 @@ mod tests {
         assert!(msg.contains("provider=gemini"), "{msg}");
         assert!(msg.contains("provider=voyage"), "{msg}");
         assert!(msg.contains("--reembed"), "{msg}");
+    }
+
+    /// A DB with only `embedding_provider` written (partial fingerprint from
+    /// a hypothetical crash mid-`set_fingerprint`) must be treated as
+    /// `Fresh`, not `Mismatch`. This prevents confusing error messages with
+    /// fabricated empty-string field values.
+    #[test]
+    fn partial_fingerprint_is_fresh() {
+        let (_d, s) = open_temp();
+        // Write only the first of the three fingerprint keys directly.
+        s.set_meta("embedding_provider", "gemini").unwrap();
+        let outcome = s
+            .check_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            FingerprintOutcome::Fresh,
+            "one key present but not all three must be treated as Fresh"
+        );
+    }
+
+    /// All three fingerprint meta keys must be present immediately after
+    /// `set_fingerprint`, with no window where any key can be absent.
+    /// Mirrors `wipe_and_rebuild_fingerprint_is_atomic`.
+    #[test]
+    fn set_fingerprint_writes_all_three_keys() {
+        let (_d, s) = open_temp();
+        s.set_fingerprint("voyage", "voyage-4", 1024).unwrap();
+
+        assert_eq!(
+            s.get_meta("embedding_provider").unwrap().as_deref(),
+            Some("voyage"),
+            "embedding_provider not written"
+        );
+        assert_eq!(
+            s.get_meta("embedding_model").unwrap().as_deref(),
+            Some("voyage-4"),
+            "embedding_model not written"
+        );
+        assert_eq!(
+            s.get_meta("embedding_dim").unwrap().as_deref(),
+            Some("1024"),
+            "embedding_dim not written"
+        );
+        let outcome = s.check_fingerprint("voyage", "voyage-4", 1024).unwrap();
+        assert_eq!(
+            outcome,
+            FingerprintOutcome::Match,
+            "fingerprint check must Match after set_fingerprint"
+        );
     }
 }
