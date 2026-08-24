@@ -688,9 +688,12 @@ mod tests {
 
     #[test]
     fn pdf_bytes_are_rejected_for_pdf_none_with_path_only_error() {
+        // Use a genuinely structurally valid PDF so the rejection comes from
+        // PdfMode::None and not from parse failure.  The mode check happens
+        // before any parsing, so the result must always be PdfUnsupported.
         let error = match prepare_media(
             "private/paper.pdf",
-            b"%PDF-1.7\nnot-a-real-document",
+            &minimal_one_page_pdf(),
             &media_model(PdfMode::None),
             PrepareOptions::default(),
         ) {
@@ -699,7 +702,11 @@ mod tests {
         };
         let display = error.to_string();
         assert!(display.contains("private/paper.pdf"));
-        assert!(!display.contains("not-a-real-document"));
+        // The error must be PdfUnsupported, not a parse error.
+        assert!(
+            matches!(error, MediaPrepareError::PdfUnsupported { .. }),
+            "expected PdfUnsupported, got: {display}"
+        );
     }
     /// Build a minimal but structurally valid single-page PDF in memory.
     fn minimal_one_page_pdf() -> Vec<u8> {
@@ -809,8 +816,8 @@ mod tests {
     }
 
     /// Multi-page PDF with pdf_pages_per_chunk=1: each page is a separate
-    /// chunk produced by extract_pages_to_bytes, so they cannot equal the
-    /// source bytes (which contains both pages).
+    /// chunk produced by extract_pages_to_bytes.  The extracted sub-PDF must
+    /// contain exactly one page and carry the correct page range.
     #[test]
     fn native_multi_page_pdf_uses_extract_per_page() {
         let pdf = minimal_two_page_pdf();
@@ -826,15 +833,16 @@ mod tests {
                 panic!("expected Media input");
             };
             assert_eq!(parts.len(), 1);
-            // Each extracted sub-PDF is a valid PDF but not identical to the
-            // original two-page source.
-            assert_ne!(
-                parts[0].bytes, pdf,
-                "extracted single page must differ from two-page source"
-            );
-            assert!(
-                parts[0].bytes.starts_with(b"%PDF-"),
-                "extracted bytes must be a valid PDF"
+            // Re-open the extracted bytes to confirm they are a one-page PDF,
+            // not a copy of the full two-page source.
+            let mut editor =
+                pdf_oxide::editor::DocumentEditor::from_bytes(parts[0].bytes.clone())
+                    .expect("extracted bytes must be a valid PDF");
+            assert_eq!(
+                editor.current_page_count(),
+                1,
+                "chunk {i}: extracted PDF must have exactly 1 page, not {}",
+                editor.current_page_count()
             );
             assert_eq!(chunk.metadata.page_range, Some((i, i + 1)));
         }

@@ -210,6 +210,7 @@ async fn reindex_one(ctx: &IndexerCtx, rel_path: &Path) -> Result<(), IndexerErr
             Ok(())
         })
         .await??;
+        bump_reindex(ctx);
         return Ok(());
     };
     let mtime_ns = meta

@@ -107,4 +107,42 @@ mod tests {
         let d = f.embed_documents(&[EmbedInput::text("x")]).await.unwrap();
         assert_ne!(q, d[0]);
     }
+
+    /// All outputs must be L2-normalised: ||v||² ≈ 1.0. If l2_normalize is
+    /// broken (e.g. zero-vector edge case or hashing producing all-zero
+    /// blocks), cosine distance in tests becomes meaningless.
+    #[tokio::test]
+    async fn outputs_are_l2_normalised() {
+        let f = Fake::new(16);
+
+        let doc_vec = &f
+            .embed_documents(&[EmbedInput::text("hello world")])
+            .await
+            .unwrap()[0];
+        let doc_norm_sq: f64 = doc_vec.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
+        assert!(
+            (doc_norm_sq - 1.0).abs() < 1e-5,
+            "document embedding must be L2-normalised: ||v||² = {doc_norm_sq}"
+        );
+
+        let media_vec = &f
+            .embed_documents(&[EmbedInput::Media(vec![MediaPart {
+                mime_type: "image/png".into(),
+                bytes: vec![1, 2, 3],
+            }])])
+            .await
+            .unwrap()[0];
+        let media_norm_sq: f64 = media_vec.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
+        assert!(
+            (media_norm_sq - 1.0).abs() < 1e-5,
+            "media embedding must be L2-normalised: ||v||² = {media_norm_sq}"
+        );
+
+        let query_vec = f.embed_query("test query").await.unwrap();
+        let query_norm_sq: f64 = query_vec.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
+        assert!(
+            (query_norm_sq - 1.0).abs() < 1e-5,
+            "query embedding must be L2-normalised: ||v||² = {query_norm_sq}"
+        );
+    }
 }

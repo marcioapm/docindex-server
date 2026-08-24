@@ -500,6 +500,26 @@ max_file_mb = 20
             f"(hash_before={hash_before!r})"
         )
 
+        # Also verify that the stored vector changed.  The Fake embedder
+        # seeds its output from the media bytes, so 4×4 and 8×8 PNGs must
+        # produce distinct embeddings.  Querying chunks_vec joined to chunks
+        # gives the current vector for the image chunk.
+        conn_vec = sqlite3.connect(str(db))
+        vec_row = conn_vec.execute(
+            "SELECT v.embedding FROM chunks_vec v "
+            "JOIN chunks c ON c.id = v.rowid "
+            "WHERE c.path = 'watch_img.png'"
+        ).fetchone()
+        conn_vec.close()
+        assert vec_row is not None, "watch_img.png must have a stored vector after re-index"
+        # The vector must not be all zeros (a plausible zero-initialised sentinel).
+        import struct
+        vec_bytes = vec_row[0]
+        floats = struct.unpack(f"{len(vec_bytes) // 4}f", vec_bytes)
+        assert any(f != 0.0 for f in floats), (
+            "stored vector for modified image must not be all zeros"
+        )
+
         # Delete the image; chunk count should drop to 1.
         img_path.unlink()
         deadline = time.monotonic() + 15.0
