@@ -1481,7 +1481,8 @@ mod tests {
             // is not written to meta. Write only provider and model manually.
             let s = Store::open_for_reembed(&path, TEST_DIM).unwrap();
             s.set_meta("embedding_provider", "gemini").unwrap();
-            s.set_meta("embedding_model", "gemini-embedding-001").unwrap();
+            s.set_meta("embedding_model", "gemini-embedding-001")
+                .unwrap();
         }
         let result = Store::peek_fingerprint(&path).unwrap();
         assert!(

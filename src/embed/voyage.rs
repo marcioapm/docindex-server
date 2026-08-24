@@ -555,8 +555,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(503)
-                    .set_body_json(json!({"detail": "service unavailable"})),
+                ResponseTemplate::new(503).set_body_json(json!({"detail": "service unavailable"})),
             )
             .up_to_n_times(1)
             .mount(&server)
@@ -585,8 +584,7 @@ mod tests {
         // No `up_to_n_times` — replies 503 to every request.
         Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(503)
-                    .set_body_json(json!({"detail": "service unavailable"})),
+                ResponseTemplate::new(503).set_body_json(json!({"detail": "service unavailable"})),
             )
             .mount(&server)
             .await;
