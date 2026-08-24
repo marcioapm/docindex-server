@@ -932,16 +932,67 @@ mod tests {
         assert_eq!(prepared.chunks[1].metadata.page_range, Some((6, 7)));
     }
 
-    /// page_ranges with pages_per_chunk=7 on a 7-page document would produce
-    /// a single (0,7) range, which the guard must reject.
+    /// A 14-page PDF with pdf_pages_per_chunk=7 produces two ranges of 7 pages
+    /// each. The multi-range extraction loop encounters the first range, finds
+    /// 7 > 6, and must return PdfChunkTooLarge from the in-loop guard — not
+    /// the single-range passthrough guard, which does not fire here because
+    /// ranges.len() > 1.
     #[test]
     fn page_ranges_with_large_pages_per_chunk_produces_oversized_range() {
-        let ranges = page_ranges(7, 7);
-        assert_eq!(ranges, vec![(0, 7)]);
-        let (start, end) = ranges[0];
+        let pdf = minimal_n_page_pdf(14);
+        let model = media_model(PdfMode::Native);
+        let opts = PrepareOptions {
+            pdf_pages_per_chunk: 7, // passes validate_options; triggers in-loop guard
+            ..PrepareOptions::default()
+        };
+        let err = match prepare_media("big.pdf", &pdf, &model, opts) {
+            Err(e) => e,
+            Ok(_) => panic!("7-page chunks on a 14-page PDF must be rejected by the loop guard"),
+        };
         assert!(
-            end - start > 6,
-            "page_ranges correctly produces a >6-page range that the guard must catch"
+            matches!(err, MediaPrepareError::PdfChunkTooLarge { pages: 7, .. }),
+            "expected PdfChunkTooLarge{{pages:7}}, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("big.pdf"),
+            "error must include the path: {err}"
+        );
+    }
+
+    /// Confirm the per-chunk guard inside the extraction loop is reachable and
+    /// independent from the single-range passthrough guard.
+    ///
+    /// A 13-page PDF with pdf_pages_per_chunk=7 yields two ranges: (0,7) and
+    /// (6,7) — wait, that's wrong per step_by. Actually (0,7) and (7,13).
+    /// ranges.len() == 2, so the passthrough branch (`ranges.len() == 1 &&
+    /// ranges[0] == (0, page_count)`) is not entered. The first iteration of
+    /// the extraction loop hits page_count_in_chunk = 7 > 6 and returns
+    /// PdfChunkTooLarge from the loop body.
+    #[test]
+    fn native_pdf_chunk_too_large_from_extraction_loop() {
+        // 13-page PDF, 7 pages per chunk → ranges [(0,7),(7,13)].
+        // The single-range passthrough is not reached because ranges.len() == 2.
+        let pdf = minimal_n_page_pdf(13);
+        let model = media_model(PdfMode::Native);
+        let opts = PrepareOptions {
+            pdf_pages_per_chunk: 7,
+            ..PrepareOptions::default()
+        };
+        let err = match prepare_media("thirteen.pdf", &pdf, &model, opts) {
+            Err(e) => e,
+            Ok(_) => {
+                panic!(
+                    "7-page chunk on a 13-page PDF must be rejected by the extraction-loop guard"
+                )
+            }
+        };
+        assert!(
+            matches!(err, MediaPrepareError::PdfChunkTooLarge { pages: 7, .. }),
+            "expected PdfChunkTooLarge{{pages:7}} from the extraction loop, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("thirteen.pdf"),
+            "error must include the path: {err}"
         );
     }
 }
