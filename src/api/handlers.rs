@@ -3,7 +3,7 @@
 use axum::{Json, extract::State, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 
-use crate::search::{self, Hit};
+use crate::search::{self, Hit, SearchOptions};
 
 use super::{AppState, auth, error::ApiError};
 
@@ -66,6 +66,8 @@ pub struct SearchRequest {
     pub query: String,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    #[serde(default)]
+    pub media_only: bool,
 }
 
 fn default_limit() -> usize {
@@ -85,16 +87,42 @@ pub async fn search(
     if req.query.trim().is_empty() {
         return Err(ApiError::BadRequest("query must not be empty".into()));
     }
-    let hits = search::search(
+    let hits = search::search_with_options(
         state.store.clone(),
         &state.embedder,
         state.embed_dim,
         &req.query,
         req.limit,
         state.display_scoring,
+        SearchOptions {
+            media_only: req.media_only,
+        },
     )
     .await?;
     Ok(Json(SearchResponse { hits }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SearchRequest;
+
+    #[test]
+    fn search_request_defaults_media_only_to_false() {
+        let request: SearchRequest = serde_json::from_str(r#"{"query":"cats"}"#).unwrap();
+
+        assert_eq!(request.query, "cats");
+        assert_eq!(request.limit, 10);
+        assert!(!request.media_only);
+    }
+
+    #[test]
+    fn search_request_deserializes_media_only() {
+        let request: SearchRequest =
+            serde_json::from_str(r#"{"query":"cats","limit":4,"media_only":true}"#).unwrap();
+
+        assert_eq!(request.limit, 4);
+        assert!(request.media_only);
+    }
 }
 
 #[derive(Deserialize)]

@@ -112,7 +112,17 @@ pub fn clamp_limit(n: usize) -> usize {
     if n == 0 { 10 } else { n.min(LIMIT_MAX) }
 }
 
-/// Run a query against the index.
+/// Parameters controlling which corpus a search considers.
+///
+/// The default preserves hybrid text-and-media search. Set `media_only` to
+/// search only non-text chunks with the vector ranker; media is intentionally
+/// absent from FTS.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchOptions {
+    pub media_only: bool,
+}
+
+/// Run a query against the index using the default hybrid corpus.
 pub async fn search(
     store: Arc<Mutex<Store>>,
     embedder: &AnyEmbedder,
@@ -120,6 +130,28 @@ pub async fn search(
     query: &str,
     limit: usize,
     display: DisplayScoring,
+) -> Result<Vec<Hit>, SearchError> {
+    search_with_options(
+        store,
+        embedder,
+        embed_dim,
+        query,
+        limit,
+        display,
+        SearchOptions::default(),
+    )
+    .await
+}
+
+/// Run a query against the index with corpus-selection options.
+pub async fn search_with_options(
+    store: Arc<Mutex<Store>>,
+    embedder: &AnyEmbedder,
+    embed_dim: usize,
+    query: &str,
+    limit: usize,
+    display: DisplayScoring,
+    options: SearchOptions,
 ) -> Result<Vec<Hit>, SearchError> {
     if query.trim().is_empty() {
         return Ok(Vec::new());
@@ -131,6 +163,13 @@ pub async fn search(
             want: embed_dim,
         });
     }
+
+    if options.media_only {
+        let media_hits = run_media_candidate_query(store.clone(), q_vec).await?;
+        let fused = fuse_rrf_ranked(&rank_ids(&media_hits), &[], RRF_K);
+        return hydrate(store, &fused, clamp_limit(limit), None, display).await;
+    }
+
     let fts_query = fts_query_from_user(query);
     let (vec_hits, fts_hits) = run_candidate_queries(store.clone(), q_vec, fts_query).await?;
     let fused = fuse_rrf_ranked(&rank_ids(&vec_hits), &rank_ids(&fts_hits), RRF_K);
@@ -156,14 +195,14 @@ pub async fn similar(
             let guard = store_c
                 .lock()
                 .map_err(|e| SearchError::Msg(format!("store lock: {e}")))?;
-            let chunks = guard.chunks_for_path(&path_owned)?;
+            let chunks = guard.chunks_for_similar(&path_owned)?;
             if chunks.is_empty() {
                 return match guard.get_file_state(&path_owned)? {
                     Some(_) => Ok(None),
                     None => Err(SearchError::PathNotIndexed(path_owned)),
                 };
             }
-            let ids: Vec<i64> = chunks.iter().map(|(id, _)| *id).collect();
+            let ids: Vec<i64> = chunks.iter().map(|chunk| chunk.id).collect();
             let vectors = guard.vectors_for_chunks(&ids)?;
             let mut avg = vec![0f64; embed_dim];
             let mut count = 0usize;
@@ -179,7 +218,7 @@ pub async fn similar(
             if count == 0 {
                 return Err(SearchError::Msg(format!(
                     "no stored vectors for path {:?}",
-                    chunks[0].0
+                    chunks[0].id
                 )));
             }
             for x in avg.iter_mut() {
@@ -193,8 +232,12 @@ pub async fn similar(
             }
             let q: Vec<f32> = avg.iter().map(|x| *x as f32).collect();
             let mut bag = String::new();
-            for (_, c) in chunks.iter().take(4) {
-                bag.push_str(c);
+            for chunk in chunks
+                .iter()
+                .filter(|chunk| chunk.media_type == "text")
+                .take(4)
+            {
+                bag.push_str(&chunk.content);
                 bag.push(' ');
             }
             Ok(Some((q, bag)))
@@ -317,6 +360,19 @@ fn rank_ids<T>(hits: &[(i64, T)]) -> Vec<i64> {
     hits.iter().map(|(id, _)| *id).collect()
 }
 
+async fn run_media_candidate_query(
+    store: Arc<Mutex<Store>>,
+    q_vec: Vec<f32>,
+) -> Result<Vec<(i64, f32)>, SearchError> {
+    tokio::task::spawn_blocking(move || -> Result<_, SearchError> {
+        let guard = store
+            .lock()
+            .map_err(|e| SearchError::Msg(format!("store lock: {e}")))?;
+        Ok(guard.search_media_vec(&q_vec)?)
+    })
+    .await?
+}
+
 async fn run_candidate_queries(
     store: Arc<Mutex<Store>>,
     q_vec: Vec<f32>,
@@ -399,7 +455,7 @@ fn to_hit(row: &HitRow, score_rrf: f64, score_normalized: f64) -> Hit {
         path: row.path.clone(),
         title,
         heading_path: row.heading_path.clone(),
-        snippet: make_snippet(&row.content, SNIPPET_MAX),
+        snippet: media_snippet(row).unwrap_or_else(|| make_snippet(&row.content, SNIPPET_MAX)),
         score: score_rrf,
         score_rrf,
         score_normalized,
@@ -410,6 +466,20 @@ fn to_hit(row: &HitRow, score_rrf: f64, score_normalized: f64) -> Hit {
         media_end: row.media_end,
         media_unit: row.media_unit.clone(),
         truncated: row.truncated,
+    }
+}
+
+fn media_snippet(row: &HitRow) -> Option<String> {
+    match row.media_type.as_str() {
+        "image" => Some("Image".into()),
+        "pdf" => match (row.media_start, row.media_end) {
+            (Some(start), Some(end)) if end == start + 1 => Some(format!("PDF page {}", start + 1)),
+            (Some(start), Some(end)) if end > start + 1 => {
+                Some(format!("PDF pages {}–{}", start + 1, end))
+            }
+            _ => Some("PDF".into()),
+        },
+        _ => None,
     }
 }
 
@@ -708,6 +778,41 @@ mod tests {
         assert_eq!(pdf_json["media_end"], 6);
         assert_eq!(pdf_json["media_unit"], "page");
         assert_eq!(pdf_json["truncated"], true);
+    }
+
+    #[test]
+    fn media_snippets_describe_images_and_pdf_page_ranges() {
+        let mut image = test_hit_row("image");
+        image.media_type = "image".into();
+        assert_eq!(media_snippet(&image).as_deref(), Some("Image"));
+
+        let mut single_page = test_hit_row("pdf");
+        single_page.media_type = "pdf".into();
+        single_page.media_start = Some(0);
+        single_page.media_end = Some(1);
+        assert_eq!(media_snippet(&single_page).as_deref(), Some("PDF page 1"));
+
+        let mut pages = test_hit_row("pdf");
+        pages.media_type = "pdf".into();
+        pages.media_start = Some(2);
+        pages.media_end = Some(5);
+        assert_eq!(media_snippet(&pages).as_deref(), Some("PDF pages 3–5"));
+    }
+
+    fn test_hit_row(media_type: &str) -> HitRow {
+        HitRow {
+            id: 1,
+            path: "item".into(),
+            heading: String::new(),
+            heading_path: String::new(),
+            content: "internal representation".into(),
+            media_type: media_type.into(),
+            mime_type: None,
+            media_start: None,
+            media_end: None,
+            media_unit: None,
+            truncated: false,
+        }
     }
 
     #[test]

@@ -166,6 +166,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_accepts_media_only_request() {
+        let (_dir, state) = test_state();
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/search")
+                    .header("authorization", "Bearer right-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"image","media_only":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response_body(response).await).unwrap();
+        assert_eq!(body, serde_json::json!({ "hits": [] }));
+    }
+
+    #[tokio::test]
     async fn similar_known_empty_file_returns_empty_hits() {
         let (_dir, state) = test_state();
         state

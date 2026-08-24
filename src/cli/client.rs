@@ -66,12 +66,21 @@ impl Client {
         handle_response(resp).await
     }
 
-    pub async fn search(&self, query: &str, limit: usize) -> Result<SearchResponse, ClientError> {
+    pub async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        media_only: bool,
+    ) -> Result<SearchResponse, ClientError> {
         let resp = self
             .http
             .post(format!("{}/search", self.base_url))
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "query": query, "limit": limit }))
+            .json(&serde_json::json!({
+                "query": query,
+                "limit": limit,
+                "media_only": media_only
+            }))
             .send()
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
@@ -120,5 +129,52 @@ async fn error_message(resp: reqwest::Response) -> String {
     match resp.json::<Body>().await {
         Ok(b) if !b.error.is_empty() => b.error,
         _ => "request failed".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+
+    use super::Client;
+
+    #[tokio::test]
+    async fn search_sends_media_only_in_request_body() {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/search",
+            post({
+                let bodies = Arc::clone(&bodies);
+                move |Json(body): Json<Value>| {
+                    let bodies = Arc::clone(&bodies);
+                    async move {
+                        bodies.lock().unwrap().push(body);
+                        Json(json!({ "hits": [] }))
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = Client::new(format!("http://{address}"), "token").unwrap();
+        let media_response = client.search("sunset", 7, true).await.unwrap();
+        let default_response = client.search("notes", 3, false).await.unwrap();
+
+        assert!(media_response.hits.is_empty());
+        assert!(default_response.hits.is_empty());
+        assert_eq!(
+            bodies.lock().unwrap().as_slice(),
+            [
+                json!({ "query": "sunset", "limit": 7, "media_only": true }),
+                json!({ "query": "notes", "limit": 3, "media_only": false }),
+            ]
+        );
+        server.abort();
     }
 }
