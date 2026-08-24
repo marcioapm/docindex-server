@@ -20,10 +20,15 @@ pub enum ClientError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub ok: bool,
-    pub indexed_chunks: i64,
-    pub last_reindex_ms: i64,
-    pub embedding_model: String,
-    pub dim: usize,
+    pub authenticated: bool,
+    #[serde(default)]
+    pub indexed_chunks: Option<i64>,
+    #[serde(default)]
+    pub last_reindex_ms: Option<i64>,
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    #[serde(default)]
+    pub dim: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +59,7 @@ impl Client {
         let resp = self
             .http
             .get(format!("{}/health", self.base_url))
+            .bearer_auth(&self.token)
             .send()
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;

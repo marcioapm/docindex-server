@@ -138,15 +138,18 @@ pub async fn similar(
     display: DisplayScoring,
 ) -> Result<Vec<Hit>, SearchError> {
     let path_owned = path.to_string();
-    let (q_vec, bag) = {
+    let source = {
         let store_c = store.clone();
-        tokio::task::spawn_blocking(move || -> Result<(Vec<f32>, String), SearchError> {
+        tokio::task::spawn_blocking(move || -> Result<Option<(Vec<f32>, String)>, SearchError> {
             let guard = store_c
                 .lock()
                 .map_err(|e| SearchError::Msg(format!("store lock: {e}")))?;
             let chunks = guard.chunks_for_path(&path_owned)?;
             if chunks.is_empty() {
-                return Err(SearchError::PathNotIndexed(path_owned));
+                return match guard.get_file_state(&path_owned)? {
+                    Some(_) => Ok(None),
+                    None => Err(SearchError::PathNotIndexed(path_owned)),
+                };
             }
             let ids: Vec<i64> = chunks.iter().map(|(id, _)| *id).collect();
             let vectors = guard.vectors_for_chunks(&ids)?;
@@ -182,9 +185,12 @@ pub async fn similar(
                 bag.push_str(c);
                 bag.push(' ');
             }
-            Ok((q, bag))
+            Ok(Some((q, bag)))
         })
         .await??
+    };
+    let Some((q_vec, bag)) = source else {
+        return Ok(Vec::new());
     };
 
     let fts_query = fts_query_from_user(&bag);

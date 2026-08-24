@@ -106,12 +106,19 @@ Traffic from Tailscale (`tailscale0`) is allowed by default interface policy; UF
 From any Tailscale peer:
 
 ```sh
+# Public liveness only; this does not verify credentials.
 curl http://100.64.0.1:7777/health
+
+# Authenticated health returns index and embedding details and verifies the bearer.
+curl -H "Authorization: Bearer $DOCINDEX_BEARER" \
+    http://100.64.0.1:7777/health
 curl -H "Authorization: Bearer $DOCINDEX_BEARER" \
     -X POST http://100.64.0.1:7777/search \
     -H 'Content-Type: application/json' \
     -d '{"query":"hello","limit":5}'
 ```
+
+`GET /health` always returns `200 OK`. A request without a valid bearer receives only `{ "ok": true, "authenticated": false }`; use that shape only for liveness monitoring, never to verify credentials. A valid bearer receives `{ "ok": true, "authenticated": true, "indexed_chunks", "last_reindex_ms", "embedding_model", "dim" }`.
 
 ## Upgrade
 

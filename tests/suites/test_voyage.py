@@ -138,6 +138,7 @@ base_url = "{voyage_mock}"
         text=True,
     )
     base_url = f"http://127.0.0.1:{port}"
+    health_headers = {"Authorization": "Bearer voyage-bearer"}
     try:
         deadline = time.monotonic() + 15.0
         ready = False
@@ -147,7 +148,9 @@ base_url = "{voyage_mock}"
                     f"server exited early with code {proc.returncode}\nlog:\n{log_path.read_text()}"
                 )
             try:
-                r = httpx.get(f"{base_url}/health", timeout=2.0)
+                r = httpx.get(
+                    f"{base_url}/health", headers=health_headers, timeout=2.0
+                )
                 if r.status_code == 200 and r.json().get("ok") is True:
                     ready = True
                     break
@@ -159,14 +162,16 @@ base_url = "{voyage_mock}"
         deadline = time.monotonic() + 15.0
         chunks = 0
         while time.monotonic() < deadline:
-            r = httpx.get(f"{base_url}/health", timeout=2.0)
+            r = httpx.get(f"{base_url}/health", headers=health_headers, timeout=2.0)
             chunks = r.json().get("indexed_chunks", 0)
             if chunks >= 2:
                 break
             time.sleep(0.2)
         assert chunks >= 2, f"expected 2 chunks, got {chunks}\nlog:\n{log_path.read_text()}"
 
-        health = httpx.get(f"{base_url}/health", timeout=5.0).json()
+        health = httpx.get(
+            f"{base_url}/health", headers=health_headers, timeout=5.0
+        ).json()
         assert health["embedding_model"] == "voyage-4"
         assert health["dim"] == VOYAGE_DIM
 

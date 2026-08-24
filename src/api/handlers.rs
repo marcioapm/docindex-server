@@ -1,22 +1,41 @@
 //! HTTP handlers for `/health`, `/search`, `/similar`.
 
-use axum::{Json, extract::State};
+use axum::{Json, extract::State, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 
 use crate::search::{self, Hit};
 
-use super::{AppState, error::ApiError};
+use super::{AppState, auth, error::ApiError};
 
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub ok: bool,
-    pub indexed_chunks: i64,
-    pub last_reindex_ms: i64,
-    pub embedding_model: String,
-    pub dim: usize,
+    pub authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed_chunks: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_reindex_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dim: Option<usize>,
 }
 
-pub async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
+pub async fn health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<HealthResponse>, ApiError> {
+    if !auth::has_valid_bearer(&headers, &state.bearer) {
+        return Ok(Json(HealthResponse {
+            ok: true,
+            authenticated: false,
+            indexed_chunks: None,
+            last_reindex_ms: None,
+            embedding_model: None,
+            dim: None,
+        }));
+    }
+
     let store = state.store.clone();
     let indexed_chunks = tokio::task::spawn_blocking(move || -> Result<i64, ApiError> {
         let guard = store
@@ -30,12 +49,15 @@ pub async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse
     .map_err(|e| ApiError::Internal(format!("join: {e}")))??;
     Ok(Json(HealthResponse {
         ok: true,
-        indexed_chunks,
-        last_reindex_ms: state
-            .last_reindex_ms
-            .load(std::sync::atomic::Ordering::Relaxed),
-        embedding_model: state.embed_model.to_string(),
-        dim: state.embed_dim,
+        authenticated: true,
+        indexed_chunks: Some(indexed_chunks),
+        last_reindex_ms: Some(
+            state
+                .last_reindex_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        embedding_model: Some(state.embed_model.to_string()),
+        dim: Some(state.embed_dim),
     }))
 }
 

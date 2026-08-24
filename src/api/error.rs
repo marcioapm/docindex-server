@@ -13,7 +13,7 @@ pub enum ApiError {
     BadRequest(String),
     #[error("unauthorized")]
     Unauthorized,
-    #[error("not found")]
+    #[error("not found: {0}")]
     NotFound(String),
     #[error("internal error")]
     Internal(String),
@@ -73,5 +73,16 @@ impl From<SearchError> for ApiError {
 impl From<axum::extract::rejection::JsonRejection> for ApiError {
     fn from(r: axum::extract::rejection::JsonRejection) -> Self {
         ApiError::BadRequest(r.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_found_display_includes_detail() {
+        let error = ApiError::NotFound("path not indexed: x.md".into());
+        assert_eq!(error.to_string(), "not found: path not indexed: x.md");
     }
 }

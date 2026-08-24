@@ -48,6 +48,18 @@ def test_similar_returns_related_doc(spawn_server, tmp_path):
         assert not p.startswith("/"), f"hit.path must be vault-relative, got {p!r}"
 
 
+def test_similar_known_empty_file_returns_empty_hits(spawn_server, tmp_path):
+    vault = _write_vault(tmp_path)
+    (vault / "empty.md").touch()
+    server = spawn_server(vault)
+    server.wait_for_chunks(len(VAULT))
+
+    r = server.post("/similar", {"path": "empty.md"})
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"hits": []}
+
+
 def test_similar_unknown_path_is_404(spawn_server, tmp_path):
     vault = _write_vault(tmp_path)
     server = spawn_server(vault)
@@ -56,3 +68,4 @@ def test_similar_unknown_path_is_404(spawn_server, tmp_path):
     assert r.status_code == 404
     body = r.json()
     assert body["code"] == "not_found"
+    assert body["error"] == "path not indexed: nope.md"

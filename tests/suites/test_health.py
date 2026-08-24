@@ -1,4 +1,4 @@
-"""E2E: /health endpoint returns 200 with expected fields."""
+"""E2E: /health serves public liveness and authenticated operational detail."""
 from __future__ import annotations
 
 import pathlib
@@ -10,30 +10,51 @@ from conftest import DEFAULT_E2E_EMBED_DIM
 
 pytestmark = pytest.mark.e2e
 
+DETAIL_KEYS = {"indexed_chunks", "last_reindex_ms", "embedding_model", "dim"}
 
-def test_health_ok(spawn_server, tmp_path: pathlib.Path):
+
+def test_health_without_bearer_is_minimal_liveness(spawn_server, tmp_path: pathlib.Path):
     vault = tmp_path / "vault"
     vault.mkdir()
     (vault / "a.md").write_text("# A\n\nalpha\n")
-
     server = spawn_server(vault)
+
     r = server.get("/health")
+
     assert r.status_code == 200
     body = r.json()
-    assert body["ok"] is True
-    assert body["embedding_model"] == "gemini-embedding-001"
-    assert body["dim"] == DEFAULT_E2E_EMBED_DIM
-    assert "indexed_chunks" in body
-    assert "last_reindex_ms" in body
+    assert body == {"ok": True, "authenticated": False}
+    assert not (DETAIL_KEYS & body.keys())
 
 
-def test_health_is_public(spawn_server, tmp_path: pathlib.Path):
+def test_health_with_wrong_bearer_matches_missing_bearer(spawn_server, tmp_path: pathlib.Path):
     vault = tmp_path / "vault"
     vault.mkdir()
     server = spawn_server(vault, bearer="topsecret")
-    # no auth header — should still succeed
-    r = server.get("/health")
+
+    missing = server.get("/health")
+    wrong = server.get("/health", headers={"Authorization": "Bearer wrong"})
+
+    assert missing.status_code == 200
+    assert wrong.status_code == 200
+    assert missing.content == wrong.content
+
+
+def test_health_with_bearer_returns_operational_detail(spawn_server, tmp_path: pathlib.Path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "a.md").write_text("# A\n\nalpha\n")
+    server = spawn_server(vault)
+
+    r = server.get("/health", headers={"Authorization": f"Bearer {server.bearer}"})
+
     assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["authenticated"] is True
+    assert body["embedding_model"] == "gemini-embedding-001"
+    assert body["dim"] == DEFAULT_E2E_EMBED_DIM
+    assert DETAIL_KEYS <= body.keys()
 
 
 def test_health_reports_indexed_chunks_after_scan(spawn_server, tmp_path: pathlib.Path):
@@ -47,11 +68,11 @@ def test_health_reports_indexed_chunks_after_scan(spawn_server, tmp_path: pathli
 
 
 def test_health_dim_tracks_env(spawn_server, tmp_path: pathlib.Path):
-    """Explicit override: /health.dim must reflect DOCINDEX_EMBED_DIM."""
+    """Explicit override: authenticated /health.dim follows DOCINDEX_EMBED_DIM."""
     vault = tmp_path / "vault"
     vault.mkdir()
     (vault / "a.md").write_text("# A\n\nalpha\n")
     server = spawn_server(vault, env_overrides={"DOCINDEX_EMBED_DIM": "64"})
-    r = server.get("/health")
+    r = server.get("/health", headers={"Authorization": f"Bearer {server.bearer}"})
     assert r.status_code == 200
     assert r.json()["dim"] == 64

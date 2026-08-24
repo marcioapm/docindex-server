@@ -8,8 +8,8 @@
 //! ```
 //!
 //! Exit codes: 0 ok, 1 usage/config error, 2 network/server error,
-//! 3 auth failure (401/403), 4 no results. Errors go to stderr, stdout is
-//! reserved for results.
+//! 3 authentication failure (401/403 or health reports `authenticated=false`),
+//! 4 no results. Errors go to stderr, stdout is reserved for results.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -97,7 +97,7 @@ enum Command {
         #[command(flatten)]
         args: GlobalArgs,
     },
-    /// Check server health.
+    /// Verify server reachability and bearer authentication.
     Health {
         #[command(flatten)]
         args: GlobalArgs,
@@ -193,6 +193,12 @@ async fn run(cli: Cli) -> ExitCode {
 
 async fn run_health(client: &Client, format: OutputFormat) -> ExitCode {
     match client.health().await {
+        Ok(h) if !h.authenticated => {
+            eprintln!(
+                "docindex-search: server is reachable but the bearer token is missing or invalid"
+            );
+            ExitCode::from(3)
+        }
         Ok(h) => {
             if format == OutputFormat::Json {
                 match serde_json::to_string(&h) {
@@ -204,8 +210,13 @@ async fn run_health(client: &Client, format: OutputFormat) -> ExitCode {
                 }
             } else {
                 println!(
-                    "ok={} indexed_chunks={} last_reindex_ms={} embedding_model={} dim={}",
-                    h.ok, h.indexed_chunks, h.last_reindex_ms, h.embedding_model, h.dim
+                    "ok={} authenticated={} indexed_chunks={} last_reindex_ms={} embedding_model={} dim={}",
+                    h.ok,
+                    h.authenticated,
+                    h.indexed_chunks.unwrap_or_default(),
+                    h.last_reindex_ms.unwrap_or_default(),
+                    h.embedding_model.as_deref().unwrap_or_default(),
+                    h.dim.unwrap_or_default(),
                 );
             }
             ExitCode::from(0)

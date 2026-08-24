@@ -91,6 +91,21 @@ def test_cli_health(spawn_server, docindex_search_bin, tmp_path):
     assert "ok=true" in r.stdout
 
 
+def test_cli_health_wrong_token_is_exit_3(spawn_server, docindex_search_bin, tmp_path):
+    vault = _write_vault(tmp_path)
+    server = spawn_server(vault)
+    server.wait_for_chunks(len(VAULT_FILES))
+
+    r = _run_cli(
+        docindex_search_bin,
+        ["health", "--server", server.base_url, "--token", "wrong-token"],
+    )
+
+    assert r.returncode == 3
+    assert r.stdout == ""
+    assert "server is reachable but the bearer token is missing or invalid" in r.stderr
+
+
 def test_cli_json_shape(spawn_server, docindex_search_bin, tmp_path):
     vault = _write_vault(tmp_path)
     server = spawn_server(vault)

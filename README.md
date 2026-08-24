@@ -95,15 +95,16 @@ Human output, one hit per line, snippet truncated to terminal width (or 200 char
         - Holdout split format: `[holdout_fraction, 1.0 - holdout_fraction]`...
 ```
 
-**Exit codes:** `0` ok, `1` usage/config error, `2` network/server error, `3` auth failure (401/403), `4` no results. Errors go to stderr; stdout is reserved for results.
+**Exit codes:** `0` ok, `1` usage/config error, `2` network/server error, `3` authentication failure (401/403 or `health` returns `authenticated: false`), `4` no results. Errors go to stderr; stdout is reserved for results.
 
 ## Endpoints
 ```
-GET  /health                          -> { ok, indexed_chunks, last_reindex_ms, embedding_model, dim }
+GET  /health                          -> without/invalid bearer: { ok, authenticated: false }
+                                      -> valid bearer: { ok, authenticated: true, indexed_chunks, last_reindex_ms, embedding_model, dim }
 POST /search   { query, limit=10 }    -> { hits: [{ path, title, heading_path, snippet, score, score_rrf, score_normalized, chunk_id }] }
 POST /similar  { path,  limit=10 }    -> same shape
 ```
-`/search` and `/similar` require `Authorization: Bearer $DOCINDEX_BEARER`. `limit` is clamped to [1, 50]. Errors return `{error, code}` JSON.
+`/health` always returns `200 OK`: without a valid bearer it is a liveness probe only and must not be used to verify credentials; with `Authorization: Bearer $DOCINDEX_BEARER`, it returns operational detail and `authenticated: true`. `/search` and `/similar` require the bearer and return `401` for missing or invalid credentials. `limit` is clamped to [1, 50]. Errors return `{error, code}` JSON.
 
 Every `hit.path` (and the `path` accepted by `/similar`) is **vault-relative** — e.g. `"notes/foo.md"`, never `/home/…/vault/notes/foo.md`. This matches Obsidian's `TFile.path` so the plugin can feed paths straight into `openLinkText()` / `getAbstractFileByPath()` without rewriting. Databases created before v0.2.0 are migrated in place on first open: any `chunks.path` / `files.path` that are absolute but still inside the vault dir get rewritten atomically, and rows pointing outside the vault cause the migration to refuse (logged, not fatal) so operators can reconcile. Once complete, `meta.path_schema_version = 1` short-circuits the scan on every subsequent boot.
 

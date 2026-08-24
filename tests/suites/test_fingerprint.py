@@ -145,7 +145,10 @@ def test_reembed_recovers_from_mismatch(docindex_bin, tmp_path):
     log_a = tmp_path / "server_a.log"
     proc_a, ready_a = _run_until_ready_or_exit(docindex_bin, env_a, log_a, port)
     assert ready_a, log_a.read_text()
-    r = httpx.get(f"http://127.0.0.1:{port}/health", timeout=5.0)
+    health_headers = {"Authorization": "Bearer fp-bearer"}
+    r = httpx.get(
+        f"http://127.0.0.1:{port}/health", headers=health_headers, timeout=5.0
+    )
     baseline_chunks = r.json()["indexed_chunks"]
     assert baseline_chunks >= 1
     _stop(proc_a)
@@ -181,12 +184,14 @@ def test_reembed_recovers_from_mismatch(docindex_bin, tmp_path):
         deadline = time.monotonic() + 10.0
         chunks = 0
         while time.monotonic() < deadline:
-            chunks = httpx.get(f"{base_url}/health", timeout=2.0).json()["indexed_chunks"]
+            chunks = httpx.get(
+                f"{base_url}/health", headers=health_headers, timeout=2.0
+            ).json()["indexed_chunks"]
             if chunks >= 1:
                 break
             time.sleep(0.2)
         assert chunks >= 1, log_c.read_text()
-        r = httpx.get(f"{base_url}/health", timeout=5.0)
+        r = httpx.get(f"{base_url}/health", headers=health_headers, timeout=5.0)
         assert r.json()["dim"] == DEFAULT_E2E_EMBED_DIM + 8
 
         r = httpx.post(

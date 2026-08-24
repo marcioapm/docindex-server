@@ -143,7 +143,7 @@ class SpawnedServer:
         last = -1
         while time.monotonic() < deadline:
             try:
-                r = self.get("/health")
+                r = self.get("/health", headers=self.headers())
                 if r.status_code == 200:
                     last = r.json().get("indexed_chunks", -1)
                     if last >= n:
