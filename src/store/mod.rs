@@ -1333,59 +1333,64 @@ mod tests {
     }
 
     /// Confirm that `search_media_vec` with a cap of `k` returns exactly the
-    /// `k` closest media chunks even when rows arrive in ascending-distance
-    /// order (rowid order = rank order).
+    /// `k` closest media chunks and that eviction actually fires.
+    ///
+    /// Chunks are inserted in an order that interleaves near and far distances:
+    /// the heap fills with two far entries first, then a closer entry arrives
+    /// and evicts the worst, then another closer entry arrives and evicts again.
+    /// A min-heap (the original broken implementation) keeps the two furthest
+    /// instead of the two closest, so this test would fail against it.
     #[test]
     fn search_media_vec_top_k_is_bounded_and_ordered() {
-        // Use a small cap to prove the heap evicts distant entries.
+        // Use a small cap so eviction is forced.
         const CAP: usize = 2;
         let (_d, s) = open_temp();
 
-        // Insert one text chunk (must be excluded) and four media chunks with
-        // known, distinct distances to the query vector [1,0,0,0,0,0,0,0].
+        // Insert one text chunk (must be excluded) and four media chunks.
+        // Insertion order is far→far→near→near so eviction fires twice.
         let text_id = s
             .upsert_chunk(&sample_chunk(0, "text", "tx"), "t.md", 1)
             .unwrap();
         s.set_vector_for_chunk(text_id, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             .unwrap();
 
-        // Build four media chunks. The normalised embeddings give distances
-        // (cosine) of exactly 0.0, 0.05, 0.5, and 1.0 for a [1,0,…] query.
-        // rank order: id_a (dist≈0) < id_b (dist≈0.05) < id_c (dist≈0.5) < id_d (dist=1.0)
         let make_image = |content: &str, hash: &str| {
             let mut c = sample_chunk(0, content, hash);
             c.media_type = crate::media::MediaType::Image;
             c
         };
 
-        let id_a = s.upsert_chunk(&make_image("a", "ha"), "a.png", 1).unwrap();
-        let id_b = s.upsert_chunk(&make_image("b", "hb"), "b.png", 1).unwrap();
-        let id_c = s.upsert_chunk(&make_image("c", "hc"), "c.png", 1).unwrap();
-        let id_d = s.upsert_chunk(&make_image("d", "hd"), "d.png", 1).unwrap();
+        // Insert in order: far first (dist=1.0), second-far (dist=0.5),
+        // then close (dist≈0.025), then closest (dist≈0.0). The heap fills
+        // after the first two, then evicts id_c when id_b arrives, and evicts
+        // id_b when id_a arrives — two evictions total.
+        let id_c = s.upsert_chunk(&make_image("c", "hc"), "c.png", 1).unwrap(); // dist=1.0
+        let id_d = s.upsert_chunk(&make_image("d", "hd"), "d.png", 1).unwrap(); // dist=0.5
+        let id_b = s.upsert_chunk(&make_image("b", "hb"), "b.png", 1).unwrap(); // dist≈0.025
+        let id_a = s.upsert_chunk(&make_image("a", "ha"), "a.png", 1).unwrap(); // dist≈0.0
 
-        // Embeddings (pre-normalised unit vectors so cosine distance = 1 - dot):
-        // a → dist ≈ 0.0  (closest to query)
-        // b → dist ≈ 0.05 (slightly off-axis)
-        // c → dist = 0.5  (orthogonal components)
-        // d → dist = 1.0  (opposite direction — furthest)
-        s.set_vector_for_chunk(id_a, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        // Embeddings (pre-normalised unit vectors; cosine dist = 1 − dot product):
+        //   id_c → [-1, 0, …]  dist = 1.0  (inserted 1st — fills heap slot 1)
+        //   id_d → [ 0, 1, …]  dist = 0.5  (inserted 2nd — fills heap slot 2)
+        //   id_b → [√0.95, √0.05, …]  dist ≈ 0.025  (closer than id_d → evicts id_c)
+        //   id_a → [ 1, 0, …]  dist ≈ 0.0  (closest → evicts id_d)
+        s.set_vector_for_chunk(id_c, &[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             .unwrap();
-        // Approximate unit vector close to [1,0,…].
-        let near = {
+        s.set_vector_for_chunk(id_d, &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        let near_vec = {
             let x: f32 = (0.95f32).sqrt();
             let y: f32 = (0.05f32).sqrt();
             [x, y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         };
-        s.set_vector_for_chunk(id_b, &near).unwrap();
-        s.set_vector_for_chunk(id_c, &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            .unwrap();
-        s.set_vector_for_chunk(id_d, &[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        s.set_vector_for_chunk(id_b, &near_vec).unwrap();
+        s.set_vector_for_chunk(id_a, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             .unwrap();
 
         let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let hits = s.search_media_vec(&query, CAP).unwrap();
 
-        // Exactly CAP results returned — not all four media chunks.
+        // Exactly CAP results returned.
         assert_eq!(
             hits.len(),
             CAP,
@@ -1393,21 +1398,34 @@ mod tests {
             hits.len()
         );
 
-        // The two returned ids must be the two closest: id_a and id_b.
+        // The two returned ids must be the two closest: id_a (dist≈0.0) and id_b (dist≈0.025).
         let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, vec![id_a, id_b], "top-2 must be id_a then id_b");
+        assert_eq!(
+            ids,
+            vec![id_a, id_b],
+            "top-2 must be id_a then id_b (closest first)"
+        );
 
-        // Distances must be non-decreasing (ascending sort).
+        // Distances must be non-decreasing (ascending order).
         assert!(
             hits[0].1 <= hits[1].1,
             "hits must be ordered ascending by distance: {:?}",
             hits
         );
 
-        // Text chunk must never appear in the result.
+        // Text chunk and the two far chunks must never appear.
+        let result_ids: std::collections::HashSet<i64> = hits.iter().map(|(id, _)| *id).collect();
         assert!(
-            hits.iter().all(|(id, _)| *id != text_id),
-            "text chunk must be excluded from media search results"
+            !result_ids.contains(&text_id),
+            "text chunk must be excluded"
+        );
+        assert!(
+            !result_ids.contains(&id_c),
+            "far chunk id_c must be evicted"
+        );
+        assert!(
+            !result_ids.contains(&id_d),
+            "far chunk id_d must be evicted"
         );
     }
 
@@ -1516,10 +1534,13 @@ mod tests {
         let hits = s
             .search_media_vec(&query, 10)
             .expect("search must succeed with many media chunks");
-        // The cap must be respected.
-        assert!(
-            hits.len() <= 10,
-            "result count must not exceed the requested cap"
+        // The cap of 10 must be respected exactly. With 1100 chunks and a query
+        // that aligns with dimension-0, there are more than 10 candidates, so
+        // the result must be exactly 10.
+        assert_eq!(
+            hits.len(),
+            10,
+            "result count must equal the requested cap when candidates exceed it"
         );
     }
 
