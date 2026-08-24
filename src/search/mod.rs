@@ -93,6 +93,18 @@ pub struct Hit {
     pub score_rrf: f64,
     pub score_normalized: f64,
     pub chunk_id: i64,
+    #[serde(default)]
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_start: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_end: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_unit: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// Clamp a user-supplied limit into the safe [1, LIMIT_MAX] band.
@@ -297,6 +309,10 @@ pub fn normalize_score(
     w_vec * branch_norm(v_rank, k) + w_bm25 * branch_norm(b_rank, k)
 }
 
+pub fn vector_only_media_score(v_rank: Option<usize>, k: f64) -> f64 {
+    branch_norm(v_rank, k)
+}
+
 fn rank_ids<T>(hits: &[(i64, T)]) -> Vec<i64> {
     hits.iter().map(|(id, _)| *id).collect()
 }
@@ -362,8 +378,11 @@ async fn hydrate(
             {
                 continue;
             }
-            let norm =
-                normalize_score(f.v_rank, f.b_rank, display.k, display.w_vec, display.w_bm25);
+            let norm = if row.media_type == "text" {
+                normalize_score(f.v_rank, f.b_rank, display.k, display.w_vec, display.w_bm25)
+            } else {
+                vector_only_media_score(f.v_rank, display.k)
+            };
             out.push(to_hit(&row, f.score_rrf, norm));
         }
         Ok(out)
@@ -385,6 +404,12 @@ fn to_hit(row: &HitRow, score_rrf: f64, score_normalized: f64) -> Hit {
         score_rrf,
         score_normalized,
         chunk_id: row.id,
+        media_type: row.media_type.clone(),
+        mime_type: row.mime_type.clone(),
+        media_start: row.media_start,
+        media_end: row.media_end,
+        media_unit: row.media_unit.clone(),
+        truncated: row.truncated,
     }
 }
 
@@ -606,6 +631,93 @@ mod tests {
         assert_eq!(by_id[&20].b_rank, None);
         assert_eq!(by_id[&40].v_rank, None);
         assert_eq!(by_id[&40].b_rank, Some(3));
+    }
+
+    #[test]
+    fn hit_json_shapes_distinguish_text_image_and_pdf() {
+        let text = Hit {
+            path: "note.md".into(),
+            title: "note".into(),
+            heading_path: String::new(),
+            snippet: "text".into(),
+            score: 1.0,
+            score_rrf: 1.0,
+            score_normalized: 1.0,
+            chunk_id: 1,
+            media_type: "text".into(),
+            mime_type: None,
+            media_start: None,
+            media_end: None,
+            media_unit: None,
+            truncated: false,
+        };
+        let text_json = serde_json::to_value(text).unwrap();
+        assert_eq!(text_json["media_type"], "text");
+        assert!(text_json.get("mime_type").is_none());
+        assert!(text_json.get("truncated").is_none());
+        let image = Hit {
+            media_type: "image".into(),
+            mime_type: Some("image/png".into()),
+            ..Hit {
+                path: "image.png".into(),
+                title: "image".into(),
+                heading_path: String::new(),
+                snippet: String::new(),
+                score: 1.0,
+                score_rrf: 1.0,
+                score_normalized: 1.0,
+                chunk_id: 2,
+                media_type: String::new(),
+                mime_type: None,
+                media_start: None,
+                media_end: None,
+                media_unit: None,
+                truncated: false,
+            }
+        };
+        assert_eq!(
+            serde_json::to_value(image).unwrap()["mime_type"],
+            "image/png"
+        );
+        let pdf = Hit {
+            media_type: "pdf".into(),
+            mime_type: Some("application/pdf".into()),
+            media_start: Some(0),
+            media_end: Some(6),
+            media_unit: Some("page".into()),
+            truncated: true,
+            ..Hit {
+                path: "paper.pdf".into(),
+                title: "paper".into(),
+                heading_path: String::new(),
+                snippet: String::new(),
+                score: 1.0,
+                score_rrf: 1.0,
+                score_normalized: 1.0,
+                chunk_id: 3,
+                media_type: String::new(),
+                mime_type: None,
+                media_start: None,
+                media_end: None,
+                media_unit: None,
+                truncated: false,
+            }
+        };
+        let pdf_json = serde_json::to_value(pdf).unwrap();
+        assert_eq!(pdf_json["media_start"], 0);
+        assert_eq!(pdf_json["media_end"], 6);
+        assert_eq!(pdf_json["media_unit"], "page");
+        assert_eq!(pdf_json["truncated"], true);
+    }
+
+    #[test]
+    fn vector_only_media_scores_are_unweighted() {
+        assert!(approx(vector_only_media_score(Some(1), 10.0), 1.0));
+        assert!(approx(vector_only_media_score(Some(10), 10.0), 0.55));
+        assert!(approx(
+            normalize_score(Some(1), None, 10.0, 0.55, 0.45),
+            0.55
+        ));
     }
 
     #[test]

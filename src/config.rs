@@ -17,7 +17,10 @@ use std::{
 
 use thiserror::Error;
 
-use crate::embed::registry::{self, EmbedProvider};
+use crate::{
+    embed::registry::{self, EmbedProvider},
+    media::MediaPolicy,
+};
 
 pub use file::{
     CliFile, FileReader, ServerFile, find_cli_config, find_server_config, os_file_reader,
@@ -39,6 +42,8 @@ pub struct Config {
     /// Explicit override for the provider's API base URL (proxy/mock).
     /// Deliberately excluded from the index fingerprint.
     pub embed_base_url: Option<String>,
+    /// Immutable media selection and processing policy. Media is opt-in.
+    pub media_policy: MediaPolicy,
     pub debounce: Duration,
     pub log_format: String,
     pub http_timeout: Duration,
@@ -73,6 +78,7 @@ impl std::fmt::Debug for Config {
             .field("embed_dim", &self.embed_dim)
             .field("embed_api_key", &"[redacted]")
             .field("embed_base_url", &self.embed_base_url)
+            .field("media_policy", &self.media_policy)
             .field("debounce", &self.debounce)
             .field("log_format", &self.log_format)
             .field("http_timeout", &self.http_timeout)
@@ -244,6 +250,21 @@ impl Config {
 
         let (embed_provider, embed_model, embed_dim, embed_api_key) =
             resolve_embed(lookup, &file.embed, &mut errs);
+        let media_policy = match MediaPolicy::new(
+            file.media.enabled,
+            &file.media.include,
+            &file.media.exclude,
+            &file.media.exclude_types,
+            file.media.max_file_mb,
+            file.media.pdf_pages_per_chunk,
+            file.media.pdf_dpi,
+        ) {
+            Ok(policy) => policy,
+            Err(error) => {
+                errs.push(error);
+                MediaPolicy::default()
+            }
+        };
 
         if !errs.is_empty() {
             return Err(ConfigError::Invalid(errs.join("; ")));
@@ -259,6 +280,7 @@ impl Config {
             embed_dim,
             embed_api_key,
             embed_base_url: file.embed.base_url.clone(),
+            media_policy,
             debounce: Duration::from_millis(debounce_ms),
             log_format,
             http_timeout: Duration::from_millis(http_timeout_ms),
@@ -875,6 +897,46 @@ mod tests {
         env.insert("DOCINDEX_DISPLAY_K".into(), "20".into());
         let c = Config::from_lookup(&lookup(&env)).expect("valid");
         assert_eq!(c.display_k, 20.0);
+    }
+
+    #[test]
+    fn media_defaults_preserve_text_only_and_toml_validation_names_errors() {
+        let dir = TempDir::new().unwrap();
+        let env = base_env(&dir);
+        let config = Config::from_lookup(&lookup(&env)).unwrap();
+        assert!(
+            config
+                .media_policy
+                .classify_path(Path::new("note.md"))
+                .is_some()
+        );
+        assert!(
+            config
+                .media_policy
+                .classify_path(Path::new("image.png"))
+                .is_none()
+        );
+
+        let d = dir.path().display();
+        let flags = ConfigFlags {
+            config_path: Some(PathBuf::from("/media.toml")),
+            reembed: false,
+        };
+        for (media, required) in [
+            ("include = [\"[\"]", "media.include \"[\""),
+            ("exclude_types = [\"unknown\"]", "media.exclude_types"),
+        ] {
+            let mut files = HashMap::new();
+            files.insert(PathBuf::from("/media.toml"), file::FileContent {
+                text: format!("vault_dir = \"{d}\"\ndb_path = \"{d}/index.db\"\nlisten = \"100.64.0.1:7777\"\nbearer = \"secret\"\n[embed]\nprovider = \"fake\"\n[media]\n{media}\n"),
+                mode: None,
+            });
+            let reader = file_reader_for(files);
+            let error = Config::load(&empty_lookup(), &reader, &flags)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(required), "{error}");
+        }
     }
 
     // --- TOML layering ---------------------------------------------------

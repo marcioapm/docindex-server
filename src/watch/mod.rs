@@ -23,7 +23,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::walk::is_indexable_extension;
+use crate::media::MediaPolicy;
 
 #[derive(Debug, Error)]
 pub enum WatchError {
@@ -33,7 +33,6 @@ pub enum WatchError {
     Notify(#[from] notify::Error),
 }
 
-const SKIPPED_DIR_SEGMENTS: &[&str] = &[".git", ".obsidian", "node_modules"];
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Watch `vault_dir` recursively and push any indexable path that changes
@@ -44,6 +43,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 pub async fn run(
     vault_dir: PathBuf,
     tx: mpsc::UnboundedSender<PathBuf>,
+    policy: MediaPolicy,
     debounce: Duration,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), WatchError> {
@@ -90,7 +90,7 @@ pub async fn run(
             }
             ev = raw_rx.recv() => {
                 match ev {
-                    Some(ev) => record(&mut pending, &ev, &canonical_vault),
+                    Some(ev) => record(&mut pending, &ev, &canonical_vault, &policy),
                     None => {
                         warn!("notify sender closed; stopping watcher");
                         break;
@@ -105,7 +105,12 @@ pub async fn run(
     Ok(())
 }
 
-fn record(pending: &mut HashMap<PathBuf, Instant>, ev: &notify::Event, root: &Path) {
+fn record(
+    pending: &mut HashMap<PathBuf, Instant>,
+    ev: &notify::Event,
+    root: &Path,
+    policy: &MediaPolicy,
+) {
     match ev.kind {
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {}
         _ => return,
@@ -117,9 +122,6 @@ fn record(pending: &mut HashMap<PathBuf, Instant>, ev: &notify::Event, root: &Pa
         } else {
             root.join(p)
         };
-        if !is_relevant(&abs) {
-            continue;
-        }
         let Some(rel) = strip_vault_prefix(root, &abs) else {
             debug!(
                 path = %abs.display(),
@@ -128,7 +130,18 @@ fn record(pending: &mut HashMap<PathBuf, Instant>, ev: &notify::Event, root: &Pa
             );
             continue;
         };
-        pending.insert(rel, now);
+        let relevant = if matches!(ev.kind, EventKind::Remove(_)) {
+            policy.allows_remove(&rel)
+        } else {
+            std::fs::metadata(&abs)
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .and_then(|metadata| policy.allows_existing_file(&rel, metadata.len()))
+                .is_some()
+        };
+        if relevant {
+            pending.insert(rel, now);
+        }
     }
 }
 
@@ -184,27 +197,9 @@ fn flush(
     }
 }
 
-fn is_relevant(path: &Path) -> bool {
-    // Filter: indexable extensions only, skip dot-files and known noisy dirs.
-    let ext_ok = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(is_indexable_extension)
-        .unwrap_or(false);
-    if !ext_ok {
-        return false;
-    }
-    for comp in path.components() {
-        let s = comp.as_os_str().to_string_lossy();
-        if SKIPPED_DIR_SEGMENTS.iter().any(|d| s == *d) {
-            return false;
-        }
-        // Skip hidden files/dirs (but not the path root if absolute).
-        if s.starts_with('.') && s != "." && s != ".." && !s.contains(':') {
-            return false;
-        }
-    }
-    true
+#[cfg(test)]
+fn is_relevant(path: &Path, policy: &MediaPolicy) -> bool {
+    policy.classify_path(path).is_some()
 }
 
 #[cfg(test)]
@@ -214,17 +209,54 @@ mod tests {
 
     #[test]
     fn relevance_filters() {
-        assert!(is_relevant(&PathBuf::from("/vault/note.md")));
-        assert!(is_relevant(&PathBuf::from("/vault/sub/note.MD")));
-        assert!(is_relevant(&PathBuf::from("/vault/plain.txt")));
-        assert!(is_relevant(&PathBuf::from("/vault/sub/plain.TXT")));
-        assert!(!is_relevant(&PathBuf::from("/vault/draft.rtf")));
-        assert!(!is_relevant(&PathBuf::from("/vault/.hidden.md")));
-        assert!(!is_relevant(&PathBuf::from("/vault/.git/a.md")));
-        assert!(!is_relevant(&PathBuf::from("/vault/node_modules/a.md")));
-        assert!(!is_relevant(&PathBuf::from(
-            "/vault/.obsidian/workspace.md"
-        )));
+        let policy = MediaPolicy::default();
+        assert!(is_relevant(&PathBuf::from("note.md"), &policy));
+        assert!(is_relevant(&PathBuf::from("sub/note.MD"), &policy));
+        assert!(is_relevant(&PathBuf::from("plain.txt"), &policy));
+        assert!(is_relevant(&PathBuf::from("sub/plain.TXT"), &policy));
+        assert!(!is_relevant(&PathBuf::from("draft.rtf"), &policy));
+        assert!(!is_relevant(&PathBuf::from(".hidden.md"), &policy));
+        assert!(!is_relevant(&PathBuf::from(".git/a.md"), &policy));
+        assert!(!is_relevant(&PathBuf::from("node_modules/a.md"), &policy));
+        assert!(!is_relevant(
+            &PathBuf::from(".obsidian/workspace.md"),
+            &policy
+        ));
+    }
+
+    #[test]
+    fn scanner_and_watcher_share_policy_classification() {
+        let policy = MediaPolicy::new(
+            true,
+            &["Attachments/**".into()],
+            &["Attachments/Private/**".into()],
+            &[],
+            20,
+            6,
+            150,
+        )
+        .unwrap();
+        for (path, want) in [
+            ("note.md", true),
+            ("Attachments/image.png", true),
+            ("Attachments/Private/image.png", false),
+            ("Attachments/paper.pdf", true),
+            ("unsupported.bin", false),
+            (".hidden/image.png", false),
+        ] {
+            assert_eq!(is_relevant(Path::new(path), &policy), want, "{path}");
+        }
+    }
+
+    #[test]
+    fn remove_event_for_oversize_media_is_recorded_without_stat() {
+        let root = tempfile::TempDir::new().unwrap();
+        let policy = MediaPolicy::new(true, &[], &[], &[], 1, 6, 150).unwrap();
+        let event = notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File))
+            .add_path(root.path().join("image.png"));
+        let mut pending = HashMap::new();
+        record(&mut pending, &event, root.path(), &policy);
+        assert!(pending.contains_key(&PathBuf::from("image.png")));
     }
 
     #[test]

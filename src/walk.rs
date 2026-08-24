@@ -9,11 +9,12 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use walkdir::WalkDir;
 
-/// One markdown file's snapshot at scan time.
+use crate::media::{MediaPolicy, MediaType};
+
+/// One indexable file's snapshot at scan time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileState {
     /// Path relative to the vault root. Always forward-slash, no leading `/`,
@@ -61,21 +62,13 @@ pub fn is_indexable_extension(ext: &str) -> bool {
         .any(|known| ext.eq_ignore_ascii_case(known))
 }
 
-/// Recursively scan `root` and return one `FileState` per indexable file.
-///
-/// Returned paths are **relative to `root`** (canonicalized). They never
-/// start with `/`, never contain `..`, and are sorted lexicographically for
-/// determinism.
-///
-/// Rules:
-/// * Only files whose extension is in [`INDEXABLE_EXTENSIONS`]
-///   (case-insensitive) are returned.
-/// * Directories named in [`SKIPPED_DIRS`] are skipped, as is any directory
-///   whose name starts with `.`.
-/// * Files whose names start with `.` are skipped.
-/// * Files whose canonicalized path escapes the canonicalized `root`
-///   (e.g. via a symlink pointing outside the vault) are logged and skipped.
+/// Recursively scan `root` using the default text-only policy.
 pub fn scan(root: &Path) -> Result<Vec<FileState>, WalkError> {
+    scan_with_policy(root, &MediaPolicy::default())
+}
+
+/// Recursively scan `root` and return one `FileState` per eligible file.
+pub fn scan_with_policy(root: &Path, policy: &MediaPolicy) -> Result<Vec<FileState>, WalkError> {
     let abs_root = root
         .canonicalize()
         .map_err(|e| WalkError::io(format!("canonicalize({})", root.display()), e))?;
@@ -115,10 +108,6 @@ pub fn scan(root: &Path) -> Result<Vec<FileState>, WalkError> {
             continue;
         }
         let path = entry.path();
-        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if !is_indexable_extension(ext) {
-            continue;
-        }
         let rel = match relativize_inside(&abs_root, path) {
             Some(r) => r,
             None => {
@@ -130,7 +119,20 @@ pub fn scan(root: &Path) -> Result<Vec<FileState>, WalkError> {
                 continue;
             }
         };
-        out.push(hash_file(path, rel)?);
+        let meta = entry
+            .metadata()
+            .map_err(|e| WalkError::Other(format!("metadata({}): {e}", path.display())))?;
+        let Some(media_type) = policy.allows_existing_file(&rel, meta.len()) else {
+            if MediaType::for_extension(path.extension().and_then(|s| s.to_str()).unwrap_or(""))
+                .is_some_and(|t| t != MediaType::Text)
+                && policy.classify_path(&rel).is_some()
+                && meta.len() > policy.max_file_bytes()
+            {
+                tracing::warn!(path = %rel.display(), observed_bytes = meta.len(), max_bytes = policy.max_file_bytes(), "skipping oversize media file");
+            }
+            continue;
+        };
+        out.push(hash_file(path, rel, policy, media_type)?);
     }
 
     out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -154,7 +156,12 @@ fn relativize_inside(canonical_root: &Path, candidate: &Path) -> Option<PathBuf>
     Some(rel.to_path_buf())
 }
 
-fn hash_file(path: &Path, rel_path: PathBuf) -> Result<FileState, WalkError> {
+fn hash_file(
+    path: &Path,
+    rel_path: PathBuf,
+    policy: &MediaPolicy,
+    media_type: MediaType,
+) -> Result<FileState, WalkError> {
     let md = std::fs::metadata(path)
         .map_err(|e| WalkError::io(format!("metadata({})", path.display()), e))?;
     let mtime_ns = md
@@ -165,19 +172,17 @@ fn hash_file(path: &Path, rel_path: PathBuf) -> Result<FileState, WalkError> {
         .unwrap_or(0);
     let bytes =
         std::fs::read(path).map_err(|e| WalkError::io(format!("read({})", path.display()), e))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let digest = hasher.finalize();
     Ok(FileState {
         rel_path,
         mtime_ns,
-        content_hash: hex::encode(digest),
+        content_hash: policy.effective_file_hash(&bytes, media_type),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::fs;
     use tempfile::TempDir;
 
@@ -267,6 +272,20 @@ mod tests {
     fn missing_root_errors() {
         let dir = TempDir::new().unwrap();
         assert!(scan(&dir.path().join("nope")).is_err());
+    }
+
+    #[test]
+    fn scan_skips_oversize_media_under_policy() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "small.md", "text");
+        write(dir.path(), "large.png", &"x".repeat(1_048_577));
+        let policy = MediaPolicy::new(true, &[], &[], &[], 1, 6, 150).unwrap();
+        let paths: Vec<_> = scan_with_policy(dir.path(), &policy)
+            .unwrap()
+            .into_iter()
+            .map(|state| state.rel_path)
+            .collect();
+        assert_eq!(paths, vec![PathBuf::from("small.md")]);
     }
 
     #[test]

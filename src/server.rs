@@ -63,6 +63,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         vault_dir: cfg.vault_dir.clone(),
         embed_model: cfg.embed_model.clone(),
         embed_dim: cfg.embed_dim,
+        media_policy: cfg.media_policy.clone(),
         last_reindex_ms: last_reindex_ms.clone(),
     };
 
@@ -77,9 +78,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         let tx = dirty_tx.clone();
         let vault = cfg.vault_dir.clone();
         let debounce = cfg.debounce;
+        let policy = cfg.media_policy.clone();
         let cancel = shutdown_rx.clone();
         async move {
-            if let Err(e) = watcher::run(vault, tx, debounce, cancel).await {
+            if let Err(e) = watcher::run(vault, tx, policy, debounce, cancel).await {
                 warn!(error = %e, "watcher exited with error");
             }
         }

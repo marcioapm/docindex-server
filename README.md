@@ -60,7 +60,25 @@ model     = "gemini-embedding-001"  # optional; provider default when omitted
 dim       = 3072                    # optional; model native dim when omitted
 api_key   = "..."                   # or api_key_env = "GEMINI_API_KEY"
 base_url  = "https://..."           # optional override (proxy/mock); NOT part of the index fingerprint
+
+[media]
+# Opt-in foundation only: this release selects eligible assets but does not
+# record them as indexed or embed images/PDFs until provider adapters land.
+enabled = false
+include = ["Attachments/**", "Papers/**"]
+exclude = ["**/Private/**", "**/Thumbnails/**"]
+exclude_types = ["audio", "video"] # image | pdf | audio | video
+max_file_mb = 20
+pdf_pages_per_chunk = 6
+pdf_dpi = 150
 ```
+
+### Media foundation
+Media is opt-in and defaults off. This phase provides only selection, metadata, schema, and ranking groundwork; it **does not yet embed images or PDFs**. Eligible media remains pending and is not recorded as indexed until provider support lands in the next commit series, so do not enable media expecting usable image/PDF results today.
+
+When enabled, phase-1 media extensions are images (`png`, `jpg`, `jpeg`, `webp`, `gif`) and PDFs (`pdf`). Text (`md`, `txt`) remains always eligible. Paths are vault-relative and normalized to `/` before matching. An empty `include` admits all supported media; a nonempty `include` admits matching paths only; `exclude` removes matching paths and always wins. `exclude_types` can contain `image`, `pdf`, `audio`, and `video`; audio/video are accepted for forward compatibility but are not scanned in this phase.
+
+`max_file_mb` is an eligibility limit: changing it adds or prunes files at the next startup reconciliation based on their observed size, without changing the effective hash of still-eligible files. The media processing profile used in effective media hashes contains `media-v1`, `max_file_mb`, `pdf_pages_per_chunk`, and `pdf_dpi`; changing any of those settings makes still-eligible media dirty at the next scan. Include/exclude/type changes are eligibility-only and reconcile by add/prune without changing a file hash. Provider/model/dim changes still require `--reembed`.
 
 ### CLI config file (`docindex-search`)
 Search order: `--config <path>` > `$DOCINDEX_CLI_CONFIG` > `~/.config/docindex/cli.toml`.

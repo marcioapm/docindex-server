@@ -64,7 +64,7 @@ def test_schema_created_with_vec0_and_fts5(spawn_server, tmp_path):
         row = conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()
-        assert row is not None and row[0] == "2", f"schema_version={row}"
+        assert row is not None and row[0] == "3", f"schema_version={row}"
 
         shadow = {
             row[0]
