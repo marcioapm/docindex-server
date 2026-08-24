@@ -11,6 +11,7 @@ pub mod cli;
 pub mod config;
 pub mod embed;
 pub mod indexer;
+pub mod media;
 pub mod search;
 pub mod server;
 pub mod store;

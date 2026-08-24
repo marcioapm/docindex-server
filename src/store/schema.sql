@@ -1,4 +1,4 @@
--- schema_version = 2
+-- schema_version = 3
 -- Storage schema for docindex-server. Applied with CREATE IF NOT EXISTS so
 -- repeated opens are idempotent.
 
@@ -12,6 +12,12 @@ CREATE TABLE IF NOT EXISTS chunks (
   content_hash TEXT    NOT NULL,
   mtime_ns     INTEGER NOT NULL,
   tokens       INTEGER,
+  media_type   TEXT    NOT NULL DEFAULT 'text',
+  mime_type    TEXT,
+  media_start  INTEGER,
+  media_end    INTEGER,
+  media_unit   TEXT,
+  truncated    INTEGER NOT NULL DEFAULT 0,
   UNIQUE(path, chunk_idx)
 );
 

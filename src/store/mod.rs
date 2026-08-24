@@ -16,7 +16,7 @@ pub use self::vec::{decode_f32, encode_f32, vec_schema_ddl};
 const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// Current schema version, written to meta on open.
-pub const SCHEMA_VERSION: &str = "2";
+pub const SCHEMA_VERSION: &str = "3";
 
 /// Version tag for the vault-relative-path normalization. Written to
 /// `meta.path_schema_version` after a successful in-place migration; used
@@ -143,11 +143,43 @@ impl Store {
         conn.execute_batch(&full_schema)
             .map_err(|e| StoreError::Msg(format!("apply schema: {e}")))?;
         let s = Self { conn };
-        s.set_meta("schema_version", SCHEMA_VERSION)?;
+        s.migrate_schema()?;
         if !skip_dim_check {
             s.reconcile_embedding_dim(embed_dim)?;
         }
         Ok(s)
+    }
+
+    fn migrate_schema(&self) -> Result<(), StoreError> {
+        let stored = self.get_meta("schema_version")?;
+        match stored.as_deref() {
+            None => self.set_meta("schema_version", SCHEMA_VERSION)?,
+            Some("2") => {
+                let tx = self.conn.unchecked_transaction()?;
+                for column in [
+                    "media_type TEXT NOT NULL DEFAULT 'text'",
+                    "mime_type TEXT",
+                    "media_start INTEGER",
+                    "media_end INTEGER",
+                    "media_unit TEXT",
+                    "truncated INTEGER NOT NULL DEFAULT 0",
+                ] {
+                    tx.execute_batch(&format!("ALTER TABLE chunks ADD COLUMN {column}"))?;
+                }
+                tx.execute(
+                    "INSERT INTO meta(key, value) VALUES ('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![SCHEMA_VERSION],
+                )?;
+                tx.commit()?;
+            }
+            Some(version) if version == SCHEMA_VERSION => {}
+            Some(version) => {
+                return Err(StoreError::Msg(format!(
+                    "schema version {version} is unsupported; this binary supports {SCHEMA_VERSION}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Drop and recreate `chunks_fts` and `chunks_vec`, delete every row of
@@ -283,15 +315,16 @@ impl Store {
     /// `chunks_fts` in sync. Returns the stable `chunks.id` rowid.
     pub fn upsert_chunk(&self, c: &Chunk, path: &str, mtime_ns: i64) -> Result<i64, StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let existing: Option<(i64, String, Option<String>)> = tx
+        let existing: Option<(i64, String, Option<String>, String)> = tx
             .query_row(
-                "SELECT id, content, heading_path FROM chunks WHERE path = ? AND chunk_idx = ?",
+                "SELECT id, content, heading_path, media_type FROM chunks WHERE path = ? AND chunk_idx = ?",
                 params![path, c.idx as i64],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
@@ -300,8 +333,8 @@ impl Store {
         let id = match existing {
             None => {
                 tx.execute(
-                    "INSERT INTO chunks(path, chunk_idx, heading, heading_path, content, content_hash, mtime_ns, tokens)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO chunks(path, chunk_idx, heading, heading_path, content, content_hash, mtime_ns, tokens, media_type, mime_type, media_start, media_end, media_unit, truncated)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         path,
                         c.idx as i64,
@@ -311,37 +344,42 @@ impl Store {
                         c.content_hash,
                         mtime_ns,
                         c.tokens as i64,
+                        c.media_type.as_str(),
+                        c.mime_type,
+                        c.media_start,
+                        c.media_end,
+                        c.media_unit,
+                        c.truncated as i64,
                     ],
                 )?;
                 tx.last_insert_rowid()
             }
-            Some((id, old_content, old_path)) => {
-                // Delete old FTS row before updating chunks, then re-insert.
+            Some((id, old_content, old_path, old_media_type)) => {
+                if old_media_type == "text" {
+                    tx.execute(
+                        "INSERT INTO chunks_fts(chunks_fts, rowid, content, heading_path) VALUES('delete', ?1, ?2, ?3)",
+                        params![id, old_content, old_path.unwrap_or_default()],
+                    )?;
+                }
                 tx.execute(
-                    "INSERT INTO chunks_fts(chunks_fts, rowid, content, heading_path) VALUES('delete', ?1, ?2, ?3)",
-                    params![id, old_content, old_path.unwrap_or_default()],
-                )?;
-                tx.execute(
-                    "UPDATE chunks SET heading=?1, heading_path=?2, content=?3, content_hash=?4, mtime_ns=?5, tokens=?6
-                     WHERE id=?7",
+                    "UPDATE chunks SET heading=?1, heading_path=?2, content=?3, content_hash=?4, mtime_ns=?5, tokens=?6, media_type=?7, mime_type=?8, media_start=?9, media_end=?10, media_unit=?11, truncated=?12
+                     WHERE id=?13",
                     params![
-                        null_if_empty(&c.heading),
-                        null_if_empty(&c.heading_path),
-                        c.content,
-                        c.content_hash,
-                        mtime_ns,
-                        c.tokens as i64,
-                        id,
+                        null_if_empty(&c.heading), null_if_empty(&c.heading_path), c.content,
+                        c.content_hash, mtime_ns, c.tokens as i64, c.media_type.as_str(),
+                        c.mime_type, c.media_start, c.media_end, c.media_unit, c.truncated as i64, id,
                     ],
                 )?;
                 id
             }
         };
 
-        tx.execute(
-            "INSERT INTO chunks_fts(rowid, content, heading_path) VALUES (?1, ?2, ?3)",
-            params![id, c.content, c.heading_path],
-        )?;
+        if c.media_type.as_str() == "text" {
+            tx.execute(
+                "INSERT INTO chunks_fts(rowid, content, heading_path) VALUES (?1, ?2, ?3)",
+                params![id, c.content, c.heading_path],
+            )?;
+        }
         tx.commit()?;
         Ok(id)
     }
@@ -349,14 +387,16 @@ impl Store {
     /// Remove every chunk for `path`, including FTS and vec rows.
     pub fn delete_chunks_for_path(&self, path: &str) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let rows: Vec<(i64, String, Option<String>)> = {
-            let mut stmt =
-                tx.prepare("SELECT id, content, heading_path FROM chunks WHERE path = ?")?;
+        let rows: Vec<(i64, String, Option<String>, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, content, heading_path, media_type FROM chunks WHERE path = ?",
+            )?;
             let mapped = stmt.query_map(params![path], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?;
             let mut v = Vec::new();
@@ -365,11 +405,13 @@ impl Store {
             }
             v
         };
-        for (id, content, heading_path) in &rows {
-            tx.execute(
-                "INSERT INTO chunks_fts(chunks_fts, rowid, content, heading_path) VALUES('delete', ?1, ?2, ?3)",
-                params![id, content, heading_path.clone().unwrap_or_default()],
-            )?;
+        for (id, content, heading_path, media_type) in &rows {
+            if media_type == "text" {
+                tx.execute(
+                    "INSERT INTO chunks_fts(chunks_fts, rowid, content, heading_path) VALUES('delete', ?1, ?2, ?3)",
+                    params![id, content, heading_path.clone().unwrap_or_default()],
+                )?;
+            }
             tx.execute("DELETE FROM chunks_vec WHERE rowid = ?1", params![id])?;
         }
         tx.execute("DELETE FROM chunks WHERE path = ?1", params![path])?;
@@ -561,7 +603,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, path, heading, heading_path, content FROM chunks WHERE id = ?1",
+                "SELECT id, path, heading, heading_path, content, media_type, mime_type, media_start, media_end, media_unit, truncated FROM chunks WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(HitRow {
@@ -570,6 +612,12 @@ impl Store {
                         heading: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                         heading_path: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
                         content: r.get::<_, String>(4)?,
+                        media_type: r.get::<_, String>(5)?,
+                        mime_type: r.get::<_, Option<String>>(6)?,
+                        media_start: r.get::<_, Option<i64>>(7)?,
+                        media_end: r.get::<_, Option<i64>>(8)?,
+                        media_unit: r.get::<_, Option<String>>(9)?,
+                        truncated: r.get::<_, i64>(10)? != 0,
                     })
                 },
             )
@@ -786,6 +834,12 @@ pub struct HitRow {
     pub heading: String,
     pub heading_path: String,
     pub content: String,
+    pub media_type: String,
+    pub mime_type: Option<String>,
+    pub media_start: Option<i64>,
+    pub media_end: Option<i64>,
+    pub media_unit: Option<String>,
+    pub truncated: bool,
 }
 
 /// Upsert the three embedding fingerprint keys inside an open transaction.
@@ -883,7 +937,49 @@ mod tests {
             content: content.to_string(),
             content_hash: hash.to_string(),
             tokens: content.split_whitespace().count(),
+            media_type: crate::media::MediaType::Text,
+            mime_type: None,
+            media_start: None,
+            media_end: None,
+            media_unit: None,
+            truncated: false,
         }
+    }
+
+    #[test]
+    fn migrates_v2_text_rows_additively_and_preserves_fts_search() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v2.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chunks (id INTEGER PRIMARY KEY, path TEXT NOT NULL, chunk_idx INTEGER NOT NULL, heading TEXT, heading_path TEXT, content TEXT NOT NULL, content_hash TEXT NOT NULL, mtime_ns INTEGER NOT NULL, tokens INTEGER, UNIQUE(path, chunk_idx));
+             CREATE VIRTUAL TABLE chunks_fts USING fts5(content, heading_path, content=chunks, content_rowid=id, tokenize='porter unicode61');
+             CREATE TABLE embedding_cache (content_hash TEXT PRIMARY KEY, model TEXT NOT NULL, task_type TEXT NOT NULL, dim INTEGER NOT NULL, embedding BLOB NOT NULL, created_at INTEGER NOT NULL);
+             CREATE TABLE files (path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, mtime_ns INTEGER NOT NULL, indexed_at INTEGER NOT NULL);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);",
+        ).unwrap();
+        conn.execute("INSERT INTO chunks(id, path, chunk_idx, content, content_hash, mtime_ns) VALUES (1, 'note.md', 0, 'legacy searchable token', 'hash', 1)", []).unwrap();
+        conn.execute("INSERT INTO chunks_fts(rowid, content, heading_path) VALUES (1, 'legacy searchable token', '')", []).unwrap();
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', '2')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&path, TEST_DIM).unwrap();
+        assert_eq!(
+            store.get_meta("schema_version").unwrap().as_deref(),
+            Some("3")
+        );
+        let row: (String, Option<String>, Option<i64>, Option<i64>, Option<String>, i64) = store.conn().query_row(
+            "SELECT media_type, mime_type, media_start, media_end, media_unit, truncated FROM chunks WHERE id = 1", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        ).unwrap();
+        assert_eq!(row, ("text".into(), None, None, None, None, 0));
+        assert_eq!(store.search_fts("legacy", 10).unwrap().len(), 1);
+        drop(store);
+        assert!(Store::open(&path, TEST_DIM).is_ok());
     }
 
     #[test]
@@ -911,6 +1007,82 @@ mod tests {
     }
 
     #[test]
+    fn media_chunks_are_vector_only_and_metadata_hydrates() {
+        let (_d, s) = open_temp();
+        let mut image = sample_chunk(0, "image representation", "image-hash");
+        image.media_type = crate::media::MediaType::Image;
+        image.mime_type = Some("image/png".into());
+        let id = s.upsert_chunk(&image, "Attachments/image.png", 1).unwrap();
+        s.set_vector_for_chunk(id, &[0.0; TEST_DIM]).unwrap();
+        let fts_count: i64 = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'representation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_count, 0);
+        let vec_count: i64 = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM chunks_vec WHERE rowid = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vec_count, 1);
+        let hit = s.chunk_for_hit(id).unwrap().unwrap();
+        assert_eq!(hit.media_type, "image");
+        assert_eq!(hit.mime_type.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn text_media_fts_transitions_remove_and_restore_terms() {
+        let (_d, s) = open_temp();
+        let path = "Attachments/item.png";
+        let id = s
+            .upsert_chunk(&sample_chunk(0, "text_only_token", "text"), path, 1)
+            .unwrap();
+        let mut image = sample_chunk(0, "image_only_token", "image");
+        image.media_type = crate::media::MediaType::Image;
+        image.mime_type = Some("image/png".into());
+        assert_eq!(s.upsert_chunk(&image, path, 2).unwrap(), id);
+        let text_hits: i64 = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'text_only_token'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let image_hits: i64 = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'image_only_token'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(text_hits, 0);
+        assert_eq!(image_hits, 0);
+        assert_eq!(
+            s.upsert_chunk(&sample_chunk(0, "restored_text_token", "restored"), path, 3)
+                .unwrap(),
+            id
+        );
+        let restored_hits: i64 = s
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'restored_text_token'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_hits, 1);
+    }
+
+    #[test]
     fn upsert_chunk_inserts_and_indexes_fts() {
         let (_d, s) = open_temp();
         let c = Chunk {
@@ -920,6 +1092,12 @@ mod tests {
             content: "# T\nhello world".into(),
             content_hash: "hash1".into(),
             tokens: 3,
+            media_type: crate::media::MediaType::Text,
+            mime_type: None,
+            media_start: None,
+            media_end: None,
+            media_unit: None,
+            truncated: false,
         };
         let id = s.upsert_chunk(&c, "/vault/a.md", 42).unwrap();
         assert!(id > 0);
@@ -1180,6 +1358,12 @@ mod tests {
             content: content.to_string(),
             content_hash: format!("hash-{abs_path}"),
             tokens: content.split_whitespace().count(),
+            media_type: crate::media::MediaType::Text,
+            mime_type: None,
+            media_start: None,
+            media_end: None,
+            media_unit: None,
+            truncated: false,
         };
         let id = store.upsert_chunk(&c, abs_path, 100).unwrap();
         store

@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     chunk::{self, Chunk},
     embed::{AnyEmbedder, EmbedError, TASK_RETRIEVAL_DOCUMENT},
+    media::{MediaPolicy, MediaType},
     store::{Store, StoreError},
     walk,
 };
@@ -49,6 +50,7 @@ pub struct IndexerCtx {
     pub vault_dir: PathBuf,
     pub embed_model: String,
     pub embed_dim: usize,
+    pub media_policy: MediaPolicy,
     pub last_reindex_ms: Arc<AtomicI64>,
 }
 
@@ -83,7 +85,9 @@ pub async fn initial_scan(
     tx: &mpsc::UnboundedSender<PathBuf>,
 ) -> Result<(usize, usize, usize), IndexerError> {
     let vault = ctx.vault_dir.clone();
-    let files = tokio::task::spawn_blocking(move || walk::scan(&vault)).await??;
+    let policy = ctx.media_policy.clone();
+    let files =
+        tokio::task::spawn_blocking(move || walk::scan_with_policy(&vault, &policy)).await??;
 
     let known: HashMap<String, String> = {
         let store = ctx.store.clone();
@@ -192,13 +196,32 @@ async fn reindex_one(ctx: &IndexerCtx, rel_path: &Path) -> Result<(), IndexerErr
         return Ok(());
     }
     let path_str = rel_path.to_string_lossy().into_owned();
+    let Some(media_type) = ctx.media_policy.allows_existing_file(rel_path, meta.len()) else {
+        let store = ctx.store.clone();
+        let p = path_str.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), IndexerError> {
+            let guard = store
+                .lock()
+                .map_err(|e| IndexerError::Msg(format!("store lock: {e}")))?;
+            guard.delete_chunks_for_path(&p)?;
+            guard.delete_file_state(&p)?;
+            Ok(())
+        })
+        .await??;
+        return Ok(());
+    };
+    if media_type != MediaType::Text {
+        // Without a provider adapter there are no chunks or vectors to commit.
+        // Preserve any pre-existing media rows; `files` state is written only
+        // after a complete index update, so this path stays dirty for adapters.
+        return Ok(());
+    }
     let mtime_ns = meta
         .modified()
         .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i64)
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i64)
         .unwrap_or(0);
-
     let bytes = std::fs::read(&abs_path)?;
     let file_hash = {
         let mut h = Sha256::new();
@@ -394,8 +417,35 @@ mod tests {
             vault_dir: dir.join("vault"),
             embed_model: "test".into(),
             embed_dim: DIM,
+            media_policy: MediaPolicy::default(),
             last_reindex_ms: Arc::new(AtomicI64::new(0)),
         }
+    }
+
+    #[tokio::test]
+    async fn foundation_media_remains_dirty_without_marking_file_state() {
+        let dir = TempDir::new().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("image.png"), b"not decoded in foundation").unwrap();
+        std::fs::write(vault.join("note.md"), b"# Note\n\ntext\n").unwrap();
+        let mut ctx = mk_ctx(dir.path());
+        ctx.media_policy = MediaPolicy::new(true, &[], &[], &[], 20, 6, 150).unwrap();
+
+        reindex_one(&ctx, Path::new("image.png")).await.unwrap();
+        reindex_one(&ctx, Path::new("note.md")).await.unwrap();
+        {
+            let store = ctx.store.lock().unwrap();
+            assert!(store.get_file_state("image.png").unwrap().is_none());
+            assert!(store.get_file_state("note.md").unwrap().is_some());
+            assert!(store.count_chunks().unwrap() >= 1);
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_, dirty, _) = initial_scan(&ctx, &tx).await.unwrap();
+        assert_eq!(dirty, 1, "only unindexed media should remain dirty");
+        assert_eq!(rx.try_recv().unwrap(), PathBuf::from("image.png"));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -19,6 +19,8 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::media::MediaType;
+
 /// One indexable fragment of a markdown document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
@@ -28,6 +30,12 @@ pub struct Chunk {
     pub content: String,
     pub content_hash: String,
     pub tokens: usize,
+    pub media_type: MediaType,
+    pub mime_type: Option<String>,
+    pub media_start: Option<i64>,
+    pub media_end: Option<i64>,
+    pub media_unit: Option<String>,
+    pub truncated: bool,
 }
 
 /// Default fallback cap. Whitespace-separated words are used as a token
@@ -220,6 +228,12 @@ fn make_chunk(idx: usize, heading: &str, heading_path: &str, content: String) ->
         content_hash: hex::encode(hasher.finalize()),
         content,
         tokens,
+        media_type: MediaType::Text,
+        mime_type: None,
+        media_start: None,
+        media_end: None,
+        media_unit: None,
+        truncated: false,
     }
 }
 

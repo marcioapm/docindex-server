@@ -57,6 +57,12 @@ mod tests {
             score_rrf: 0.79,
             score_normalized: 0.79,
             chunk_id: 42,
+            media_type: "text".into(),
+            mime_type: None,
+            media_start: None,
+            media_end: None,
+            media_unit: None,
+            truncated: false,
         }
     }
 

@@ -73,6 +73,51 @@ pub struct ServerFile {
     pub allow_loopback: Option<bool>,
     #[serde(default)]
     pub embed: EmbedFile,
+    #[serde(default)]
+    pub media: MediaFile,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaFile {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default)]
+    pub exclude_types: Vec<String>,
+    #[serde(default = "default_max_file_mb")]
+    pub max_file_mb: u64,
+    #[serde(default = "default_pdf_pages_per_chunk")]
+    pub pdf_pages_per_chunk: u8,
+    #[serde(default = "default_pdf_dpi")]
+    pub pdf_dpi: u16,
+}
+
+impl Default for MediaFile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            exclude_types: Vec::new(),
+            max_file_mb: default_max_file_mb(),
+            pdf_pages_per_chunk: default_pdf_pages_per_chunk(),
+            pdf_dpi: default_pdf_dpi(),
+        }
+    }
+}
+
+const fn default_max_file_mb() -> u64 {
+    20
+}
+const fn default_pdf_pages_per_chunk() -> u8 {
+    6
+}
+const fn default_pdf_dpi() -> u16 {
+    150
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
