@@ -285,6 +285,26 @@ def test_startup_scan_indexes_image_and_pdf_into_vectors(
         # Querying via MATCH 'sphinx' would be vacuous because media chunks
         # store empty content and could never match any term even if they were
         # erroneously inserted; docsize membership is the only reliable check.
+        #
+        # Precondition: verify the shadow table is present and readable.  If
+        # fts5 internals ever change and the table vanishes or is renamed, this
+        # assertion will fail loudly rather than silently turning into a no-op.
+        conn2 = sqlite3.connect(str(db))
+        try:
+            shadow_accessible = conn2.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' AND name='chunks_fts_docsize'"
+            ).fetchone()[0]
+            assert shadow_accessible == 1, (
+                "chunks_fts_docsize shadow table is missing; the FTS membership "
+                "check below would be a no-op.  Either fts5 internals changed or "
+                "the FTS table was not created correctly."
+            )
+            # Smoke-read the shadow table to confirm it is actually readable.
+            conn2.execute("SELECT COUNT(*) FROM chunks_fts_docsize").fetchone()
+        finally:
+            conn2.close()
+
         conn2 = sqlite3.connect(str(db))
         text_ids = set(
             r[0]
