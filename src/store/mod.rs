@@ -601,38 +601,67 @@ impl Store {
         Ok(out)
     }
 
-    /// All media chunk rowids by cosine distance to `query`.
+    /// Top-`k` media chunk rowids by cosine distance to `query` (ascending
+    /// distance). Streams every `(rowid, embedding)` pair from `chunks_vec`
+    /// joined to `chunks` on the media-type predicate and retains only the
+    /// best `k` results in a bounded max-heap — no `IN (…)` with unbounded
+    /// placeholders, no materialisation of all vectors.
     ///
-    /// sqlite-vec applies its `k` limit before rows can be constrained by a
-    /// joined `chunks.media_type` predicate. Fetch every vector candidate,
-    /// then filter the ordered result against `chunks` here in the Store. The
-    /// returned order is therefore dense over media only: its first item is
-    /// media rank 1, not the item's rank among text and media combined.
-    pub fn search_media_vec(&self, query: &[f32]) -> Result<Vec<(i64, f32)>, StoreError> {
-        let count = self.count_chunks()?;
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        let all_candidates = self.search_vec(query, count as usize)?;
-        if all_candidates.is_empty() {
+    /// The returned order is dense over media only: rank-1 is the closest
+    /// media chunk, regardless of where it would rank among all chunk types.
+    pub fn search_media_vec(&self, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>, StoreError> {
+        use std::collections::BinaryHeap;
+
+        if k == 0 {
             return Ok(Vec::new());
         }
 
-        let ids = all_candidates.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        let placeholders = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql =
-            format!("SELECT id FROM chunks WHERE media_type <> 'text' AND id IN ({placeholders})");
-        let mut stmt = self.conn.prepare(&sql)?;
-        let media_ids = stmt
-            .query_map(rusqlite::params_from_iter(ids), |r| r.get::<_, i64>(0))?
-            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        // Stream media vectors via a join; never materialise all rows or ids.
+        let mut stmt = self.conn.prepare(
+            "SELECT v.rowid, v.embedding \
+             FROM chunks_vec v \
+             JOIN chunks c ON c.id = v.rowid \
+             WHERE c.media_type != 'text'",
+        )?;
 
-        Ok(all_candidates
+        // Max-heap keyed by (dist_bits, rowid): the root holds the entry with
+        // the LARGEST distance, so when the heap is full we can evict the
+        // worst candidate to make room for a closer one. IEEE 754 positive
+        // floats sort correctly by their bit representation; cosine distance
+        // is always ≥ 0, so this encoding is safe.
+        //
+        // Tie-break: larger rowid sorts higher, so on eviction we remove the
+        // entry with the largest rowid among equally-distant candidates,
+        // keeping results deterministic regardless of scan order.
+        let mut heap: BinaryHeap<(u32, i64)> = BinaryHeap::with_capacity(k + 1);
+
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let embedding =
+                decode_f32(&blob).map_err(|e| StoreError::Msg(format!("decode vec: {e}")))?;
+            let dist = cosine_distance(query, &embedding);
+            let dist_bits = dist.to_bits();
+
+            if heap.len() < k {
+                heap.push((dist_bits, rowid));
+            } else if let Some(&(top_bits, _)) = heap.peek()
+                && dist_bits < top_bits
+            {
+                // New entry is closer than the current worst; replace it.
+                heap.pop();
+                heap.push((dist_bits, rowid));
+            }
+        }
+
+        let mut results: Vec<(i64, f32)> = heap
             .into_iter()
-            .filter(|(id, _)| media_ids.contains(id))
-            .collect())
+            .map(|(bits, id)| (id, f32::from_bits(bits)))
+            .collect();
+        // Sort ascending by distance, then ascending by rowid for determinism.
+        results.sort_by(|(id_a, d_a), (id_b, d_b)| d_a.total_cmp(d_b).then(id_a.cmp(id_b)));
+        Ok(results)
     }
 
     /// Top-`k` chunk rowids by BM25 over `chunks_fts` for the raw FTS5
@@ -1093,6 +1122,16 @@ fn set_file_state_in_tx(
     Ok(())
 }
 
+/// Cosine distance matching the `distance_metric=cosine` semantics of
+/// `sqlite-vec`'s `vec0` table: `1.0 - dot(a, b)` for unit vectors, with
+/// the result clamped to `[0.0, 2.0]`. For the Fake embedder and most real
+/// providers, embeddings are L2-normalised, so this is numerically equivalent
+/// to the kNN distance sqlite-vec computes internally.
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    (1.0 - dot).clamp(0.0, 2.0)
+}
+
 fn null_if_empty(s: &str) -> Option<&str> {
     if s.is_empty() { None } else { Some(s) }
 }
@@ -1285,11 +1324,202 @@ mod tests {
             .unwrap();
 
         let hits = s
-            .search_media_vec(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .search_media_vec(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 10)
             .unwrap();
         assert_eq!(
             hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![image_id, pdf_id]
+        );
+    }
+
+    /// Confirm that `search_media_vec` with a cap of `k` returns exactly the
+    /// `k` closest media chunks even when rows arrive in ascending-distance
+    /// order (rowid order = rank order).
+    #[test]
+    fn search_media_vec_top_k_is_bounded_and_ordered() {
+        // Use a small cap to prove the heap evicts distant entries.
+        const CAP: usize = 2;
+        let (_d, s) = open_temp();
+
+        // Insert one text chunk (must be excluded) and four media chunks with
+        // known, distinct distances to the query vector [1,0,0,0,0,0,0,0].
+        let text_id = s
+            .upsert_chunk(&sample_chunk(0, "text", "tx"), "t.md", 1)
+            .unwrap();
+        s.set_vector_for_chunk(text_id, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        // Build four media chunks. The normalised embeddings give distances
+        // (cosine) of exactly 0.0, 0.05, 0.5, and 1.0 for a [1,0,…] query.
+        // rank order: id_a (dist≈0) < id_b (dist≈0.05) < id_c (dist≈0.5) < id_d (dist=1.0)
+        let make_image = |content: &str, hash: &str| {
+            let mut c = sample_chunk(0, content, hash);
+            c.media_type = crate::media::MediaType::Image;
+            c
+        };
+
+        let id_a = s.upsert_chunk(&make_image("a", "ha"), "a.png", 1).unwrap();
+        let id_b = s.upsert_chunk(&make_image("b", "hb"), "b.png", 1).unwrap();
+        let id_c = s.upsert_chunk(&make_image("c", "hc"), "c.png", 1).unwrap();
+        let id_d = s.upsert_chunk(&make_image("d", "hd"), "d.png", 1).unwrap();
+
+        // Embeddings (pre-normalised unit vectors so cosine distance = 1 - dot):
+        // a → dist ≈ 0.0  (closest to query)
+        // b → dist ≈ 0.05 (slightly off-axis)
+        // c → dist = 0.5  (orthogonal components)
+        // d → dist = 1.0  (opposite direction — furthest)
+        s.set_vector_for_chunk(id_a, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        // Approximate unit vector close to [1,0,…].
+        let near = {
+            let x: f32 = (0.95f32).sqrt();
+            let y: f32 = (0.05f32).sqrt();
+            [x, y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        };
+        s.set_vector_for_chunk(id_b, &near).unwrap();
+        s.set_vector_for_chunk(id_c, &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        s.set_vector_for_chunk(id_d, &[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let hits = s.search_media_vec(&query, CAP).unwrap();
+
+        // Exactly CAP results returned — not all four media chunks.
+        assert_eq!(
+            hits.len(),
+            CAP,
+            "expected exactly {CAP} hits, got {}",
+            hits.len()
+        );
+
+        // The two returned ids must be the two closest: id_a and id_b.
+        let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![id_a, id_b], "top-2 must be id_a then id_b");
+
+        // Distances must be non-decreasing (ascending sort).
+        assert!(
+            hits[0].1 <= hits[1].1,
+            "hits must be ordered ascending by distance: {:?}",
+            hits
+        );
+
+        // Text chunk must never appear in the result.
+        assert!(
+            hits.iter().all(|(id, _)| *id != text_id),
+            "text chunk must be excluded from media search results"
+        );
+    }
+
+    /// Same correctness check as above but with chunks inserted in REVERSE
+    /// distance order (furthest rowid first, closest rowid last). The table
+    /// scan returns rows in rowid order, so the heap sees distances
+    /// [1.0, 0.5, ≈0.05, ≈0.0] — furthest first, closest last.
+    ///
+    /// A min-heap (the original broken implementation) would evict the two
+    /// closest entries as they arrive, leaving the two furthest in the result.
+    /// A correct max-heap must still return the two closest.
+    #[test]
+    fn search_media_vec_top_k_correct_when_furthest_inserted_first() {
+        const CAP: usize = 2;
+        let (_d, s) = open_temp();
+
+        let make_image = |content: &str, hash: &str| {
+            let mut c = sample_chunk(0, content, hash);
+            c.media_type = crate::media::MediaType::Image;
+            c
+        };
+
+        // Insert in DESCENDING distance order so rowid order = furthest first.
+        // id_far1 is farthest (dist=1.0), id_far2 is next (dist=0.5),
+        // id_near2 is close (dist≈0.05), id_near1 is closest (dist≈0.0).
+        let id_far1 = s
+            .upsert_chunk(&make_image("far1", "hfar1"), "far1.png", 1)
+            .unwrap();
+        let id_far2 = s
+            .upsert_chunk(&make_image("far2", "hfar2"), "far2.png", 1)
+            .unwrap();
+        let id_near2 = s
+            .upsert_chunk(&make_image("near2", "hnear2"), "near2.png", 1)
+            .unwrap();
+        let id_near1 = s
+            .upsert_chunk(&make_image("near1", "hnear1"), "near1.png", 1)
+            .unwrap();
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        // Assign embeddings: further from query = higher rowid.
+        s.set_vector_for_chunk(id_far1, &[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap(); // dist = 1.0
+        s.set_vector_for_chunk(id_far2, &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap(); // dist = 0.5
+        let near2_vec = {
+            let x: f32 = (0.95f32).sqrt();
+            let y: f32 = (0.05f32).sqrt();
+            [x, y, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        };
+        s.set_vector_for_chunk(id_near2, &near2_vec).unwrap(); // dist ≈ 0.05
+        s.set_vector_for_chunk(id_near1, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap(); // dist ≈ 0.0
+
+        let hits = s.search_media_vec(&query, CAP).unwrap();
+
+        assert_eq!(
+            hits.len(),
+            CAP,
+            "expected exactly {CAP} hits, got {}",
+            hits.len()
+        );
+
+        // Must return the two CLOSEST (id_near1 and id_near2), not the two furthest.
+        let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![id_near1, id_near2],
+            "top-2 must be the two closest chunks regardless of insertion order; \
+             a min-heap bug returns the two furthest instead: got {ids:?}"
+        );
+
+        assert!(
+            hits[0].1 <= hits[1].1,
+            "result must be sorted ascending by distance: {:?}",
+            hits
+        );
+    }
+
+    /// Inserting many media chunks (more than SQLITE_MAX_VARIABLE_NUMBER, which
+    /// is typically 999) must not fail with a "too many SQL variables" error.
+    /// The old `IN (…)` implementation would blow up here.
+    #[test]
+    fn search_media_vec_handles_many_media_chunks_without_variable_overflow() {
+        let (_d, s) = open_temp();
+        const N: usize = 1_100; // exceeds the default SQLITE_MAX_VARIABLE_NUMBER (999)
+
+        let make_image = |idx: usize| {
+            let mut c = sample_chunk(idx, "img content", &format!("h{idx}"));
+            c.media_type = crate::media::MediaType::Image;
+            c
+        };
+
+        for i in 0..N {
+            let id = s
+                .upsert_chunk(&make_image(i), &format!("img{i}.png"), 1)
+                .unwrap();
+            // Use a simple unit vector (dimension 0 = 1/(sqrt(8)), rest zero).
+            let mut v = [0.0f32; TEST_DIM];
+            v[i % TEST_DIM] = 1.0;
+            s.set_vector_for_chunk(id, &v).unwrap();
+        }
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        // Must succeed without panicking or returning a SQLite error.
+        let hits = s
+            .search_media_vec(&query, 10)
+            .expect("search must succeed with many media chunks");
+        // The cap must be respected.
+        assert!(
+            hits.len() <= 10,
+            "result count must not exceed the requested cap"
         );
     }
 
@@ -1568,6 +1798,81 @@ mod tests {
         );
         assert_eq!(s.search_fts("prior", 10).unwrap().len(), 1);
         assert_eq!(s.search_fts("new", 10).unwrap().len(), 0);
+    }
+
+    /// A failure inside `put_embedding_cache_in_tx` (after vectors are
+    /// written but before `set_file_state_in_tx`) must roll back the whole
+    /// transaction: old file state, old chunk, and old vector must all be
+    /// preserved, and the new cache entry must not appear.
+    #[test]
+    fn replace_file_rolls_back_when_cache_insert_fails() {
+        let (_d, s) = open_temp();
+        let old_chunks = vec![sample_chunk(0, "prior searchable token", "old-chunk-hash")];
+        let old_embeddings = vec![vec![0.5; TEST_DIM]];
+        s.replace_file(FileReplacement {
+            path: "note.md",
+            content_hash: "old-file-hash",
+            mtime_ns: 1,
+            chunks: &old_chunks,
+            embeddings: &old_embeddings,
+            cache_entries: &[],
+        })
+        .unwrap();
+        let (old_id, _) = s.chunks_for_path("note.md").unwrap().pop().unwrap();
+
+        // Install a trigger that aborts any INSERT into embedding_cache.
+        // This fires after the vector INSERT succeeds but before file state
+        // is written, exercising the cache-insert failure rollback path.
+        s.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_cache_insert BEFORE INSERT ON embedding_cache
+                 BEGIN SELECT RAISE(ABORT, 'forced cache insert failure'); END;",
+            )
+            .unwrap();
+
+        let new_chunks = vec![sample_chunk(0, "new searchable token", "new-chunk-hash")];
+        let new_embeddings = vec![vec![0.75; TEST_DIM]];
+        let cache_entries = [PreparedEmbeddingCacheEntry {
+            content_hash: "new-chunk-hash",
+            model: "test-model",
+            task_type: "RETRIEVAL_DOCUMENT",
+            dim: TEST_DIM,
+            embedding: &new_embeddings[0],
+        }];
+        let err = s
+            .replace_file(FileReplacement {
+                path: "note.md",
+                content_hash: "new-file-hash",
+                mtime_ns: 2,
+                chunks: &new_chunks,
+                embeddings: &new_embeddings,
+                cache_entries: &cache_entries,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "unexpected error: {err}"
+        );
+
+        // All prior state must be intact.
+        assert_eq!(
+            s.get_file_state("note.md").unwrap(),
+            Some(("old-file-hash".into(), 1))
+        );
+        assert_eq!(
+            s.chunks_for_path("note.md").unwrap(),
+            vec![(old_id, "prior searchable token".into())]
+        );
+        assert_eq!(
+            s.vectors_for_chunks(&[old_id]).unwrap(),
+            vec![(old_id, old_embeddings[0].clone())]
+        );
+        assert_eq!(s.search_fts("prior", 10).unwrap().len(), 1);
+        // The new cache entry must NOT have been committed.
+        assert!(
+            s.get_embedding_cache("new-chunk-hash").unwrap().is_none(),
+            "cache entry must not be present after rollback"
+        );
     }
 
     #[test]

@@ -368,7 +368,7 @@ async fn run_media_candidate_query(
         let guard = store
             .lock()
             .map_err(|e| SearchError::Msg(format!("store lock: {e}")))?;
-        Ok(guard.search_media_vec(&q_vec)?)
+        Ok(guard.search_media_vec(&q_vec, CANDIDATE_K)?)
     })
     .await?
 }
