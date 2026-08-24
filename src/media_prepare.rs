@@ -760,11 +760,13 @@ mod tests {
             &format!("2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {n} >>\nendobj\n"),
         );
         // Page objects 3..n+2
-        for _ in 0..n {
+        for i in 3..=(n + 2) {
             push_obj(
                 &mut body,
                 &mut offsets,
-                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+                &format!(
+                    "{i} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n"
+                ),
             );
         }
 
