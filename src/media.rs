@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 pub const MEDIA_PROTOCOL_VERSION: &str = "media-v1";
 const DEFAULT_MAX_FILE_MB: u64 = 20;
-const DEFAULT_PDF_PAGES_PER_CHUNK: u8 = 6;
+const DEFAULT_PDF_PAGES_PER_CHUNK: u8 = 1;
 const DEFAULT_PDF_DPI: u16 = 150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +134,10 @@ impl MediaPolicy {
             pdf_pages_per_chunk,
             pdf_dpi,
         })
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     pub fn classify_path(&self, relative: &Path) -> Option<MediaType> {

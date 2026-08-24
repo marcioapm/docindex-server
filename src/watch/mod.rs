@@ -136,8 +136,7 @@ fn record(
             std::fs::metadata(&abs)
                 .ok()
                 .filter(|metadata| metadata.is_file())
-                .and_then(|metadata| policy.allows_existing_file(&rel, metadata.len()))
-                .is_some()
+                .is_some_and(|_| policy.classify_path(&rel).is_some())
         };
         if relevant {
             pending.insert(rel, now);

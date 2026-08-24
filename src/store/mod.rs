@@ -33,6 +33,8 @@ pub enum StoreError {
     VecExtension(String),
     #[error("store: embedding_cache row dim mismatch: got {got}, want {want}")]
     CacheDimMismatch { got: usize, want: usize },
+    #[error("store: replace file has {chunks} chunks but {embeddings} embeddings")]
+    ReplaceEmbeddingCount { chunks: usize, embeddings: usize },
     #[error(
         "store: embedding_dim on disk is {stored}, config says {config} — run with --reembed to reindex at the new dim, or delete the index DB as a fallback."
     )]
@@ -311,6 +313,43 @@ impl Store {
         &self.conn
     }
 
+    /// Atomically replace every indexed row for one file. This includes old
+    /// chunks, FTS rows, vectors, prepared embedding-cache entries, and the
+    /// file-state bookkeeping row. If any statement fails, the prior file
+    /// index remains intact.
+    pub fn replace_file(&self, replacement: FileReplacement<'_>) -> Result<(), StoreError> {
+        if replacement.chunks.len() != replacement.embeddings.len() {
+            return Err(StoreError::ReplaceEmbeddingCount {
+                chunks: replacement.chunks.len(),
+                embeddings: replacement.embeddings.len(),
+            });
+        }
+        for entry in replacement.cache_entries {
+            validate_cache_entry(entry)?;
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        delete_chunks_for_path_in_tx(&tx, replacement.path)?;
+        for (chunk, embedding) in replacement.chunks.iter().zip(replacement.embeddings) {
+            let id = insert_chunk_in_tx(&tx, chunk, replacement.path, replacement.mtime_ns)?;
+            tx.execute(
+                "INSERT INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)",
+                params![id, encode_f32(embedding)],
+            )?;
+        }
+        for entry in replacement.cache_entries {
+            put_embedding_cache_in_tx(&tx, entry)?;
+        }
+        set_file_state_in_tx(
+            &tx,
+            replacement.path,
+            replacement.content_hash,
+            replacement.mtime_ns,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Insert or update the chunk at (`path`, `chunk.idx`) and keep
     /// `chunks_fts` in sync. Returns the stable `chunks.id` rowid.
     pub fn upsert_chunk(&self, c: &Chunk, path: &str, mtime_ns: i64) -> Result<i64, StoreError> {
@@ -387,34 +426,17 @@ impl Store {
     /// Remove every chunk for `path`, including FTS and vec rows.
     pub fn delete_chunks_for_path(&self, path: &str) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        let rows: Vec<(i64, String, Option<String>, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT id, content, heading_path, media_type FROM chunks WHERE path = ?",
-            )?;
-            let mapped = stmt.query_map(params![path], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
-            let mut v = Vec::new();
-            for r in mapped {
-                v.push(r?);
-            }
-            v
-        };
-        for (id, content, heading_path, media_type) in &rows {
-            if media_type == "text" {
-                tx.execute(
-                    "INSERT INTO chunks_fts(chunks_fts, rowid, content, heading_path) VALUES('delete', ?1, ?2, ?3)",
-                    params![id, content, heading_path.clone().unwrap_or_default()],
-                )?;
-            }
-            tx.execute("DELETE FROM chunks_vec WHERE rowid = ?1", params![id])?;
-        }
-        tx.execute("DELETE FROM chunks WHERE path = ?1", params![path])?;
+        delete_chunks_for_path_in_tx(&tx, path)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically remove every indexed representation and bookkeeping state
+    /// for `path`. If any deletion fails, all prior rows remain intact.
+    pub fn remove_file(&self, path: &str) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        delete_chunks_for_path_in_tx(&tx, path)?;
+        tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
         tx.commit()?;
         Ok(())
     }
@@ -579,6 +601,40 @@ impl Store {
         Ok(out)
     }
 
+    /// All media chunk rowids by cosine distance to `query`.
+    ///
+    /// sqlite-vec applies its `k` limit before rows can be constrained by a
+    /// joined `chunks.media_type` predicate. Fetch every vector candidate,
+    /// then filter the ordered result against `chunks` here in the Store. The
+    /// returned order is therefore dense over media only: its first item is
+    /// media rank 1, not the item's rank among text and media combined.
+    pub fn search_media_vec(&self, query: &[f32]) -> Result<Vec<(i64, f32)>, StoreError> {
+        let count = self.count_chunks()?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let all_candidates = self.search_vec(query, count as usize)?;
+        if all_candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids = all_candidates.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql =
+            format!("SELECT id FROM chunks WHERE media_type <> 'text' AND id IN ({placeholders})");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let media_ids = stmt
+            .query_map(rusqlite::params_from_iter(ids), |r| r.get::<_, i64>(0))?
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+
+        Ok(all_candidates
+            .into_iter()
+            .filter(|(id, _)| media_ids.contains(id))
+            .collect())
+    }
+
     /// Top-`k` chunk rowids by BM25 over `chunks_fts` for the raw FTS5
     /// query string (ascending bm25 score — smaller is better per FTS5).
     pub fn search_fts(&self, query: &str, k: usize) -> Result<Vec<(i64, f64)>, StoreError> {
@@ -624,14 +680,34 @@ impl Store {
             .optional()?)
     }
 
-    /// All chunks for `path` (id, content). Used by /similar to build a
-    /// pseudo-query from the bag-of-words + average of stored vectors.
+    /// All chunks for `path` (id, content). Used by callers that need the
+    /// stored content without media metadata.
     pub fn chunks_for_path(&self, path: &str) -> Result<Vec<(i64, String)>, StoreError> {
         let mut stmt = self
             .conn
             .prepare("SELECT id, content FROM chunks WHERE path = ?1 ORDER BY chunk_idx")?;
         let rows = stmt.query_map(params![path], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// All chunks for `path` with media metadata. Used by /similar to restrict
+    /// its lexical bag to text chunks while retaining all vectors.
+    pub fn chunks_for_similar(&self, path: &str) -> Result<Vec<PathChunkRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, content, media_type FROM chunks WHERE path = ?1 ORDER BY chunk_idx",
+        )?;
+        let rows = stmt.query_map(params![path], |r| {
+            Ok(PathChunkRow {
+                id: r.get(0)?,
+                content: r.get(1)?,
+                media_type: r.get(2)?,
+            })
         })?;
         let mut out = Vec::new();
         for r in rows {
@@ -769,6 +845,29 @@ impl Store {
     }
 }
 
+/// All data needed to atomically replace one file's indexed representation.
+/// Embeddings must be ordered to match `chunks`; `cache_entries` can contain
+/// newly resolved document embeddings to persist with the replacement.
+#[derive(Debug, Clone, Copy)]
+pub struct FileReplacement<'a> {
+    pub path: &'a str,
+    pub content_hash: &'a str,
+    pub mtime_ns: i64,
+    pub chunks: &'a [Chunk],
+    pub embeddings: &'a [Vec<f32>],
+    pub cache_entries: &'a [PreparedEmbeddingCacheEntry<'a>],
+}
+
+/// A validated-at-commit embedding-cache write prepared by an indexer.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedEmbeddingCacheEntry<'a> {
+    pub content_hash: &'a str,
+    pub model: &'a str,
+    pub task_type: &'a str,
+    pub dim: usize,
+    pub embedding: &'a [f32],
+}
+
 /// Summary of a `migrate_paths_to_relative` call. Exposed so the caller (and
 /// tests) can distinguish a no-op from a real rewrite from a refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -825,6 +924,15 @@ impl FingerprintOutcome {
     }
 }
 
+/// One stored chunk used by /similar to form a vector mean and a text-only
+/// lexical bag.
+#[derive(Debug, Clone)]
+pub struct PathChunkRow {
+    pub id: i64,
+    pub content: String,
+    pub media_type: String,
+}
+
 /// Minimal row projection used to hydrate a search hit. Kept in the store
 /// module so SQL column order stays colocated with the schema.
 #[derive(Debug, Clone)]
@@ -863,6 +971,125 @@ fn write_fingerprint_in_tx(
             params![key, val],
         )?;
     }
+    Ok(())
+}
+
+fn delete_chunks_for_path_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+) -> Result<(), StoreError> {
+    let rows: Vec<(i64, String, Option<String>, String)> = {
+        let mut stmt =
+            tx.prepare("SELECT id, content, heading_path, media_type FROM chunks WHERE path = ?")?;
+        let mapped = stmt.query_map(params![path], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row?);
+        }
+        rows
+    };
+    for (id, content, heading_path, media_type) in rows {
+        if media_type == "text" {
+            tx.execute(
+                "INSERT INTO chunks_fts(chunks_fts, rowid, content, heading_path) VALUES('delete', ?1, ?2, ?3)",
+                params![id, content, heading_path.unwrap_or_default()],
+            )?;
+        }
+        tx.execute("DELETE FROM chunks_vec WHERE rowid = ?1", params![id])?;
+    }
+    tx.execute("DELETE FROM chunks WHERE path = ?1", params![path])?;
+    Ok(())
+}
+
+fn insert_chunk_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    chunk: &Chunk,
+    path: &str,
+    mtime_ns: i64,
+) -> Result<i64, StoreError> {
+    tx.execute(
+        "INSERT INTO chunks(path, chunk_idx, heading, heading_path, content, content_hash, mtime_ns, tokens, media_type, mime_type, media_start, media_end, media_unit, truncated)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            path,
+            chunk.idx as i64,
+            null_if_empty(&chunk.heading),
+            null_if_empty(&chunk.heading_path),
+            chunk.content,
+            chunk.content_hash,
+            mtime_ns,
+            chunk.tokens as i64,
+            chunk.media_type.as_str(),
+            chunk.mime_type,
+            chunk.media_start,
+            chunk.media_end,
+            chunk.media_unit,
+            chunk.truncated as i64,
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    if chunk.media_type.as_str() == "text" {
+        tx.execute(
+            "INSERT INTO chunks_fts(rowid, content, heading_path) VALUES (?1, ?2, ?3)",
+            params![id, chunk.content, chunk.heading_path],
+        )?;
+    }
+    Ok(id)
+}
+
+fn validate_cache_entry(entry: &PreparedEmbeddingCacheEntry<'_>) -> Result<(), StoreError> {
+    if entry.embedding.len() != entry.dim {
+        return Err(StoreError::CacheDimMismatch {
+            got: entry.embedding.len(),
+            want: entry.dim,
+        });
+    }
+    Ok(())
+}
+
+fn put_embedding_cache_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    entry: &PreparedEmbeddingCacheEntry<'_>,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO embedding_cache(content_hash, model, task_type, dim, embedding, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'))
+         ON CONFLICT(content_hash) DO UPDATE SET
+           model=excluded.model, task_type=excluded.task_type,
+           dim=excluded.dim, embedding=excluded.embedding, created_at=excluded.created_at",
+        params![
+            entry.content_hash,
+            entry.model,
+            entry.task_type,
+            entry.dim as i64,
+            encode_f32(entry.embedding),
+        ],
+    )?;
+    Ok(())
+}
+
+fn set_file_state_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    content_hash: &str,
+    mtime_ns: i64,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO files(path, content_hash, mtime_ns, indexed_at)
+         VALUES (?1, ?2, ?3, strftime('%s','now'))
+         ON CONFLICT(path) DO UPDATE SET
+           content_hash = excluded.content_hash,
+           mtime_ns = excluded.mtime_ns,
+           indexed_at = excluded.indexed_at",
+        params![path, content_hash, mtime_ns],
+    )?;
     Ok(())
 }
 
@@ -1038,6 +1265,35 @@ mod tests {
     }
 
     #[test]
+    fn media_vector_search_filters_text_and_preserves_dense_media_order() {
+        let (_d, s) = open_temp();
+        let text_id = s
+            .upsert_chunk(&sample_chunk(0, "text", "text-hash"), "note.md", 1)
+            .unwrap();
+        let mut image = sample_chunk(0, "image", "image-hash");
+        image.media_type = crate::media::MediaType::Image;
+        let image_id = s.upsert_chunk(&image, "image.png", 1).unwrap();
+        let mut pdf = sample_chunk(0, "pdf", "pdf-hash");
+        pdf.media_type = crate::media::MediaType::Pdf;
+        let pdf_id = s.upsert_chunk(&pdf, "paper.pdf", 1).unwrap();
+
+        s.set_vector_for_chunk(text_id, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        s.set_vector_for_chunk(image_id, &[0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        s.set_vector_for_chunk(pdf_id, &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let hits = s
+            .search_media_vec(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![image_id, pdf_id]
+        );
+    }
+
+    #[test]
     fn text_media_fts_transitions_remove_and_restore_terms() {
         let (_d, s) = open_temp();
         let path = "Attachments/item.png";
@@ -1150,13 +1406,15 @@ mod tests {
     }
 
     #[test]
-    fn delete_chunks_for_path_cleans_up() {
+    fn remove_file_cleans_up_chunks_vectors_fts_and_file_state() {
         let (_d, s) = open_temp();
+        let path = "/v/a.md";
         let id = s
-            .upsert_chunk(&sample_chunk(0, "searchable token", "h"), "/v/a.md", 1)
+            .upsert_chunk(&sample_chunk(0, "searchable token", "h"), path, 1)
             .unwrap();
         s.set_vector_for_chunk(id, &[0.0; TEST_DIM]).unwrap();
-        s.delete_chunks_for_path("/v/a.md").unwrap();
+        s.set_file_state(path, "file-hash", 1).unwrap();
+        s.remove_file(path).unwrap();
         let n: i64 = s
             .conn()
             .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
@@ -1180,6 +1438,136 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0);
+        assert!(s.get_file_state(path).unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_file_rolls_back_when_file_state_deletion_fails() {
+        let (_d, s) = open_temp();
+        let path = "note.md";
+        let id = s
+            .upsert_chunk(&sample_chunk(0, "prior searchable token", "h"), path, 1)
+            .unwrap();
+        s.set_vector_for_chunk(id, &[0.0; TEST_DIM]).unwrap();
+        s.set_file_state(path, "file-hash", 1).unwrap();
+        s.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_file_delete BEFORE DELETE ON files
+                 BEGIN SELECT RAISE(ABORT, 'forced file state delete failure'); END;",
+            )
+            .unwrap();
+
+        let err = s.remove_file(path).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            s.get_file_state(path).unwrap(),
+            Some(("file-hash".into(), 1))
+        );
+        assert_eq!(
+            s.chunks_for_path(path).unwrap(),
+            vec![(id, "prior searchable token".into())]
+        );
+        assert_eq!(
+            s.vectors_for_chunks(&[id]).unwrap(),
+            vec![(id, vec![0.0; TEST_DIM])]
+        );
+        assert_eq!(s.search_fts("prior", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replace_file_writes_chunks_vectors_cache_and_file_state_together() {
+        let (_d, s) = open_temp();
+        let chunks = vec![sample_chunk(
+            0,
+            "replacement searchable token",
+            "chunk-hash",
+        )];
+        let embeddings = vec![vec![0.25; TEST_DIM]];
+        let cache_entries = [PreparedEmbeddingCacheEntry {
+            content_hash: "chunk-hash",
+            model: "test-model",
+            task_type: "RETRIEVAL_DOCUMENT",
+            dim: TEST_DIM,
+            embedding: &embeddings[0],
+        }];
+
+        s.replace_file(FileReplacement {
+            path: "note.md",
+            content_hash: "file-hash",
+            mtime_ns: 42,
+            chunks: &chunks,
+            embeddings: &embeddings,
+            cache_entries: &cache_entries,
+        })
+        .unwrap();
+
+        assert_eq!(s.count_chunks().unwrap(), 1);
+        assert_eq!(
+            s.get_file_state("note.md").unwrap(),
+            Some(("file-hash".into(), 42))
+        );
+        assert_eq!(
+            s.get_embedding_cache("chunk-hash").unwrap(),
+            Some(embeddings[0].clone())
+        );
+        let (id, _) = s.chunks_for_path("note.md").unwrap().pop().unwrap();
+        assert_eq!(
+            s.vectors_for_chunks(&[id]).unwrap(),
+            vec![(id, embeddings[0].clone())]
+        );
+        assert_eq!(s.search_fts("replacement", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replace_file_rolls_back_when_vector_is_invalid() {
+        let (_d, s) = open_temp();
+        let old_chunks = vec![sample_chunk(0, "prior searchable token", "old-chunk-hash")];
+        let old_embeddings = vec![vec![0.5; TEST_DIM]];
+        s.replace_file(FileReplacement {
+            path: "note.md",
+            content_hash: "old-file-hash",
+            mtime_ns: 1,
+            chunks: &old_chunks,
+            embeddings: &old_embeddings,
+            cache_entries: &[],
+        })
+        .unwrap();
+        let (old_id, _) = s.chunks_for_path("note.md").unwrap().pop().unwrap();
+
+        let new_chunks = vec![sample_chunk(0, "new searchable token", "new-chunk-hash")];
+        let invalid_embeddings = vec![vec![0.0; TEST_DIM - 1]];
+        let err = s
+            .replace_file(FileReplacement {
+                path: "note.md",
+                content_hash: "new-file-hash",
+                mtime_ns: 2,
+                chunks: &new_chunks,
+                embeddings: &invalid_embeddings,
+                cache_entries: &[],
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(
+            s.get_file_state("note.md").unwrap(),
+            Some(("old-file-hash".into(), 1))
+        );
+        assert_eq!(
+            s.chunks_for_path("note.md").unwrap(),
+            vec![(old_id, "prior searchable token".into())]
+        );
+        assert_eq!(
+            s.vectors_for_chunks(&[old_id]).unwrap(),
+            vec![(old_id, old_embeddings[0].clone())]
+        );
+        assert_eq!(s.search_fts("prior", 10).unwrap().len(), 1);
+        assert_eq!(s.search_fts("new", 10).unwrap().len(), 0);
     }
 
     #[test]

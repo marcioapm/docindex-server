@@ -12,6 +12,7 @@ pub mod config;
 pub mod embed;
 pub mod indexer;
 pub mod media;
+pub mod media_prepare;
 pub mod search;
 pub mod server;
 pub mod store;
