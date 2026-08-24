@@ -287,9 +287,9 @@ fn resolve_embed(
     let provider_raw = if !provider_raw.is_empty() {
         provider_raw
     } else {
-        // No explicit provider anywhere: infer from which API key env var
-        // is present, defaulting to "fake". Mirrors the pre-registry
-        // behavior of defaulting to gemini only when GEMINI_API_KEY is set.
+        // No explicit provider anywhere: auto-select based on which API key is
+        // present, preferring gemini over voyage, falling back to fake when
+        // neither is set.
         let gemini_key_present = lookup("GEMINI_API_KEY").is_some_and(|v| !v.is_empty());
         let voyage_key_present = lookup("VOYAGE_API_KEY").is_some_and(|v| !v.is_empty());
         if gemini_key_present {

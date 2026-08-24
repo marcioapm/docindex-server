@@ -1,8 +1,7 @@
 //! Static provider/model registry.
 //!
-//! Replaces the old stringly-typed `embed_backend` with a validated enum and
-//! a fixed table of known models. All dim/task-label lookups for building an
-//! embedder go through this module so validation logic lives in one place.
+//! All dim/task-label lookups for building an embedder go through this
+//! module so validation logic lives in one place.
 
 use std::fmt;
 
