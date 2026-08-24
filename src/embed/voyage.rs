@@ -72,6 +72,7 @@ impl Voyage {
             model: self.model.clone(),
             input: texts.to_vec(),
             input_type: input_type.to_string(),
+            truncation: false,
             output_dimension: self.dim,
         };
         self.send_request(&url, &body, texts.len()).await
@@ -334,6 +335,7 @@ struct EmbedRequest {
     model: String,
     input: Vec<String>,
     input_type: String,
+    truncation: bool,
     output_dimension: usize,
 }
 
@@ -411,6 +413,7 @@ mod tests {
                 "model": "voyage-4",
                 "input": ["hello"],
                 "input_type": "document",
+                "truncation": false,
                 "output_dimension": 4,
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -434,6 +437,7 @@ mod tests {
                 "model": "voyage-4",
                 "input": ["q"],
                 "input_type": "query",
+                "truncation": false,
                 "output_dimension": 4,
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
