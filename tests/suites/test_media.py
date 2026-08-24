@@ -464,12 +464,13 @@ max_file_mb = 20
         # 1 text + 1 image = 2 chunks.
         _wait_for_chunks(base_url, bearer, 2, timeout=30.0)
 
-        # Capture the content_hash currently stored for the image BEFORE
-        # overwriting the file. The file-state row already exists at this point
-        # (written during the startup scan), so polling for row existence would
-        # be vacuous. Polling for a CHANGED hash proves the watcher actually
-        # re-indexed the new file contents.
+        # Capture the content_hash and the cached embedding blob for the image
+        # BEFORE overwriting the file. The file-state row already exists at this
+        # point (written during the startup scan), so polling for row existence
+        # would be vacuous. Capturing the blob before modification lets us assert
+        # later that the vector actually changed, not merely that some blob exists.
         import sqlite3
+        import struct
         conn_pre = sqlite3.connect(str(db))
         pre_row = conn_pre.execute(
             "SELECT content_hash FROM files WHERE path = 'watch_img.png'"
@@ -479,6 +480,21 @@ max_file_mb = 20
             "watch_img.png file-state row must exist after initial scan"
         )
         hash_before = pre_row[0]
+
+        # Read the cached embedding blob for the original image.
+        conn_blob_pre = sqlite3.connect(str(db))
+        blob_pre_row = conn_blob_pre.execute(
+            "SELECT ec.embedding "
+            "FROM chunks c "
+            "JOIN embedding_cache ec ON ec.content_hash = c.content_hash "
+            "WHERE c.path = 'watch_img.png' "
+            "LIMIT 1"
+        ).fetchone()
+        conn_blob_pre.close()
+        assert blob_pre_row is not None, (
+            "embedding_cache must have an entry for watch_img.png before modification"
+        )
+        blob_before = blob_pre_row[0]
 
         # Modify the image and wait for the stored hash to change.
         img_path.write_bytes(_make_minimal_png(8, 8))
@@ -500,12 +516,10 @@ max_file_mb = 20
             f"(hash_before={hash_before!r})"
         )
 
-        # Also verify that the stored embedding was updated.  The Fake embedder
-        # seeds its output from the media bytes, so 4×4 and 8×8 PNGs produce
-        # distinct embeddings that are stored in embedding_cache.
-        # Join chunks → embedding_cache to read the cached vector for the
-        # image path.  embedding_cache is a regular table readable without
-        # the sqlite-vec extension.
+        # Verify the cached embedding was updated. The Fake embedder seeds its
+        # output from the media bytes, so 4×4 and 8×8 PNGs produce distinct
+        # vectors. Read the new blob and assert it is present, decodes to floats,
+        # is not all-zero, and differs from the pre-modification blob.
         conn_cache = sqlite3.connect(str(db))
         cache_row = conn_cache.execute(
             "SELECT ec.embedding "
@@ -518,9 +532,19 @@ max_file_mb = 20
         assert cache_row is not None, (
             "embedding_cache must have an entry for watch_img.png after re-index"
         )
-        # Non-empty BLOB confirms a vector was actually stored.
-        assert len(cache_row[0]) > 0, (
+        blob_after = cache_row[0]
+        assert len(blob_after) > 0, (
             "cached embedding for modified image must not be empty"
+        )
+        n_floats = len(blob_after) // 4
+        assert n_floats > 0, "embedding blob must contain at least one float"
+        floats = struct.unpack(f"{n_floats}f", blob_after[:n_floats * 4])
+        assert any(f != 0.0 for f in floats), (
+            "embedding must not be all-zero"
+        )
+        assert blob_after != blob_before, (
+            "embedding blob for the modified image must differ from the original; "
+            "the watcher must have re-embedded the new file contents"
         )
 
         # Delete the image; chunk count should drop to 1.
