@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use crate::{
     Config,
     api::{self, AppState},
-    embed::{AnyEmbedder, Fake, Gemini},
+    embed::{AnyEmbedder, Fake, Gemini, Voyage},
     indexer::{self, IndexerCtx},
     store::Store,
     watch as watcher,
@@ -28,7 +28,12 @@ use crate::{
 /// graceful shutdown on SIGINT/SIGTERM or a bind error).
 pub async fn run(cfg: Config) -> Result<()> {
     let embedder = build_embedder(&cfg)?;
-    let store = Store::open(&cfg.db_path, cfg.embed_dim).context("open store")?;
+    let store = if cfg.reembed {
+        Store::open_for_reembed(&cfg.db_path, cfg.embed_dim).context("open store")?
+    } else {
+        Store::open(&cfg.db_path, cfg.embed_dim).context("open store")?
+    };
+    check_or_apply_fingerprint(&store, &cfg)?;
     // Rewrite any pre-0.2.0 absolute paths to vault-relative form. Idempotent
     // across restarts; a mismatch between the DB's paths and the configured
     // vault_dir is surfaced as a refusal (logged, not fatal) so operators can
@@ -109,7 +114,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         listen = %bound,
         vault = %cfg.vault_dir.display(),
         db = %cfg.db_path.display(),
-        embed_backend = %cfg.embed_backend,
+        embed_backend = %cfg.embed_provider,
         "docindex-server listening"
     );
 
@@ -133,20 +138,75 @@ pub async fn run(cfg: Config) -> Result<()> {
     res
 }
 
+/// Compare the store's embedding fingerprint against the effective config.
+/// A fresh (never-fingerprinted) DB adopts the current config. `--reembed`
+/// wipes and rebuilds instead of erroring on a mismatch.
+fn check_or_apply_fingerprint(store: &Store, cfg: &Config) -> Result<()> {
+    let provider = cfg.embed_provider.as_str();
+    let model = &cfg.embed_model;
+    let dim = cfg.embed_dim;
+    match store
+        .check_fingerprint(provider, model, dim)
+        .context("check embedding fingerprint")?
+    {
+        crate::store::FingerprintOutcome::Match => Ok(()),
+        crate::store::FingerprintOutcome::Fresh => store
+            .set_fingerprint(provider, model, dim)
+            .context("set embedding fingerprint"),
+        crate::store::FingerprintOutcome::Mismatch(msg) => {
+            if cfg.reembed {
+                warn!(reason = %msg, "fingerprint mismatch; --reembed set, wiping and rebuilding");
+                store
+                    .wipe_and_rebuild(dim, provider, model)
+                    .context("wipe and rebuild index for --reembed")
+            } else {
+                Err(anyhow!("{msg}"))
+            }
+        }
+    }
+}
+
 fn build_embedder(cfg: &Config) -> Result<AnyEmbedder> {
-    match cfg.embed_backend.as_str() {
-        "gemini" => {
+    match cfg.embed_provider {
+        crate::embed::registry::EmbedProvider::Gemini => {
             let g = Gemini::new(
-                cfg.gemini_key.clone(),
+                cfg.embed_api_key.clone(),
                 cfg.embed_model.clone(),
                 cfg.embed_dim,
                 cfg.http_timeout,
             )
             .map_err(|e| anyhow!("build gemini client: {e}"))?;
+            let g = if let Some(base_url) = &cfg.embed_base_url {
+                Gemini {
+                    base_url: base_url.clone(),
+                    ..g
+                }
+            } else {
+                g
+            };
             Ok(AnyEmbedder::Gemini(Arc::new(g)))
         }
-        "fake" => Ok(AnyEmbedder::Fake(Arc::new(Fake::new(cfg.embed_dim)))),
-        other => Err(anyhow!("unknown DOCINDEX_EMBED {other:?}")),
+        crate::embed::registry::EmbedProvider::Voyage => {
+            let v = Voyage::new(
+                cfg.embed_api_key.clone(),
+                cfg.embed_model.clone(),
+                cfg.embed_dim,
+                cfg.http_timeout,
+            )
+            .map_err(|e| anyhow!("build voyage client: {e}"))?;
+            let v = if let Some(base_url) = &cfg.embed_base_url {
+                Voyage {
+                    base_url: base_url.clone(),
+                    ..v
+                }
+            } else {
+                v
+            };
+            Ok(AnyEmbedder::Voyage(Arc::new(v)))
+        }
+        crate::embed::registry::EmbedProvider::Fake => {
+            Ok(AnyEmbedder::Fake(Arc::new(Fake::new(cfg.embed_dim))))
+        }
     }
 }
 

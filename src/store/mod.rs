@@ -52,6 +52,23 @@ impl Store {
     /// `FLOAT[...]`, and enforces that `meta.embedding_dim` matches
     /// `embed_dim` (refusing to start on mismatch).
     pub fn open(path: impl AsRef<Path>, embed_dim: usize) -> Result<Self, StoreError> {
+        Self::open_internal(path, embed_dim, false)
+    }
+
+    /// Open for a `--reembed` run: skips the `embedding_dim` mismatch
+    /// refusal so the caller can immediately call [`Store::wipe_and_rebuild`]
+    /// to drop and recreate `chunks_vec` at the new dim. Opening this way
+    /// without following up with a wipe leaves the store in an inconsistent
+    /// state — callers must always pair it with `wipe_and_rebuild`.
+    pub fn open_for_reembed(path: impl AsRef<Path>, embed_dim: usize) -> Result<Self, StoreError> {
+        Self::open_internal(path, embed_dim, true)
+    }
+
+    fn open_internal(
+        path: impl AsRef<Path>,
+        embed_dim: usize,
+        skip_dim_check: bool,
+    ) -> Result<Self, StoreError> {
         if embed_dim == 0 {
             return Err(StoreError::Msg("embed_dim must be > 0".into()));
         }
@@ -61,14 +78,97 @@ impl Store {
         verify_vec_loaded(&conn)?;
         // Apply the base schema and the dim-parameterized `chunks_vec` DDL
         // in a single batch. vec0 requires the dim as a SQL literal, so it
-        // can't live in the static schema.sql file.
+        // can't live in the static schema.sql file. If `chunks_vec` already
+        // exists at a different dim, `IF NOT EXISTS` makes this a silent
+        // no-op — safe because the `skip_dim_check=true` (reembed) caller
+        // is about to drop and recreate it anyway, and the normal caller
+        // gets a hard refusal below.
         let full_schema = format!("{}\n{}", SCHEMA_SQL, vec_schema_ddl(embed_dim));
         conn.execute_batch(&full_schema)
             .map_err(|e| StoreError::Msg(format!("apply schema: {e}")))?;
         let s = Self { conn };
         s.set_meta("schema_version", SCHEMA_VERSION)?;
-        s.reconcile_embedding_dim(embed_dim)?;
+        if !skip_dim_check {
+            s.reconcile_embedding_dim(embed_dim)?;
+        }
         Ok(s)
+    }
+
+    /// Drop and recreate `chunks_fts` and `chunks_vec`, delete every row of
+    /// `chunks` / `files` / `embedding_cache`, and write the new embedding
+    /// fingerprint. Used by `--reembed` after [`Store::open_for_reembed`] —
+    /// the only supported way to change the embedding dim on an existing
+    /// DB, since `chunks_vec`'s dim is baked into its DDL.
+    pub fn wipe_and_rebuild(
+        &self,
+        embed_dim: usize,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch("DROP TABLE IF EXISTS chunks_fts; DROP TABLE IF EXISTS chunks_vec;")?;
+        tx.execute("DELETE FROM chunks", [])?;
+        tx.execute("DELETE FROM files", [])?;
+        tx.execute("DELETE FROM embedding_cache", [])?;
+        // Recreates chunks_fts (IF NOT EXISTS in SCHEMA_SQL; chunks/files/
+        // embedding_cache/meta are no-ops since they still exist) and
+        // chunks_vec at the new dim.
+        tx.execute_batch(SCHEMA_SQL)
+            .map_err(|e| StoreError::Msg(format!("reapply base schema: {e}")))?;
+        tx.execute_batch(&vec_schema_ddl(embed_dim))
+            .map_err(|e| StoreError::Msg(format!("recreate chunks_vec: {e}")))?;
+        tx.commit()?;
+        self.set_meta("embedding_dim", &embed_dim.to_string())?;
+        self.set_meta("embedding_provider", provider)?;
+        self.set_meta("embedding_model", model)?;
+        Ok(())
+    }
+
+    /// Compare the stored embedding fingerprint (`embedding_provider` /
+    /// `embedding_model` / `embedding_dim` in `meta`) against the effective
+    /// config. A DB with no fingerprint recorded yet (pre-existing
+    /// deployments, or a genuinely empty index) is [`FingerprintOutcome::Fresh`]
+    /// — the caller should adopt the current config as the fingerprint via
+    /// [`Store::set_fingerprint`] rather than error, so upgrading an
+    /// existing production DB never breaks on its own.
+    pub fn check_fingerprint(
+        &self,
+        provider: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<FingerprintOutcome, StoreError> {
+        let stored_provider = self.get_meta("embedding_provider")?;
+        let stored_model = self.get_meta("embedding_model")?;
+        let (stored_provider, stored_model) = match (stored_provider, stored_model) {
+            (None, None) => return Ok(FingerprintOutcome::Fresh),
+            (p, m) => (p.unwrap_or_default(), m.unwrap_or_default()),
+        };
+        let stored_dim: usize = self
+            .get_meta("embedding_dim")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(dim);
+        if stored_provider == provider && stored_model == model && stored_dim == dim {
+            return Ok(FingerprintOutcome::Match);
+        }
+        Ok(FingerprintOutcome::Mismatch(format!(
+            "index built with provider={stored_provider} model={stored_model} dim={stored_dim}, \
+             config says provider={provider} model={model} dim={dim}; re-embed required: run with --reembed"
+        )))
+    }
+
+    /// Record the embedding fingerprint. Called once, on a genuinely fresh
+    /// index (see [`FingerprintOutcome::Fresh`]) or immediately after
+    /// [`Store::wipe_and_rebuild`] (which writes it directly).
+    pub fn set_fingerprint(
+        &self,
+        provider: &str,
+        model: &str,
+        dim: usize,
+    ) -> Result<(), StoreError> {
+        self.set_meta("embedding_provider", provider)?;
+        self.set_meta("embedding_model", model)?;
+        self.set_meta("embedding_dim", &dim.to_string())?;
+        Ok(())
     }
 
     /// Ensure `meta.embedding_dim` agrees with `embed_dim`:
@@ -567,6 +667,19 @@ pub enum MigrationOutcome {
     Refused { offending_rows: u64 },
 }
 
+/// Result of comparing the stored embedding fingerprint against the
+/// effective config, from [`Store::check_fingerprint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FingerprintOutcome {
+    /// No fingerprint recorded yet — caller should adopt the current config.
+    Fresh,
+    /// Stored fingerprint matches the effective config.
+    Match,
+    /// Mismatch; the `String` names exactly which field(s) changed and both
+    /// old/new values, ready to surface as a startup error.
+    Mismatch(String),
+}
+
 /// Minimal row projection used to hydrate a search hit. Kept in the store
 /// module so SQL column order stays colocated with the schema.
 #[derive(Debug, Clone)]
@@ -1058,5 +1171,95 @@ mod tests {
             s.get_meta("path_schema_version").unwrap().as_deref(),
             Some(PATH_SCHEMA_VERSION)
         );
+    }
+
+    // --- fingerprint guard -------------------------------------------
+
+    #[test]
+    fn fingerprint_fresh_on_new_db() {
+        let (_d, s) = open_temp();
+        let outcome = s
+            .check_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        assert_eq!(outcome, FingerprintOutcome::Fresh);
+    }
+
+    #[test]
+    fn fingerprint_matches_after_set() {
+        let (_d, s) = open_temp();
+        s.set_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        let outcome = s
+            .check_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        assert_eq!(outcome, FingerprintOutcome::Match);
+    }
+
+    #[test]
+    fn fingerprint_mismatch_provider_names_both_values() {
+        let (_d, s) = open_temp();
+        s.set_fingerprint("gemini", "gemini-embedding-001", 3072)
+            .unwrap();
+        let outcome = s.check_fingerprint("voyage", "voyage-4", 1024).unwrap();
+        let msg = match outcome {
+            FingerprintOutcome::Mismatch(m) => m,
+            other => panic!("expected Mismatch, got {other:?}"),
+        };
+        assert!(msg.contains("provider=gemini"), "{msg}");
+        assert!(msg.contains("provider=voyage"), "{msg}");
+        assert!(msg.contains("model=gemini-embedding-001"), "{msg}");
+        assert!(msg.contains("model=voyage-4"), "{msg}");
+        assert!(msg.contains("dim=3072"), "{msg}");
+        assert!(msg.contains("dim=1024"), "{msg}");
+        assert!(msg.contains("--reembed"), "{msg}");
+    }
+
+    #[test]
+    fn fingerprint_mismatch_model_only() {
+        let (_d, s) = open_temp();
+        s.set_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        let outcome = s
+            .check_fingerprint("gemini", "some-other-model", TEST_DIM)
+            .unwrap();
+        assert!(matches!(outcome, FingerprintOutcome::Mismatch(_)));
+    }
+
+    #[test]
+    fn fingerprint_mismatch_dim_only() {
+        let (_d, s) = open_temp();
+        s.set_fingerprint("gemini", "gemini-embedding-001", TEST_DIM)
+            .unwrap();
+        let outcome = s
+            .check_fingerprint("gemini", "gemini-embedding-001", TEST_DIM + 1)
+            .unwrap();
+        assert!(matches!(outcome, FingerprintOutcome::Mismatch(_)));
+    }
+
+    #[test]
+    fn wipe_and_rebuild_clears_data_and_sets_fingerprint() {
+        let (_d, s) = open_temp();
+        let id = s
+            .upsert_chunk(&sample_chunk(0, "alpha", "h1"), "/v/a.md", 1)
+            .unwrap();
+        s.set_vector_for_chunk(id, &[0.0; TEST_DIM]).unwrap();
+        s.set_file_state("/v/a.md", "h1", 1).unwrap();
+        s.put_embedding_cache("h1", "m", "t", TEST_DIM, &[0.0; TEST_DIM])
+            .unwrap();
+
+        s.wipe_and_rebuild(16, "voyage", "voyage-4").unwrap();
+
+        assert_eq!(s.count_chunks().unwrap(), 0);
+        assert!(s.list_indexed_paths().unwrap().is_empty());
+        assert!(s.get_embedding_cache("h1").unwrap().is_none());
+        let outcome = s.check_fingerprint("voyage", "voyage-4", 16).unwrap();
+        assert_eq!(outcome, FingerprintOutcome::Match);
+        // chunks_vec must be usable at the new dim.
+        s.conn()
+            .execute(
+                "INSERT INTO chunks_vec(rowid, embedding) VALUES (1, ?1)",
+                params![encode_f32(&[0.0_f32; 16])],
+            )
+            .expect("insert at new dim");
     }
 }

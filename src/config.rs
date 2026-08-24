@@ -1,8 +1,13 @@
-//! Env-based configuration (12-factor).
+//! Layered configuration: CLI flags > environment variables > TOML file >
+//! built-in defaults.
 //!
-//! All runtime configuration comes from environment variables. See
-//! `.env.example` for the full list. `0.0.0.0` binds (and the v6 equivalent)
-//! are rejected at startup.
+//! The running production service is driven entirely by env vars (see
+//! `.env.example`) and that path keeps working unchanged — `Config::from_env`
+//! is a thin wrapper over [`Config::load`] with no file and no flag
+//! overrides. `0.0.0.0` binds (and the v6 equivalent) are rejected at
+//! startup regardless of which layer set `listen`.
+
+pub mod file;
 
 use std::{
     net::IpAddr,
@@ -12,6 +17,12 @@ use std::{
 
 use thiserror::Error;
 
+use crate::embed::registry::{self, EmbedProvider};
+
+pub use file::{
+    CliFile, FileReader, ServerFile, find_cli_config, find_server_config, os_file_reader,
+};
+
 /// Typed, validated runtime configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -19,18 +30,19 @@ pub struct Config {
     pub db_path: PathBuf,
     pub listen: String,
     pub bearer: String,
-    pub gemini_key: String,
+    pub embed_provider: EmbedProvider,
     pub embed_model: String,
     pub embed_dim: usize,
+    pub embed_api_key: String,
+    /// Explicit override for the provider's API base URL (proxy/mock).
+    /// Deliberately excluded from the index fingerprint.
+    pub embed_base_url: Option<String>,
     pub debounce: Duration,
     pub log_format: String,
     pub http_timeout: Duration,
     /// Dev/test-only: when true, `127.0.0.1` binds are allowed. MUST stay
     /// false in production (Tailscale is the perimeter).
     pub allow_loopback: bool,
-    /// Which embedder to build. "gemini" in prod, "fake" in tests / when
-    /// `GEMINI_API_KEY` is unset.
-    pub embed_backend: String,
     /// Display-side smoothing constant for `score_normalized`. NOT the RRF
     /// constant (ranking is always k=60). Smaller = faster decay past rank-1.
     pub display_k: f64,
@@ -39,6 +51,12 @@ pub struct Config {
     /// Weight of the BM25 branch in `score_normalized`. `weight_vec + weight_bm25`
     /// is validated to sum to 1.0 (± 0.01).
     pub weight_bm25: f64,
+    /// `--reembed`: wipe chunks/vectors/FTS and rebuild when the index
+    /// fingerprint (provider/model/dim) no longer matches this config.
+    pub reembed: bool,
+    /// Path of the TOML file this config was loaded from, if any — for
+    /// startup logging only.
+    pub config_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -50,39 +68,90 @@ pub enum ConfigError {
 /// Function signature matching `std::env::var`, injectable for tests.
 pub type Lookup<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
+/// CLI-flag-level overrides for the server binary. Only `--config` and
+/// `--reembed` are documented server flags — every other field is env/file/
+/// default only.
+#[derive(Debug, Default, Clone)]
+pub struct ConfigFlags {
+    pub config_path: Option<PathBuf>,
+    pub reembed: bool,
+}
+
 impl Config {
-    /// Load and validate configuration from the process environment.
+    /// Load and validate configuration from the process environment, with
+    /// no CLI overrides. Thin wrapper over [`Config::load`] using the real
+    /// filesystem for TOML discovery — production deployments have no
+    /// config file at the well-known locations, so this resolves to
+    /// exactly the pre-TOML env-only behavior.
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_lookup(&|k| std::env::var(k).ok())
+        Self::load(
+            &|k| std::env::var(k).ok(),
+            &os_file_reader,
+            &ConfigFlags::default(),
+        )
     }
 
-    /// Load and validate configuration from a custom lookup function.
+    /// Load and validate configuration from a custom lookup function, with
+    /// no file layer and no flags. Preserved for existing unit tests.
     pub fn from_lookup(lookup: &Lookup<'_>) -> Result<Self, ConfigError> {
+        Self::load(lookup, &|_: &Path| None, &ConfigFlags::default())
+    }
+
+    /// Full layered load: CLI flags > env vars > TOML file > defaults.
+    pub fn load(
+        lookup: &Lookup<'_>,
+        file_reader: &FileReader<'_>,
+        flags: &ConfigFlags,
+    ) -> Result<Self, ConfigError> {
         let mut errs: Vec<String> = Vec::new();
 
-        let vault_dir_raw = get_or_default(lookup, "DOCINDEX_VAULT_DIR", "");
-        let db_path_raw = get_or_default(lookup, "DOCINDEX_DB_PATH", "");
-        let listen = get_or_default(lookup, "DOCINDEX_LISTEN", "");
-        let bearer = get_or_default(lookup, "DOCINDEX_BEARER", "");
-        let gemini_key = get_or_default(lookup, "GEMINI_API_KEY", "");
-        let embed_model = get_or_default(lookup, "DOCINDEX_EMBED_MODEL", "gemini-embedding-001");
-        let log_format = get_or_default(lookup, "DOCINDEX_LOG_FORMAT", "json").to_ascii_lowercase();
-        let allow_loopback_raw =
-            get_or_default(lookup, "DOCINDEX_ALLOW_LOOPBACK", "false").to_ascii_lowercase();
-        let allow_loopback = matches!(allow_loopback_raw.as_str(), "1" | "true" | "yes" | "on");
-        let embed_backend_raw = get_or_default(lookup, "DOCINDEX_EMBED", "").to_ascii_lowercase();
-        let embed_backend = if !embed_backend_raw.is_empty() {
-            embed_backend_raw
-        } else if !gemini_key.is_empty() {
-            "gemini".to_string()
-        } else {
-            "fake".to_string()
+        let found = find_server_config(lookup, file_reader, flags.config_path.as_deref())
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        let (config_path, file) = match found {
+            Some((p, f)) => (Some(p), f),
+            None => (None, ServerFile::default()),
         };
 
-        let embed_dim = parse_int_default(lookup, "DOCINDEX_EMBED_DIM", 3072, &mut errs);
-        let debounce_ms = parse_int_default(lookup, "DOCINDEX_DEBOUNCE_MS", 5000, &mut errs);
-        let http_timeout_ms =
-            parse_int_default(lookup, "DOCINDEX_HTTP_TIMEOUT_MS", 30000, &mut errs);
+        let vault_dir_raw =
+            resolved_str(lookup, "DOCINDEX_VAULT_DIR", file.vault_dir.as_deref(), "");
+        let db_path_raw = resolved_str(lookup, "DOCINDEX_DB_PATH", file.db_path.as_deref(), "");
+        let listen = resolved_str(lookup, "DOCINDEX_LISTEN", file.listen.as_deref(), "");
+        let log_format = resolved_str(
+            lookup,
+            "DOCINDEX_LOG_FORMAT",
+            file.log_format.as_deref(),
+            "json",
+        )
+        .to_ascii_lowercase();
+        let allow_loopback = resolved_bool(
+            lookup,
+            "DOCINDEX_ALLOW_LOOPBACK",
+            file.allow_loopback,
+            false,
+        );
+
+        let bearer_file_effective = indirected(&file.bearer, &file.bearer_env, lookup);
+        let bearer = resolved_str(
+            lookup,
+            "DOCINDEX_BEARER",
+            bearer_file_effective.as_deref(),
+            "",
+        );
+
+        let debounce_ms = resolved_u64(
+            lookup,
+            "DOCINDEX_DEBOUNCE_MS",
+            file.debounce_ms,
+            5000,
+            &mut errs,
+        );
+        let http_timeout_ms = resolved_u64(
+            lookup,
+            "DOCINDEX_HTTP_TIMEOUT_MS",
+            file.http_timeout_ms,
+            30000,
+            &mut errs,
+        );
 
         let display_k = parse_float_default(
             lookup,
@@ -140,22 +209,14 @@ impl Config {
         if bearer.is_empty() {
             errs.push("DOCINDEX_BEARER is required".into());
         }
-        if embed_backend == "gemini" && gemini_key.is_empty() {
-            errs.push("GEMINI_API_KEY is required when DOCINDEX_EMBED=gemini".into());
-        }
-        if embed_backend != "gemini" && embed_backend != "fake" {
-            errs.push(format!(
-                "DOCINDEX_EMBED {embed_backend:?}: must be 'gemini' or 'fake'"
-            ));
-        }
-        if embed_dim == 0 {
-            errs.push("DOCINDEX_EMBED_DIM must be > 0".into());
-        }
         if log_format != "json" && log_format != "text" {
             errs.push(format!(
                 "DOCINDEX_LOG_FORMAT {log_format:?}: must be 'json' or 'text'"
             ));
         }
+
+        let (embed_provider, embed_model, embed_dim, embed_api_key) =
+            resolve_embed(lookup, &file.embed, &mut errs);
 
         if !errs.is_empty() {
             return Err(ConfigError::Invalid(errs.join("; ")));
@@ -166,43 +227,187 @@ impl Config {
             db_path: db_path.unwrap_or_default(),
             listen,
             bearer,
-            gemini_key,
+            embed_provider,
             embed_model,
             embed_dim,
-            debounce: Duration::from_millis(debounce_ms as u64),
+            embed_api_key,
+            embed_base_url: file.embed.base_url.clone(),
+            debounce: Duration::from_millis(debounce_ms),
             log_format,
-            http_timeout: Duration::from_millis(http_timeout_ms as u64),
+            http_timeout: Duration::from_millis(http_timeout_ms),
             allow_loopback,
-            embed_backend,
             display_k,
             weight_vec,
             weight_bm25,
+            reembed: flags.reembed,
+            config_path,
         })
     }
 }
 
-fn get_or_default(lookup: &Lookup<'_>, key: &str, def: &str) -> String {
-    match lookup(key) {
-        Some(v) if !v.is_empty() => v,
-        _ => def.to_string(),
+/// Resolve the embed provider/model/dim/api_key quadruple, pushing any
+/// validation errors onto `errs`. Returns best-effort placeholder values on
+/// failure so the caller can keep constructing a `Config` that is discarded
+/// once `errs` is non-empty.
+fn resolve_embed(
+    lookup: &Lookup<'_>,
+    file: &file::EmbedFile,
+    errs: &mut Vec<String>,
+) -> (EmbedProvider, String, usize, String) {
+    // Back-compat: DOCINDEX_EMBED is the historical env var name for
+    // provider selection ("gemini" | "fake"); it now also accepts "voyage".
+    let provider_raw = resolved_str(lookup, "DOCINDEX_EMBED", file.provider.as_deref(), "");
+    let provider_raw = if !provider_raw.is_empty() {
+        provider_raw
+    } else {
+        // No explicit provider anywhere: infer from which API key env var
+        // is present, defaulting to "fake". Mirrors the pre-registry
+        // behavior of defaulting to gemini only when GEMINI_API_KEY is set.
+        let gemini_key_present = lookup("GEMINI_API_KEY").is_some_and(|v| !v.is_empty());
+        let voyage_key_present = lookup("VOYAGE_API_KEY").is_some_and(|v| !v.is_empty());
+        if gemini_key_present {
+            "gemini".to_string()
+        } else if voyage_key_present {
+            "voyage".to_string()
+        } else {
+            "fake".to_string()
+        }
+    };
+
+    let provider = match registry::parse_provider(&provider_raw) {
+        Ok(p) => p,
+        Err(e) => {
+            errs.push(e.to_string());
+            EmbedProvider::Fake
+        }
+    };
+
+    let default_model = provider.default_model().to_string();
+    let model = resolved_str(
+        lookup,
+        "DOCINDEX_EMBED_MODEL",
+        file.model.as_deref(),
+        &default_model,
+    );
+
+    let model_info = match registry::lookup(provider, &model) {
+        Ok(info) => Some(info),
+        Err(e) => {
+            errs.push(e.to_string());
+            None
+        }
+    };
+    let native_dim = model_info.as_ref().map(|i| i.native_dim).unwrap_or(3072);
+
+    let dim = resolved_u64(
+        lookup,
+        "DOCINDEX_EMBED_DIM",
+        file.dim.map(|d| d as u64),
+        native_dim as u64,
+        errs,
+    ) as usize;
+    if dim == 0 {
+        errs.push("DOCINDEX_EMBED_DIM must be > 0".into());
+    } else if let Some(info) = &model_info
+        && let Err(e) = registry::validate_dim(info, dim)
+    {
+        errs.push(e.to_string());
     }
+
+    let key_file_effective = indirected(&file.api_key, &file.api_key_env, lookup);
+    let api_key = match provider.key_env_var() {
+        Some(env_var) => {
+            let key = resolved_str(lookup, env_var, key_file_effective.as_deref(), "");
+            if key.is_empty() {
+                errs.push(registry::RegistryError::MissingKey { provider, env_var }.to_string());
+            }
+            key
+        }
+        None => key_file_effective.unwrap_or_default(),
+    };
+
+    (provider, model, dim, api_key)
 }
 
-fn parse_int_default(lookup: &Lookup<'_>, key: &str, def: i64, errs: &mut Vec<String>) -> usize {
-    match lookup(key) {
-        Some(v) if !v.is_empty() => match v.parse::<i64>() {
-            Ok(n) if n >= 0 => n as usize,
+/// `bearer`/`api_key`-style indirection: prefer the inline value, else look
+/// up the named env var from `*_env`, else `None`.
+fn indirected(
+    inline: &Option<String>,
+    env_key: &Option<String>,
+    lookup: &Lookup<'_>,
+) -> Option<String> {
+    if let Some(v) = inline
+        && !v.is_empty()
+    {
+        return Some(v.clone());
+    }
+    env_key
+        .as_ref()
+        .filter(|k| !k.is_empty())
+        .and_then(|k| lookup(k))
+        .filter(|v| !v.is_empty())
+}
+
+/// Resolve a string field: env var, else TOML file value, else default.
+/// (No CLI-flag layer for the server binary — its only flags are
+/// `--config` and `--reembed`, handled separately.)
+pub(crate) fn resolved_str(
+    lookup: &Lookup<'_>,
+    env_key: &str,
+    file_val: Option<&str>,
+    default: &str,
+) -> String {
+    if let Some(v) = lookup(env_key)
+        && !v.is_empty()
+    {
+        return v;
+    }
+    if let Some(v) = file_val
+        && !v.is_empty()
+    {
+        return v.to_string();
+    }
+    default.to_string()
+}
+
+pub(crate) fn resolved_bool(
+    lookup: &Lookup<'_>,
+    env_key: &str,
+    file_val: Option<bool>,
+    default: bool,
+) -> bool {
+    if let Some(v) = lookup(env_key) {
+        let lc = v.to_ascii_lowercase();
+        if !lc.is_empty() {
+            return matches!(lc.as_str(), "1" | "true" | "yes" | "on");
+        }
+    }
+    file_val.unwrap_or(default)
+}
+
+pub(crate) fn resolved_u64(
+    lookup: &Lookup<'_>,
+    env_key: &str,
+    file_val: Option<u64>,
+    default: u64,
+    errs: &mut Vec<String>,
+) -> u64 {
+    if let Some(v) = lookup(env_key)
+        && !v.is_empty()
+    {
+        return match v.parse::<i64>() {
+            Ok(n) if n >= 0 => n as u64,
             Ok(_) => {
-                errs.push(format!("{key} {v:?}: must be >= 0"));
-                def as usize
+                errs.push(format!("{env_key} {v:?}: must be >= 0"));
+                default
             }
             Err(e) => {
-                errs.push(format!("{key} {v:?}: must be an integer: {e}"));
-                def as usize
+                errs.push(format!("{env_key} {v:?}: must be an integer: {e}"));
+                default
             }
-        },
-        _ => def as usize,
+        };
     }
+    file_val.unwrap_or(default)
 }
 
 fn parse_float_default(lookup: &Lookup<'_>, key: &str, def: f64, errs: &mut Vec<String>) -> f64 {
@@ -393,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn gemini_key_required_when_backend_gemini() {
+    fn key_required_when_provider_gemini() {
         let dir = TempDir::new().unwrap();
         let mut env = base_env(&dir);
         env.remove("GEMINI_API_KEY");
@@ -502,7 +707,7 @@ mod tests {
         let mut env = base_env(&dir);
         env.remove("GEMINI_API_KEY");
         let c = Config::from_lookup(&lookup(&env)).expect("valid");
-        assert_eq!(c.embed_backend, "fake");
+        assert_eq!(c.embed_provider, EmbedProvider::Fake);
     }
 
     #[test]
@@ -510,7 +715,19 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = base_env(&dir);
         let c = Config::from_lookup(&lookup(&env)).expect("valid");
-        assert_eq!(c.embed_backend, "gemini");
+        assert_eq!(c.embed_provider, EmbedProvider::Gemini);
+    }
+
+    #[test]
+    fn embed_backend_defaults_to_voyage_with_voyage_key_only() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.remove("GEMINI_API_KEY");
+        env.insert("VOYAGE_API_KEY".into(), "vk".into());
+        let c = Config::from_lookup(&lookup(&env)).expect("valid");
+        assert_eq!(c.embed_provider, EmbedProvider::Voyage);
+        assert_eq!(c.embed_model, "voyage-4");
+        assert_eq!(c.embed_dim, 1024);
     }
 
     #[test]
@@ -520,7 +737,7 @@ mod tests {
         env.remove("GEMINI_API_KEY");
         env.insert("DOCINDEX_EMBED".into(), "fake".into());
         let c = Config::from_lookup(&lookup(&env)).expect("valid");
-        assert_eq!(c.embed_backend, "fake");
+        assert_eq!(c.embed_provider, EmbedProvider::Fake);
     }
 
     #[test]
@@ -528,7 +745,40 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut env = base_env(&dir);
         env.insert("DOCINDEX_EMBED".into(), "bogus".into());
-        assert!(Config::from_lookup(&lookup(&env)).is_err());
+        let err = Config::from_lookup(&lookup(&env)).expect_err("err");
+        assert!(format!("{err}").contains("bogus"));
+    }
+
+    #[test]
+    fn unknown_model_for_provider_errors() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.insert("DOCINDEX_EMBED_MODEL".into(), "nope-not-a-model".into());
+        let err = Config::from_lookup(&lookup(&env)).expect_err("err");
+        assert!(format!("{err}").contains("nope-not-a-model"));
+    }
+
+    #[test]
+    fn bad_dim_for_model_errors() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.insert("DOCINDEX_EMBED_DIM".into(), "999".into());
+        let err = Config::from_lookup(&lookup(&env)).expect_err("err");
+        assert!(format!("{err}").contains("999"));
+    }
+
+    #[test]
+    fn voyage_bad_dim_lists_allowed() {
+        let dir = TempDir::new().unwrap();
+        let mut env = base_env(&dir);
+        env.remove("GEMINI_API_KEY");
+        env.insert("DOCINDEX_EMBED".into(), "voyage".into());
+        env.insert("VOYAGE_API_KEY".into(), "vk".into());
+        env.insert("DOCINDEX_EMBED_DIM".into(), "3072".into());
+        let err = Config::from_lookup(&lookup(&env)).expect_err("err");
+        let msg = format!("{err}");
+        assert!(msg.contains("256"), "{msg}");
+        assert!(msg.contains("2048"), "{msg}");
     }
 
     #[test]
@@ -598,5 +848,203 @@ mod tests {
         env.insert("DOCINDEX_DISPLAY_K".into(), "20".into());
         let c = Config::from_lookup(&lookup(&env)).expect("valid");
         assert_eq!(c.display_k, 20.0);
+    }
+
+    // --- TOML layering ---------------------------------------------------
+
+    fn empty_lookup() -> impl Fn(&str) -> Option<String> {
+        |_: &str| None
+    }
+
+    fn file_reader_for(
+        files: HashMap<PathBuf, file::FileContent>,
+    ) -> impl Fn(&Path) -> Option<file::FileContent> {
+        move |p: &Path| files.get(p).cloned()
+    }
+
+    fn server_toml_file(dir: &TempDir, extra_embed: &str) -> HashMap<PathBuf, file::FileContent> {
+        let d = dir.path().to_str().unwrap().to_string();
+        let text = format!(
+            r#"
+vault_dir = "{d}"
+db_path = "{d}/index.db"
+listen = "100.83.46.59:7777"
+bearer = "file-secret"
+log_format = "text"
+
+[embed]
+{extra_embed}
+"#
+        );
+        let mut files = HashMap::new();
+        files.insert(
+            PathBuf::from("/cfg/server.toml"),
+            file::FileContent {
+                text,
+                mode: Some(0o600),
+            },
+        );
+        files
+    }
+
+    #[test]
+    fn file_only_no_env_boots() {
+        let dir = TempDir::new().unwrap();
+        let files = server_toml_file(&dir, "provider = \"fake\"");
+        let reader = file_reader_for(files);
+        let flags = ConfigFlags {
+            config_path: Some(PathBuf::from("/cfg/server.toml")),
+            reembed: false,
+        };
+        let c = Config::load(&empty_lookup(), &reader, &flags).expect("valid");
+        assert_eq!(c.bearer, "file-secret");
+        assert_eq!(c.listen, "100.83.46.59:7777");
+        assert_eq!(c.embed_provider, EmbedProvider::Fake);
+    }
+
+    #[test]
+    fn env_overrides_file() {
+        let dir = TempDir::new().unwrap();
+        let files = server_toml_file(&dir, "provider = \"fake\"");
+        let reader = file_reader_for(files);
+        let mut env = HashMap::new();
+        env.insert("DOCINDEX_BEARER".into(), "env-secret".into());
+        let flags = ConfigFlags {
+            config_path: Some(PathBuf::from("/cfg/server.toml")),
+            reembed: false,
+        };
+        let c = Config::load(&lookup(&env), &reader, &flags).expect("valid");
+        assert_eq!(c.bearer, "env-secret");
+    }
+
+    #[test]
+    fn flag_config_path_overrides_env_config_path() {
+        let dir = TempDir::new().unwrap();
+        let d = dir.path().to_str().unwrap().to_string();
+        let mut files = HashMap::new();
+        files.insert(
+            PathBuf::from("/from-flag.toml"),
+            file::FileContent {
+                text: format!(
+                    "vault_dir = \"{d}\"\ndb_path = \"{d}/index.db\"\nlisten = \"1.1.1.1:1\"\nbearer = \"flag-wins\"\n\n[embed]\nprovider = \"fake\"\n"
+                ),
+                mode: Some(0o600),
+            },
+        );
+        files.insert(
+            PathBuf::from("/from-env.toml"),
+            file::FileContent {
+                text: format!(
+                    "vault_dir = \"{d}\"\ndb_path = \"{d}/index.db\"\nlisten = \"2.2.2.2:2\"\nbearer = \"env-wins\"\n\n[embed]\nprovider = \"fake\"\n"
+                ),
+                mode: Some(0o600),
+            },
+        );
+        let reader = file_reader_for(files);
+        let mut env = HashMap::new();
+        env.insert("DOCINDEX_CONFIG".into(), "/from-env.toml".into());
+        let flags = ConfigFlags {
+            config_path: Some(PathBuf::from("/from-flag.toml")),
+            reembed: false,
+        };
+        let c = Config::load(&lookup(&env), &reader, &flags).expect("valid");
+        assert_eq!(c.bearer, "flag-wins");
+        assert_eq!(c.listen, "1.1.1.1:1");
+    }
+
+    #[test]
+    fn bearer_env_indirection_reads_named_var() {
+        let dir = TempDir::new().unwrap();
+        let d = dir.path().to_str().unwrap().to_string();
+        let mut files = HashMap::new();
+        files.insert(
+            PathBuf::from("/cfg/server.toml"),
+            file::FileContent {
+                text: format!(
+                    "vault_dir = \"{d}\"\ndb_path = \"{d}/index.db\"\nlisten = \"1.1.1.1:1\"\nbearer_env = \"MY_BEARER\"\n\n[embed]\nprovider = \"fake\"\n"
+                ),
+                mode: Some(0o600),
+            },
+        );
+        let reader = file_reader_for(files);
+        let mut env = HashMap::new();
+        env.insert("MY_BEARER".into(), "indirected-secret".into());
+        let flags = ConfigFlags {
+            config_path: Some(PathBuf::from("/cfg/server.toml")),
+            reembed: false,
+        };
+        let c = Config::load(&lookup(&env), &reader, &flags).expect("valid");
+        assert_eq!(c.bearer, "indirected-secret");
+    }
+
+    #[test]
+    fn api_key_env_indirection_for_voyage() {
+        let dir = TempDir::new().unwrap();
+        let d = dir.path().to_str().unwrap().to_string();
+        let mut files = HashMap::new();
+        files.insert(
+            PathBuf::from("/cfg/server.toml"),
+            file::FileContent {
+                text: format!(
+                    "vault_dir = \"{d}\"\ndb_path = \"{d}/index.db\"\nlisten = \"1.1.1.1:1\"\nbearer = \"b\"\n\n[embed]\nprovider = \"voyage\"\napi_key_env = \"MY_VOYAGE_KEY\"\n"
+                ),
+                mode: Some(0o600),
+            },
+        );
+        let reader = file_reader_for(files);
+        let mut env = HashMap::new();
+        env.insert("MY_VOYAGE_KEY".into(), "vk-from-indirection".into());
+        let flags = ConfigFlags {
+            config_path: Some(PathBuf::from("/cfg/server.toml")),
+            reembed: false,
+        };
+        let c = Config::load(&lookup(&env), &reader, &flags).expect("valid");
+        assert_eq!(c.embed_api_key, "vk-from-indirection");
+    }
+
+    #[test]
+    fn missing_key_for_voyage_names_env_var() {
+        let dir = TempDir::new().unwrap();
+        let d = dir.path().to_str().unwrap().to_string();
+        let mut files = HashMap::new();
+        files.insert(
+            PathBuf::from("/cfg/server.toml"),
+            file::FileContent {
+                text: format!(
+                    "vault_dir = \"{d}\"\ndb_path = \"{d}/index.db\"\nlisten = \"1.1.1.1:1\"\nbearer = \"b\"\n\n[embed]\nprovider = \"voyage\"\n"
+                ),
+                mode: Some(0o600),
+            },
+        );
+        let reader = file_reader_for(files);
+        let flags = ConfigFlags {
+            config_path: Some(PathBuf::from("/cfg/server.toml")),
+            reembed: false,
+        };
+        let err = Config::load(&empty_lookup(), &reader, &flags).expect_err("err");
+        assert!(format!("{err}").contains("VOYAGE_API_KEY"));
+    }
+
+    #[test]
+    fn base_url_read_from_file() {
+        let dir = TempDir::new().unwrap();
+        let d = dir.path().to_str().unwrap().to_string();
+        let mut files = HashMap::new();
+        files.insert(
+            PathBuf::from("/cfg/server.toml"),
+            file::FileContent {
+                text: format!(
+                    "vault_dir = \"{d}\"\ndb_path = \"{d}/index.db\"\nlisten = \"1.1.1.1:1\"\nbearer = \"b\"\n\n[embed]\nprovider = \"fake\"\nbase_url = \"http://proxy.local\"\n"
+                ),
+                mode: Some(0o600),
+            },
+        );
+        let reader = file_reader_for(files);
+        let flags = ConfigFlags {
+            config_path: Some(PathBuf::from("/cfg/server.toml")),
+            reembed: false,
+        };
+        let c = Config::load(&empty_lookup(), &reader, &flags).expect("valid");
+        assert_eq!(c.embed_base_url.as_deref(), Some("http://proxy.local"));
     }
 }

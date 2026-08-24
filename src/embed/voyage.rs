@@ -1,0 +1,444 @@
+//! Voyage AI embeddings client.
+//!
+//! Mirrors the Gemini client's retry/backoff and `EmbedError` mapping.
+//! Voyage's free-tier limits are per-minute; `Retry-After` (when present)
+//! is honored verbatim, otherwise backoff starts at 1s (not the Gemini
+//! client's 200ms) so a burst of 429s doesn't exhaust retries before the
+//! window resets.
+
+use std::time::Duration;
+
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+
+use super::EmbedError;
+
+/// Max inputs per Voyage embeddings request. Larger batches are chunked.
+pub const MAX_BATCH: usize = 128;
+
+/// Embedder backed by Voyage AI's REST API.
+pub struct Voyage {
+    pub api_key: String,
+    pub model: String,
+    pub dim: usize,
+    pub base_url: String,
+    pub client: reqwest::Client,
+    pub max_retries: u32,
+    pub base_delay: Duration,
+}
+
+impl Voyage {
+    pub fn new(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        dim: usize,
+        timeout: Duration,
+    ) -> Result<Self, EmbedError> {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| EmbedError::Config(format!("build reqwest client: {e}")))?;
+        Ok(Self {
+            api_key: api_key.into(),
+            model: model.into(),
+            dim,
+            base_url: "https://api.voyageai.com".to_string(),
+            client,
+            max_retries: 5,
+            base_delay: Duration::from_secs(1),
+        })
+    }
+
+    async fn embed_batch(
+        &self,
+        texts: &[String],
+        input_type: &str,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if self.api_key.is_empty() {
+            return Err(EmbedError::Config("api_key is empty".into()));
+        }
+        if self.model.is_empty() {
+            return Err(EmbedError::Config("model is empty".into()));
+        }
+        if self.dim == 0 {
+            return Err(EmbedError::Config("dim must be > 0".into()));
+        }
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let url = format!("{}/v1/embeddings", self.base_url);
+        let body = EmbedRequest {
+            model: self.model.clone(),
+            input: texts.to_vec(),
+            input_type: input_type.to_string(),
+            output_dimension: self.dim,
+        };
+
+        let attempts = self.max_retries.saturating_add(1);
+        let mut delay = self.base_delay;
+        let mut last_err: EmbedError = EmbedError::Http("no attempts".into());
+
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+            let resp = match self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = EmbedError::Http(e.to_string());
+                    continue;
+                }
+            };
+            let status = resp.status();
+            let retry_after = retry_after_delay(&resp);
+            let raw = resp
+                .bytes()
+                .await
+                .map_err(|e| EmbedError::Http(format!("read body: {e}")))?;
+
+            if status.is_success() {
+                let parsed: EmbedResponse = serde_json::from_slice(&raw)
+                    .map_err(|e| EmbedError::Decode(format!("decode: {e}")))?;
+                let mut data = parsed.data;
+                data.sort_by_key(|d| d.index);
+                if data.len() != texts.len() {
+                    return Err(EmbedError::Decode(format!(
+                        "response has {} embeddings for {} inputs",
+                        data.len(),
+                        texts.len()
+                    )));
+                }
+                let mut out = Vec::with_capacity(data.len());
+                for d in data {
+                    if d.embedding.len() != self.dim {
+                        return Err(EmbedError::DimMismatch {
+                            got: d.embedding.len(),
+                            want: self.dim,
+                        });
+                    }
+                    out.push(d.embedding);
+                }
+                return Ok(out);
+            }
+
+            let message = parse_api_error(&raw).unwrap_or_else(|| {
+                String::from_utf8(raw.to_vec()).unwrap_or_else(|_| "<binary body>".into())
+            });
+            last_err = EmbedError::Api {
+                status: status.as_u16(),
+                message,
+            };
+            if !is_retryable(status) {
+                return Err(last_err);
+            }
+            if status == StatusCode::TOO_MANY_REQUESTS
+                && let Some(ra) = retry_after
+            {
+                delay = ra;
+            }
+        }
+        Err(EmbedError::RetriesExhausted(format!("{last_err}")))
+    }
+
+    async fn embed(&self, texts: &[String], input_type: &str) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.len() <= MAX_BATCH {
+            return self.embed_batch(texts, input_type).await;
+        }
+        let mut out = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(MAX_BATCH) {
+            out.extend(self.embed_batch(chunk, input_type).await?);
+        }
+        Ok(out)
+    }
+
+    pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.embed(texts, "document").await
+    }
+
+    pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        let texts = [text.to_string()];
+        let mut out = self.embed(&texts, "query").await?;
+        out.pop()
+            .ok_or_else(|| EmbedError::Decode("empty response for single query".into()))
+    }
+}
+
+/// Extract `Retry-After` from a response, if present and a valid integer
+/// number of seconds (the only form Voyage documents).
+fn retry_after_delay(resp: &reqwest::Response) -> Option<Duration> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+fn is_retryable(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn parse_api_error(raw: &[u8]) -> Option<String> {
+    let v: ApiError = serde_json::from_slice(raw).ok()?;
+    let msg = v.detail.or(v.error);
+    match msg {
+        Some(m) if !m.is_empty() => Some(m),
+        _ => None,
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct EmbedRequest {
+    model: String,
+    input: Vec<String>,
+    input_type: String,
+    output_dimension: usize,
+}
+
+#[derive(Deserialize)]
+struct EmbedResponse {
+    data: Vec<EmbedDatum>,
+}
+
+#[derive(Deserialize)]
+struct EmbedDatum {
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+#[derive(Deserialize, Default)]
+struct ApiError {
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_voyage(server: &MockServer, max_retries: u32, base_delay: Duration) -> Voyage {
+        Voyage {
+            api_key: "test-key".into(),
+            model: "voyage-4".into(),
+            dim: 4,
+            base_url: server.uri(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            max_retries,
+            base_delay,
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_documents_request_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(header("Authorization", "Bearer test-key"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(json!({
+                "model": "voyage-4",
+                "input": ["hello"],
+                "input_type": "document",
+                "output_dimension": 4,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "embedding": [0.1, 0.2, 0.3, 0.4], "index": 0 }]
+            })))
+            .mount(&server)
+            .await;
+        let v = test_voyage(&server, 0, Duration::from_millis(1));
+        let out = v.embed_documents(&["hello".to_string()]).await.expect("ok");
+        assert_eq!(out, vec![vec![0.1_f32, 0.2, 0.3, 0.4]]);
+    }
+
+    #[tokio::test]
+    async fn embed_query_uses_query_input_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_json(json!({
+                "model": "voyage-4",
+                "input": ["q"],
+                "input_type": "query",
+                "output_dimension": 4,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "embedding": [1.0, 0.0, 0.0, 0.0], "index": 0 }]
+            })))
+            .mount(&server)
+            .await;
+        let v = test_voyage(&server, 0, Duration::from_millis(1));
+        let out = v.embed_query("q").await.unwrap();
+        assert_eq!(out, vec![1.0_f32, 0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn out_of_order_index_is_reordered() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "embedding": [2.0, 0.0, 0.0, 0.0], "index": 1 },
+                    { "embedding": [1.0, 0.0, 0.0, 0.0], "index": 0 },
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let v = test_voyage(&server, 0, Duration::from_millis(1));
+        let out = v
+            .embed_documents(&["a".to_string(), "b".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(out[0], vec![1.0_f32, 0.0, 0.0, 0.0]);
+        assert_eq!(out[1], vec![2.0_f32, 0.0, 0.0, 0.0]);
+    }
+
+    #[tokio::test]
+    async fn retry_429_honours_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "0")
+                    .set_body_json(json!({"error": "rate limited"})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "embedding": [0.5, 0.5, 0.5, 0.5], "index": 0 }]
+            })))
+            .mount(&server)
+            .await;
+        // Large base_delay proves Retry-After (0s) was used instead — the
+        // request must still complete quickly.
+        let v = test_voyage(&server, 2, Duration::from_secs(30));
+        let start = std::time::Instant::now();
+        let out = v.embed_query("q").await.expect("success after retry");
+        assert_eq!(out.len(), 4);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "Retry-After should have short-circuited the 30s base delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_429_without_retry_after_uses_backoff() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429).set_body_json(json!({"error": "rate limited"})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "embedding": [0.5, 0.5, 0.5, 0.5], "index": 0 }]
+            })))
+            .mount(&server)
+            .await;
+        let v = test_voyage(&server, 2, Duration::from_millis(5));
+        let out = v.embed_query("q").await.expect("success after retry");
+        assert_eq!(out.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn batch_chunking_over_128_inputs() {
+        let server = MockServer::start().await;
+        // First batch of 128, then remainder of 5.
+        Mock::given(method("POST"))
+            .and(body_json_partial_len(128))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: EmbedRequest = serde_json::from_slice(&req.body).unwrap();
+                let data: Vec<_> = body
+                    .input
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| json!({ "embedding": [1.0, 0.0, 0.0, 0.0], "index": i }))
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({ "data": data }))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_json_partial_len(5))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: EmbedRequest = serde_json::from_slice(&req.body).unwrap();
+                let data: Vec<_> = body
+                    .input
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| json!({ "embedding": [2.0, 0.0, 0.0, 0.0], "index": i }))
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({ "data": data }))
+            })
+            .mount(&server)
+            .await;
+        let v = test_voyage(&server, 0, Duration::from_millis(1));
+        let texts: Vec<String> = (0..133).map(|i| format!("text-{i}")).collect();
+        let out = v.embed_documents(&texts).await.expect("ok");
+        assert_eq!(out.len(), 133);
+        assert_eq!(out[0], vec![1.0_f32, 0.0, 0.0, 0.0]);
+        assert_eq!(out[132], vec![2.0_f32, 0.0, 0.0, 0.0]);
+    }
+
+    fn body_json_partial_len(n: usize) -> impl wiremock::Match {
+        struct LenMatch(usize);
+        impl wiremock::Match for LenMatch {
+            fn matches(&self, req: &wiremock::Request) -> bool {
+                serde_json::from_slice::<EmbedRequest>(&req.body)
+                    .map(|b| b.input.len() == self.0)
+                    .unwrap_or(false)
+            }
+        }
+        LenMatch(n)
+    }
+
+    #[tokio::test]
+    async fn fail_fast_on_4xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "bad request"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let v = test_voyage(&server, 5, Duration::from_millis(1));
+        let err = v.embed_query("q").await.expect_err("should fail");
+        assert!(matches!(err, EmbedError::Api { status: 400, .. }));
+    }
+
+    #[tokio::test]
+    async fn validation_errors() {
+        let v = Voyage {
+            api_key: String::new(),
+            model: "m".into(),
+            dim: 4,
+            base_url: "http://x".into(),
+            client: reqwest::Client::new(),
+            max_retries: 0,
+            base_delay: Duration::from_millis(1),
+        };
+        assert!(matches!(
+            v.embed_query("q").await,
+            Err(EmbedError::Config(_))
+        ));
+    }
+}
