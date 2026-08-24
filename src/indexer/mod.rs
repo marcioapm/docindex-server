@@ -590,4 +590,67 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    /// When a file exists on disk but is rejected by the media policy,
+    /// `reindex_one` must remove it from the store, call `bump_reindex`
+    /// so `/health` reflects the change, and return `Ok(())`.
+    ///
+    /// The disallowed-file branch fires when `allows_existing_file` returns
+    /// `None` — for example when media is enabled but the file exceeds the
+    /// configured size limit.
+    #[tokio::test]
+    async fn disallowed_file_calls_bump_reindex_and_removes_state() {
+        let dir = TempDir::new().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+
+        // Write a 1×1 PNG (small) to the vault.
+        image::RgbaImage::new(1, 1)
+            .save(vault.join("photo.png"))
+            .unwrap();
+
+        // Use a policy with media enabled but a 1-byte size cap so the PNG
+        // (which is a few hundred bytes) is rejected by `allows_existing_file`.
+        let mut ctx = mk_ctx(dir.path());
+        ctx.embed_model = "gemini-embedding-2".into();
+        // Index the file once with media enabled so the store has a file-state row.
+        ctx.media_policy = MediaPolicy::new(true, &[], &[], &[], 20, 1, 150).unwrap();
+        reindex_one(&ctx, Path::new("photo.png")).await.unwrap();
+        let file_state_before = ctx
+            .store
+            .lock()
+            .unwrap()
+            .get_file_state("photo.png")
+            .unwrap();
+        assert!(
+            file_state_before.is_some(),
+            "file must be indexed before the policy change"
+        );
+
+        // Reset the reindex timestamp so we can detect bump_reindex.
+        ctx.last_reindex_ms.store(0, Ordering::Relaxed);
+
+        // Switch to a policy with media disabled: classify_path returns None
+        // for .png, so allows_existing_file returns None → disallowed path.
+        ctx.media_policy = MediaPolicy::default(); // media disabled
+
+        let before_ms = ctx.last_reindex_ms.load(Ordering::Relaxed);
+        reindex_one(&ctx, Path::new("photo.png")).await.unwrap();
+        let after_ms = ctx.last_reindex_ms.load(Ordering::Relaxed);
+
+        assert!(
+            after_ms > before_ms,
+            "bump_reindex must update last_reindex_ms on the disallowed-file path"
+        );
+        let file_state_after = ctx
+            .store
+            .lock()
+            .unwrap()
+            .get_file_state("photo.png")
+            .unwrap();
+        assert!(
+            file_state_after.is_none(),
+            "disallowed file must be removed from the store"
+        );
+    }
 }
