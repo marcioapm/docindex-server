@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 use docindex::cli::{CliConfig, CliFlags, Client, ClientError, OutputFormat, config, output};
 use docindex::search::Hit;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(name = "docindex-search", version, about = "Query a docindex server")]
 struct Cli {
     #[command(subcommand)]
@@ -33,7 +33,17 @@ struct Cli {
     global: GlobalArgs,
 }
 
-#[derive(clap::Args, Debug, Default)]
+impl std::fmt::Debug for Cli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cli")
+            .field("command", &self.command)
+            .field("bare_query", &self.bare_query)
+            .field("global", &self.global)
+            .finish()
+    }
+}
+
+#[derive(clap::Args, Default)]
 struct GlobalArgs {
     /// Result count. Defaults to the configured limit, else 10.
     #[arg(short = 'n', long = "limit", global = true)]
@@ -44,7 +54,11 @@ struct GlobalArgs {
     /// Server base URL, e.g. http://100.83.46.59:7777.
     #[arg(long, global = true)]
     server: Option<String>,
-    /// Bearer token.
+    /// Bearer token for authentication.
+    ///
+    /// Intended for local development and testing only. argv is visible to
+    /// other processes on the host via /proc and ps(1). For production use,
+    /// set $DOCINDEX_CLI_TOKEN or add `token`/`token_env` to cli.toml.
     #[arg(long, global = true)]
     token: Option<String>,
     /// Path to a CLI TOML config file.
@@ -54,6 +68,19 @@ struct GlobalArgs {
     /// prefix.
     #[arg(long, global = true)]
     path_filter: Option<String>,
+}
+
+impl std::fmt::Debug for GlobalArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GlobalArgs")
+            .field("limit", &self.limit)
+            .field("json", &self.json)
+            .field("server", &self.server)
+            .field("token", &"[redacted]")
+            .field("config", &self.config)
+            .field("path_filter", &self.path_filter)
+            .finish()
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -101,24 +128,19 @@ fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> ExitCode {
-    let (command, global) = match cli.command {
+    let (verb, arg, global) = match cli.command {
         Some(Command::Search { query, args }) => {
-            (Some(("search", query.join(" "))), merge(cli.global, args))
+            ("search", query.join(" "), merge(cli.global, args))
         }
-        Some(Command::Similar { path, args }) => (Some(("similar", path)), merge(cli.global, args)),
-        Some(Command::Health { args }) => {
-            (Some(("health", String::new())), merge(cli.global, args))
-        }
+        Some(Command::Similar { path, args }) => ("similar", path, merge(cli.global, args)),
+        Some(Command::Health { args }) => ("health", String::new(), merge(cli.global, args)),
         None => {
             if cli.bare_query.is_empty() {
                 eprintln!("docindex-search: expected a query, or one of: search, similar, health");
                 return ExitCode::from(1);
             }
-            (Some(("search", cli.bare_query.join(" "))), cli.global)
+            ("search", cli.bare_query.join(" "), cli.global)
         }
-    };
-    let Some((verb, arg)) = command else {
-        return ExitCode::from(1);
     };
 
     let flags = CliFlags {
@@ -151,7 +173,7 @@ async fn run(cli: Cli) -> ExitCode {
     match verb {
         "health" => run_health(&client, cfg.format).await,
         "similar" => {
-            run_search_like(&client, cfg.format, global.path_filter.as_deref(), || {
+            run_search_like(cfg.format, global.path_filter.as_deref(), || {
                 client.similar(&arg, cfg.limit)
             })
             .await
@@ -161,7 +183,7 @@ async fn run(cli: Cli) -> ExitCode {
                 eprintln!("docindex-search: empty query");
                 return ExitCode::from(1);
             }
-            run_search_like(&client, cfg.format, global.path_filter.as_deref(), || {
+            run_search_like(cfg.format, global.path_filter.as_deref(), || {
                 client.search(&arg, cfg.limit)
             })
             .await
@@ -193,7 +215,6 @@ async fn run_health(client: &Client, format: OutputFormat) -> ExitCode {
 }
 
 async fn run_search_like<F, Fut>(
-    _client: &Client,
     format: OutputFormat,
     path_filter: Option<&str>,
     call: F,
@@ -242,5 +263,42 @@ fn exit_for_client_error(e: &ClientError) -> ExitCode {
     match e {
         ClientError::Auth(_) => ExitCode::from(3),
         ClientError::Network(_) | ClientError::Server { .. } => ExitCode::from(2),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_args_debug_redacts_token() {
+        let args = GlobalArgs {
+            token: Some("super-secret-token".into()),
+            server: Some("http://example.com".into()),
+            ..Default::default()
+        };
+        let dbg = format!("{args:?}");
+        assert!(
+            !dbg.contains("super-secret-token"),
+            "token value must not appear in Debug output: {dbg}"
+        );
+        assert!(dbg.contains("[redacted]"), "expected [redacted] in: {dbg}");
+        // Non-secret fields are still visible.
+        assert!(dbg.contains("http://example.com"), "{dbg}");
+    }
+
+    #[test]
+    fn cli_debug_redacts_nested_token() {
+        let cli = Cli {
+            command: None,
+            bare_query: vec!["q".into()],
+            global: GlobalArgs {
+                token: Some("hidden".into()),
+                ..Default::default()
+            },
+        };
+        let dbg = format!("{cli:?}");
+        assert!(!dbg.contains("hidden"), "token must not appear: {dbg}");
+        assert!(dbg.contains("[redacted]"), "expected [redacted] in: {dbg}");
     }
 }

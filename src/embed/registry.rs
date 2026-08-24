@@ -69,35 +69,11 @@ impl fmt::Display for EmbedProvider {
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub provider: EmbedProvider,
-    pub model: String,
+    pub model: &'static str,
     pub native_dim: usize,
     pub allowed_dims: &'static [usize],
     pub doc_task: &'static str,
     pub query_task: &'static str,
-}
-
-/// Static table entry — mirrors [`ModelInfo`] but with a `'static` model id
-/// so [`MODELS`] can be a plain array literal.
-struct Entry {
-    provider: EmbedProvider,
-    model: &'static str,
-    native_dim: usize,
-    allowed_dims: &'static [usize],
-    doc_task: &'static str,
-    query_task: &'static str,
-}
-
-impl Entry {
-    fn to_owned_info(&self) -> ModelInfo {
-        ModelInfo {
-            provider: self.provider,
-            model: self.model.to_string(),
-            native_dim: self.native_dim,
-            allowed_dims: self.allowed_dims,
-            doc_task: self.doc_task,
-            query_task: self.query_task,
-        }
-    }
 }
 
 /// Gemini's Matryoshka-truncatable dims for `gemini-embedding-001`.
@@ -107,8 +83,8 @@ const VOYAGE_DIMS: &[usize] = &[256, 512, 1024, 2048];
 
 /// The full set of known models. `Fake` has no fixed entries — any model
 /// name / dim is accepted, matched dynamically in [`lookup`].
-static MODELS: &[Entry] = &[
-    Entry {
+static MODELS: &[ModelInfo] = &[
+    ModelInfo {
         provider: EmbedProvider::Gemini,
         model: "gemini-embedding-001",
         native_dim: 3072,
@@ -116,7 +92,7 @@ static MODELS: &[Entry] = &[
         doc_task: "RETRIEVAL_DOCUMENT",
         query_task: "RETRIEVAL_QUERY",
     },
-    Entry {
+    ModelInfo {
         provider: EmbedProvider::Voyage,
         model: "voyage-4",
         native_dim: 1024,
@@ -124,7 +100,7 @@ static MODELS: &[Entry] = &[
         doc_task: "document",
         query_task: "query",
     },
-    Entry {
+    ModelInfo {
         provider: EmbedProvider::Voyage,
         model: "voyage-4-lite",
         native_dim: 1024,
@@ -132,7 +108,7 @@ static MODELS: &[Entry] = &[
         doc_task: "document",
         query_task: "query",
     },
-    Entry {
+    ModelInfo {
         provider: EmbedProvider::Voyage,
         model: "voyage-4-large",
         native_dim: 1024,
@@ -140,7 +116,7 @@ static MODELS: &[Entry] = &[
         doc_task: "document",
         query_task: "query",
     },
-    Entry {
+    ModelInfo {
         provider: EmbedProvider::Voyage,
         model: "voyage-context-4",
         native_dim: 1024,
@@ -148,7 +124,7 @@ static MODELS: &[Entry] = &[
         doc_task: "document",
         query_task: "query",
     },
-    Entry {
+    ModelInfo {
         provider: EmbedProvider::Voyage,
         model: "voyage-code-3",
         native_dim: 1024,
@@ -161,10 +137,10 @@ static MODELS: &[Entry] = &[
 /// `Fake`'s synthetic model entry — accepts any dim, used only for its task
 /// labels and native_dim default (128, an arbitrary small test-friendly
 /// value; callers always pass an explicit dim in practice).
-fn fake_model(model: &str) -> ModelInfo {
+fn fake_model(model: &'static str) -> ModelInfo {
     ModelInfo {
         provider: EmbedProvider::Fake,
-        model: model.to_string(),
+        model,
         native_dim: 128,
         allowed_dims: &[],
         doc_task: "document",
@@ -251,12 +227,12 @@ pub fn models_for(provider: EmbedProvider) -> Vec<&'static str> {
 /// Look up a `(provider, model)` pair. `Fake` matches any model name.
 pub fn lookup(provider: EmbedProvider, model: &str) -> Result<ModelInfo, RegistryError> {
     if provider == EmbedProvider::Fake {
-        return Ok(fake_model(model));
+        return Ok(fake_model("fake"));
     }
     MODELS
         .iter()
         .find(|m| m.provider == provider && m.model == model)
-        .map(Entry::to_owned_info)
+        .cloned()
         .ok_or_else(|| RegistryError::UnknownModel {
             provider,
             got: model.to_string(),
@@ -276,7 +252,7 @@ pub fn validate_dim(info: &ModelInfo, dim: usize) -> Result<(), RegistryError> {
     } else {
         Err(RegistryError::BadDim {
             provider: info.provider,
-            model: info.model.clone(),
+            model: info.model.to_string(),
             got: dim,
             allowed: info.allowed_dims.to_vec(),
         })

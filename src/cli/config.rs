@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::config::{
     Lookup,
     file::{FileReader, find_cli_config},
+    indirected,
 };
 
 /// Resolved CLI configuration.
@@ -117,23 +118,6 @@ impl CliConfig {
 
 fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.is_empty())
-}
-
-fn indirected(
-    inline: &Option<String>,
-    env_key: &Option<String>,
-    lookup: &Lookup<'_>,
-) -> Option<String> {
-    if let Some(v) = inline
-        && !v.is_empty()
-    {
-        return Some(v.clone());
-    }
-    env_key
-        .as_ref()
-        .filter(|k| !k.is_empty())
-        .and_then(|k| lookup(k))
-        .filter(|v| !v.is_empty())
 }
 
 /// Real-filesystem lookup for the CLI binary's default `$HOME`-relative

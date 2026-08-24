@@ -209,21 +209,16 @@ fn build_embedder(cfg: &Config) -> Result<AnyEmbedder> {
             Ok(AnyEmbedder::Gemini(Arc::new(g)))
         }
         crate::embed::registry::EmbedProvider::Voyage => {
-            let v = Voyage::new(
+            let mut v = Voyage::new(
                 cfg.embed_api_key.clone(),
                 cfg.embed_model.clone(),
                 cfg.embed_dim,
                 cfg.http_timeout,
             )
             .map_err(|e| anyhow!("build voyage client: {e}"))?;
-            let v = if let Some(base_url) = &cfg.embed_base_url {
-                Voyage {
-                    base_url: base_url.clone(),
-                    ..v
-                }
-            } else {
-                v
-            };
+            if let Some(base_url) = &cfg.embed_base_url {
+                v.base_url = base_url.clone();
+            }
             Ok(AnyEmbedder::Voyage(Arc::new(v)))
         }
         crate::embed::registry::EmbedProvider::Fake => {
@@ -274,3 +269,40 @@ fn _type_assertions() {
 // Silence unused `Ordering` when the cfg paths don't use it.
 #[allow(dead_code)]
 const _ORDERING: Ordering = Ordering::Relaxed;
+
+#[cfg(test)]
+mod tests {
+    use crate::store::{FingerprintOutcome, Store};
+    use tempfile::TempDir;
+
+    /// A first-boot open (fresh DB) must write the fingerprint so that a
+    /// second open detects a Match rather than Fresh. If the write were
+    /// dropped, the second open would also return Fresh and never catch a
+    /// provider/model/dim change.
+    #[test]
+    fn fresh_db_boot_writes_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("x.db");
+
+        // Simulate first boot: no stored fingerprint.
+        {
+            let store = Store::open(&db, 8).expect("open");
+            let outcome = store.check_fingerprint("fake", "fake", 8).expect("check");
+            assert_eq!(outcome, FingerprintOutcome::Fresh, "new DB must be Fresh");
+            store
+                .set_fingerprint("fake", "fake", 8)
+                .expect("set fingerprint");
+        }
+
+        // Second open: fingerprint must now Match, not Fresh.
+        let store2 = Store::open(&db, 8).expect("reopen");
+        let outcome2 = store2
+            .check_fingerprint("fake", "fake", 8)
+            .expect("check again");
+        assert_eq!(
+            outcome2,
+            FingerprintOutcome::Match,
+            "fingerprint written on first boot must be detected as Match on second open"
+        );
+    }
+}

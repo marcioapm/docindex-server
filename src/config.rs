@@ -24,7 +24,9 @@ pub use file::{
 };
 
 /// Typed, validated runtime configuration.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually to redact `bearer` and `embed_api_key`.
+#[derive(Clone)]
 pub struct Config {
     pub vault_dir: PathBuf,
     pub db_path: PathBuf,
@@ -57,6 +59,31 @@ pub struct Config {
     /// Path of the TOML file this config was loaded from, if any — for
     /// startup logging only.
     pub config_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("vault_dir", &self.vault_dir)
+            .field("db_path", &self.db_path)
+            .field("listen", &self.listen)
+            .field("bearer", &"[redacted]")
+            .field("embed_provider", &self.embed_provider)
+            .field("embed_model", &self.embed_model)
+            .field("embed_dim", &self.embed_dim)
+            .field("embed_api_key", &"[redacted]")
+            .field("embed_base_url", &self.embed_base_url)
+            .field("debounce", &self.debounce)
+            .field("log_format", &self.log_format)
+            .field("http_timeout", &self.http_timeout)
+            .field("allow_loopback", &self.allow_loopback)
+            .field("display_k", &self.display_k)
+            .field("weight_vec", &self.weight_vec)
+            .field("weight_bm25", &self.weight_bm25)
+            .field("reembed", &self.reembed)
+            .field("config_path", &self.config_path)
+            .finish()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -331,7 +358,7 @@ fn resolve_embed(
 
 /// `bearer`/`api_key`-style indirection: prefer the inline value, else look
 /// up the named env var from `*_env`, else `None`.
-fn indirected(
+pub(crate) fn indirected(
     inline: &Option<String>,
     env_key: &Option<String>,
     lookup: &Lookup<'_>,
@@ -1046,5 +1073,25 @@ log_format = "text"
         };
         let c = Config::load(&empty_lookup(), &reader, &flags).expect("valid");
         assert_eq!(c.embed_base_url.as_deref(), Some("http://proxy.local"));
+    }
+
+    #[test]
+    fn debug_redacts_bearer_and_api_key() {
+        let dir = TempDir::new().unwrap();
+        let env = base_env(&dir);
+        let c = Config::from_lookup(&lookup(&env)).expect("valid");
+        let dbg = format!("{c:?}");
+        // "secret" is the bearer value; "key" is the GEMINI_API_KEY value.
+        // The field names (bearer, embed_api_key) are allowed to appear; only
+        // the values must be redacted.
+        assert!(
+            !dbg.contains("\"secret\""),
+            "bearer value must not appear in Debug output: {dbg}"
+        );
+        assert!(
+            !dbg.contains("\"key\""),
+            "api_key value must not appear in Debug output: {dbg}"
+        );
+        assert!(dbg.contains("[redacted]"), "expected [redacted] in: {dbg}");
     }
 }
