@@ -203,15 +203,16 @@ fn decode_image(
         ImageFormat::Gif => {
             let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
                 .map_err(|_| MediaPrepareError::ImageDecode { path: path.into() })?;
-            let frames = decoder
-                .into_frames()
-                .collect_frames()
-                .map_err(|_| MediaPrepareError::ImageDecode { path: path.into() })?;
-            let animated = frames.len() > 1;
+            let mut frames = decoder.into_frames();
+            // Decode only the first frame; check for a second without
+            // decoding its pixel data — `next()` on the lazy iterator
+            // advances the parser just enough to determine whether a frame
+            // boundary exists.
             let first = frames
-                .into_iter()
                 .next()
-                .ok_or_else(|| MediaPrepareError::ImageDecode { path: path.into() })?;
+                .ok_or_else(|| MediaPrepareError::ImageDecode { path: path.into() })?
+                .map_err(|_| MediaPrepareError::ImageDecode { path: path.into() })?;
+            let animated = frames.next().is_some();
             Ok((DynamicImage::ImageRgba8(first.into_buffer()), animated))
         }
         ImageFormat::WebP => {
@@ -510,6 +511,17 @@ mod tests {
         bytes
     }
 
+    fn static_gif() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            let frame =
+                image::Frame::new(image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255])));
+            encoder.encode_frame(frame).unwrap();
+        }
+        bytes
+    }
+
     #[test]
     fn detects_png_bytes_without_consulting_extension() {
         let prepared = prepare_media(
@@ -538,6 +550,32 @@ mod tests {
         };
         let pixel = image::load_from_memory(&parts[0].bytes).unwrap().to_rgba8();
         assert_eq!(pixel.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    /// A single-frame GIF must not be marked truncated — the lazy iterator
+    /// probes for a second frame (returning None) without loading any extra
+    /// pixel data.
+    #[test]
+    fn static_gif_is_not_marked_truncated() {
+        let prepared = prepare_media(
+            "static.gif",
+            &static_gif(),
+            &media_model(PdfMode::Native),
+            PrepareOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            !prepared.chunks[0].metadata.truncated_animation,
+            "single-frame GIF must not be marked truncated"
+        );
+        // Output is PNG (GIF always re-encodes).
+        let EmbedInput::Media(parts) = &prepared.chunks[0].input else {
+            panic!("expected media input");
+        };
+        assert_eq!(parts[0].mime_type, "image/png");
+        // Pixel must be the green frame.
+        let pixel = image::load_from_memory(&parts[0].bytes).unwrap().to_rgba8();
+        assert_eq!(pixel.get_pixel(0, 0).0, [0, 255, 0, 255]);
     }
 
     #[test]
