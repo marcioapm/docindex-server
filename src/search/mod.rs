@@ -12,7 +12,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -83,7 +83,7 @@ pub enum SearchError {
 /// fusion score used for ranking). `score_normalized` is the 0..1
 /// query-independent display score derived from per-branch ranks via
 /// [`normalize_score`].
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Hit {
     pub path: String,
     pub title: String,
