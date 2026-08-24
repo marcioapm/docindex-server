@@ -537,7 +537,12 @@ mod tests {
         assert_eq!(output.len(), 17);
         // Two batches must have been sent: one of 16, one of 1.
         let reqs = server.received_requests().await.unwrap();
-        assert_eq!(reqs.len(), 2, "expected exactly 2 batch requests, got {}", reqs.len());
+        assert_eq!(
+            reqs.len(),
+            2,
+            "expected exactly 2 batch requests, got {}",
+            reqs.len()
+        );
         // Batch sizes: first request has 16 items, second has 1.
         let first_count: usize = serde_json::from_slice::<serde_json::Value>(&reqs[0].body)
             .unwrap()["requests"]

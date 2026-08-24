@@ -132,14 +132,20 @@ mod tests {
             }])])
             .await
             .unwrap()[0];
-        let media_norm_sq: f64 = media_vec.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
+        let media_norm_sq: f64 = media_vec
+            .iter()
+            .map(|x| f64::from(*x) * f64::from(*x))
+            .sum();
         assert!(
             (media_norm_sq - 1.0).abs() < 1e-5,
             "media embedding must be L2-normalised: ||v||² = {media_norm_sq}"
         );
 
         let query_vec = f.embed_query("test query").await.unwrap();
-        let query_norm_sq: f64 = query_vec.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
+        let query_norm_sq: f64 = query_vec
+            .iter()
+            .map(|x| f64::from(*x) * f64::from(*x))
+            .sum();
         assert!(
             (query_norm_sq - 1.0).abs() < 1e-5,
             "query embedding must be L2-normalised: ||v||² = {query_norm_sq}"

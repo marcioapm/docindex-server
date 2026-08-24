@@ -106,7 +106,9 @@ pub enum MediaPrepareError {
         start: usize,
         end: usize,
     },
-    #[error("media preparation for {path}: PDF render produced {pages} pages for a single chunk (max 6)")]
+    #[error(
+        "media preparation for {path}: PDF render produced {pages} pages for a single chunk (max 6)"
+    )]
     PdfChunkTooLarge { path: PathBuf, pages: usize },
     #[error("media preparation for {path}: PDF page {page} could not be rasterized")]
     PdfRender { path: PathBuf, page: usize },
@@ -537,8 +539,11 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
-            let frame =
-                image::Frame::new(image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255])));
+            let frame = image::Frame::new(image::RgbaImage::from_pixel(
+                2,
+                2,
+                image::Rgba([0, 255, 0, 255]),
+            ));
             encoder.encode_frame(frame).unwrap();
         }
         bytes
@@ -746,7 +751,7 @@ mod tests {
         push_obj(
             &mut body,
             &mut offsets,
-            &format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"),
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         );
         // Object 2: Pages
         push_obj(
@@ -866,9 +871,8 @@ mod tests {
             assert_eq!(parts.len(), 1);
             // Re-open the extracted bytes to confirm they are a one-page PDF,
             // not a copy of the full two-page source.
-            let mut editor =
-                pdf_oxide::editor::DocumentEditor::from_bytes(parts[0].bytes.clone())
-                    .expect("extracted bytes must be a valid PDF");
+            let editor = pdf_oxide::editor::DocumentEditor::from_bytes(parts[0].bytes.clone())
+                .expect("extracted bytes must be a valid PDF");
             assert_eq!(
                 editor.current_page_count(),
                 1,
@@ -919,8 +923,8 @@ mod tests {
             pdf_pages_per_chunk: 6,
             ..PrepareOptions::default()
         };
-        let prepared = prepare_media("doc.pdf", &pdf, &model, opts)
-            .expect("6-pages-per-chunk must succeed");
+        let prepared =
+            prepare_media("doc.pdf", &pdf, &model, opts).expect("6-pages-per-chunk must succeed");
         assert_eq!(prepared.chunks.len(), 2, "7 pages / 6 per chunk = 2 chunks");
         assert_eq!(prepared.chunks[0].metadata.page_range, Some((0, 6)));
         assert_eq!(prepared.chunks[1].metadata.page_range, Some((6, 7)));
