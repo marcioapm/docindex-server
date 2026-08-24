@@ -265,6 +265,32 @@ fn prepare_native_pdf(
         return Err(MediaPrepareError::EmptyPdf { path });
     }
     let ranges = page_ranges(page_count, options.pdf_pages_per_chunk as usize);
+
+    // Single-page PDF where the only range spans the whole document: send the
+    // original bytes unchanged. Rebuilding a one-page PDF via
+    // extract_pages_to_bytes rewrites the object graph and xref table with no
+    // semantic benefit and risks fidelity loss on complex single-page files.
+    if ranges.len() == 1 && ranges[0] == (0, page_count) {
+        let mime_type = "application/pdf";
+        let input = media_input(mime_type, bytes.to_vec());
+        let chunk = PreparedMediaChunk {
+            metadata: metadata(
+                MediaType::Pdf,
+                0,
+                Some((0, page_count)),
+                mime_type,
+                &input,
+                false,
+            ),
+            input,
+        };
+        return Ok(PreparedMedia {
+            path,
+            media_type: MediaType::Pdf,
+            chunks: vec![chunk],
+        });
+    }
+
     let chunks = ranges
         .into_iter()
         .enumerate()
@@ -614,5 +640,93 @@ mod tests {
         let display = error.to_string();
         assert!(display.contains("private/paper.pdf"));
         assert!(!display.contains("not-a-real-document"));
+    }
+
+    /// Build a minimal but structurally valid single-page PDF in memory.
+    fn minimal_one_page_pdf() -> Vec<u8> {
+        b"%PDF-1.4\n\
+          1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+          2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+          3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n\
+          xref\n0 4\n\
+          0000000000 65535 f \n\
+          0000000009 00000 n \n\
+          0000000058 00000 n \n\
+          0000000115 00000 n \n\
+          trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n197\n%%EOF\n"
+            .to_vec()
+    }
+
+    /// Build a minimal two-page PDF by cloning the one-page structure with two
+    /// /Page kids.
+    fn minimal_two_page_pdf() -> Vec<u8> {
+        b"%PDF-1.4\n\
+          1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+          2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n\
+          3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n\
+          4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n\
+          xref\n0 5\n\
+          0000000000 65535 f \n\
+          0000000009 00000 n \n\
+          0000000058 00000 n \n\
+          0000000115 00000 n \n\
+          0000000196 00000 n \n\
+          trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n277\n%%EOF\n"
+            .to_vec()
+    }
+
+    /// Single-page PDF with pdf_pages_per_chunk=1: the original bytes must be
+    /// sent unchanged. extract_pages_to_bytes must NOT be called because it
+    /// rebuilds the object graph and risks fidelity loss.
+    #[test]
+    fn native_single_page_pdf_passes_through_original_bytes() {
+        let pdf = minimal_one_page_pdf();
+        let model = media_model(PdfMode::Native);
+        let prepared = prepare_media("doc.pdf", &pdf, &model, PrepareOptions::default()).unwrap();
+        assert_eq!(prepared.chunks.len(), 1, "single-page yields one chunk");
+        let EmbedInput::Media(parts) = &prepared.chunks[0].input else {
+            panic!("expected Media input");
+        };
+        assert_eq!(parts.len(), 1);
+        // Byte equality: original file bytes must be sent untouched.
+        assert_eq!(
+            parts[0].bytes, pdf,
+            "single-page PDF must pass through original bytes unchanged"
+        );
+        assert_eq!(parts[0].mime_type, "application/pdf");
+        // Chunk range covers the whole document: [0, 1).
+        assert_eq!(prepared.chunks[0].metadata.page_range, Some((0, 1)));
+    }
+
+    /// Multi-page PDF with pdf_pages_per_chunk=1: each page is a separate
+    /// chunk produced by extract_pages_to_bytes, so they cannot equal the
+    /// source bytes (which contains both pages).
+    #[test]
+    fn native_multi_page_pdf_uses_extract_per_page() {
+        let pdf = minimal_two_page_pdf();
+        let model = media_model(PdfMode::Native);
+        let opts = PrepareOptions {
+            pdf_pages_per_chunk: 1,
+            ..PrepareOptions::default()
+        };
+        let prepared = prepare_media("multi.pdf", &pdf, &model, opts).unwrap();
+        assert_eq!(prepared.chunks.len(), 2, "two pages → two chunks");
+        for (i, chunk) in prepared.chunks.iter().enumerate() {
+            let EmbedInput::Media(parts) = &chunk.input else {
+                panic!("expected Media input");
+            };
+            assert_eq!(parts.len(), 1);
+            // Each extracted sub-PDF is a valid PDF but not identical to the
+            // original two-page source.
+            assert_ne!(
+                parts[0].bytes, pdf,
+                "extracted single page must differ from two-page source"
+            );
+            assert!(
+                parts[0].bytes.starts_with(b"%PDF-"),
+                "extracted bytes must be a valid PDF"
+            );
+            assert_eq!(chunk.metadata.page_range, Some((i, i + 1)));
+        }
     }
 }
