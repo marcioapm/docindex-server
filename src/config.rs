@@ -591,7 +591,7 @@ mod tests {
         HashMap::from([
             ("DOCINDEX_VAULT_DIR".into(), d.clone()),
             ("DOCINDEX_DB_PATH".into(), format!("{}/index.db", d)),
-            ("DOCINDEX_LISTEN".into(), "100.83.46.59:7777".into()),
+            ("DOCINDEX_LISTEN".into(), "100.64.0.1:7777".into()),
             ("DOCINDEX_BEARER".into(), "secret".into()),
             ("GEMINI_API_KEY".into(), "key".into()),
         ])
@@ -702,7 +702,7 @@ mod tests {
     fn listen_missing_port_errors() {
         let dir = TempDir::new().unwrap();
         let mut env = base_env(&dir);
-        env.insert("DOCINDEX_LISTEN".into(), "100.83.46.59".into());
+        env.insert("DOCINDEX_LISTEN".into(), "100.64.0.1".into());
         assert!(Config::from_lookup(&lookup(&env)).is_err());
     }
 
@@ -895,7 +895,7 @@ mod tests {
             r#"
 vault_dir = "{d}"
 db_path = "{d}/index.db"
-listen = "100.83.46.59:7777"
+listen = "100.64.0.1:7777"
 bearer = "file-secret"
 log_format = "text"
 
@@ -925,7 +925,7 @@ log_format = "text"
         };
         let c = Config::load(&empty_lookup(), &reader, &flags).expect("valid");
         assert_eq!(c.bearer, "file-secret");
-        assert_eq!(c.listen, "100.83.46.59:7777");
+        assert_eq!(c.listen, "100.64.0.1:7777");
         assert_eq!(c.embed_provider, EmbedProvider::Fake);
     }
 

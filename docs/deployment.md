@@ -36,7 +36,7 @@ Create `~/.config/docindex/env` on the host:
 DOCINDEX_VAULT_DIR=/home/docindex/vault
 DOCINDEX_DB_PATH=/home/docindex/index.db
 # Use the Tailscale IP assigned to this host:
-DOCINDEX_LISTEN=100.83.46.59:7777
+DOCINDEX_LISTEN=100.64.0.1:7777
 DOCINDEX_BEARER=<random 32-char secret>
 GEMINI_API_KEY=<from Google AI Studio>
 DOCINDEX_EMBED_MODEL=gemini-embedding-001
@@ -106,9 +106,9 @@ Traffic from Tailscale (`tailscale0`) is allowed by default interface policy; UF
 From any Tailscale peer:
 
 ```sh
-curl http://100.83.46.59:7777/health
+curl http://100.64.0.1:7777/health
 curl -H "Authorization: Bearer $DOCINDEX_BEARER" \
-    -X POST http://100.83.46.59:7777/search \
+    -X POST http://100.64.0.1:7777/search \
     -H 'Content-Type: application/json' \
     -d '{"query":"hello","limit":5}'
 ```

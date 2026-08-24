@@ -76,7 +76,7 @@ def base_env(vault_dir: pathlib.Path, db_path: pathlib.Path) -> dict[str, str]:
         {
             "DOCINDEX_VAULT_DIR": str(vault_dir),
             "DOCINDEX_DB_PATH": str(db_path),
-            "DOCINDEX_LISTEN": "100.83.46.59:7777",
+            "DOCINDEX_LISTEN": "100.64.0.1:7777",
             "DOCINDEX_BEARER": "test-bearer",
             "GEMINI_API_KEY": "test-key",
             "DOCINDEX_EMBED_MODEL": "gemini-embedding-001",

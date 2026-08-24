@@ -47,7 +47,7 @@ Unknown provider, unknown model for a provider, or a `dim` outside a model's all
 ```toml
 vault_dir        = "/var/lib/docindex/vault"
 db_path          = "/var/lib/docindex/index.db"
-listen           = "100.83.46.59:7777"
+listen           = "100.64.0.1:7777"
 bearer           = "..."            # or bearer_env = "DOCINDEX_BEARER"
 debounce_ms      = 5000
 http_timeout_ms  = 30000
@@ -66,7 +66,7 @@ base_url  = "https://..."           # optional override (proxy/mock); NOT part o
 Search order: `--config <path>` > `$DOCINDEX_CLI_CONFIG` > `~/.config/docindex/cli.toml`.
 
 ```toml
-server = "http://100.83.46.59:7777"
+server = "http://100.64.0.1:7777"
 token  = "..."                      # or token_env = "DOCINDEX_BEARER"
 limit  = 10
 format = "text"                     # text | json

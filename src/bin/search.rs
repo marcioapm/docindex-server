@@ -51,7 +51,7 @@ struct GlobalArgs {
     /// Emit the server response verbatim as JSON instead of formatted text.
     #[arg(long, global = true)]
     json: bool,
-    /// Server base URL, e.g. http://100.83.46.59:7777.
+    /// Server base URL, e.g. http://100.64.0.1:7777.
     #[arg(long, global = true)]
     server: Option<String>,
     /// Bearer token for authentication.
