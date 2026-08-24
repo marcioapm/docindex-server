@@ -15,12 +15,23 @@ use crate::config::{
 };
 
 /// Resolved CLI configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CliConfig {
     pub server: String,
     pub token: String,
     pub limit: usize,
     pub format: OutputFormat,
+}
+
+impl std::fmt::Debug for CliConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CliConfig")
+            .field("server", &self.server)
+            .field("token", &"[redacted]")
+            .field("limit", &self.limit)
+            .field("format", &self.format)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,13 +48,25 @@ pub enum CliConfigError {
 
 /// CLI-flag-level overrides. `json` is a bool flag that forces
 /// `OutputFormat::Json` regardless of what env/file/default say.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct CliFlags {
     pub config_path: Option<PathBuf>,
     pub server: Option<String>,
     pub token: Option<String>,
     pub limit: Option<usize>,
     pub json: bool,
+}
+
+impl std::fmt::Debug for CliFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CliFlags")
+            .field("config_path", &self.config_path)
+            .field("server", &self.server)
+            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .field("limit", &self.limit)
+            .field("json", &self.json)
+            .finish()
+    }
 }
 
 const DEFAULT_LIMIT: usize = 10;
@@ -286,6 +309,66 @@ mod tests {
             ..Default::default()
         };
         assert!(CliConfig::load(&empty_lookup(), &no_file(), &flags).is_err());
+    }
+
+    /// `flags.limit` must beat both `DOCINDEX_CLI_LIMIT` env var and the file
+    /// value. If the precedence order were inverted, env (42) or file (5)
+    /// would win and the assertion would fail.
+    #[test]
+    fn flag_limit_beats_env_and_file() {
+        let mut env = HashMap::new();
+        env.insert("DOCINDEX_CLI_SERVER".into(), "http://x".into());
+        env.insert("DOCINDEX_CLI_LIMIT".into(), "42".into());
+        env.insert("DOCINDEX_CLI_CONFIG".into(), "/cfg.toml".into());
+        let mut files = HashMap::new();
+        files.insert(
+            PathBuf::from("/cfg.toml"),
+            FileContent {
+                text: "server = \"http://x\"\nlimit = 5".into(),
+                mode: Some(0o600),
+            },
+        );
+        let reader = file_reader_for(files);
+        let flags = CliFlags {
+            limit: Some(7),
+            ..Default::default()
+        };
+        let c = CliConfig::load(&lookup(&env), &reader, &flags).expect("valid");
+        // flag says 7, env says 42, file says 5 — flag must win.
+        assert_eq!(c.limit, 7);
+    }
+
+    /// `CliConfig::Debug` must not expose the bearer token.
+    #[test]
+    fn cli_config_debug_redacts_token() {
+        let c = CliConfig {
+            server: "http://x".into(),
+            token: "secret-bearer".into(),
+            limit: 10,
+            format: OutputFormat::Text,
+        };
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains("secret-bearer"),
+            "token must not appear in Debug output: {dbg}"
+        );
+        assert!(dbg.contains("[redacted]"), "expected [redacted] in: {dbg}");
+        assert!(dbg.contains("http://x"), "{dbg}");
+    }
+
+    /// `CliFlags::Debug` must not expose the token when set.
+    #[test]
+    fn cli_flags_debug_redacts_token() {
+        let f = CliFlags {
+            token: Some("secret-flag-token".into()),
+            ..Default::default()
+        };
+        let dbg = format!("{f:?}");
+        assert!(
+            !dbg.contains("secret-flag-token"),
+            "token must not appear in Debug output: {dbg}"
+        );
+        assert!(dbg.contains("[redacted]"), "expected [redacted] in: {dbg}");
     }
 
     /// `DOCINDEX_CLI_LIMIT` env var overrides the file value when no flag is
