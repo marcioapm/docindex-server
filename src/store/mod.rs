@@ -180,17 +180,7 @@ impl Store {
             .map_err(|e| StoreError::Msg(format!("recreate chunks_vec: {e}")))?;
         // Write the fingerprint inside the same transaction so the wipe and
         // the new fingerprint are committed atomically.
-        for (key, val) in [
-            ("embedding_provider", provider),
-            ("embedding_model", model),
-            ("embedding_dim", &embed_dim.to_string() as &str),
-        ] {
-            tx.execute(
-                "INSERT INTO meta(key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, val],
-            )?;
-        }
+        write_fingerprint_in_tx(&tx, provider, model, embed_dim)?;
         tx.commit()?;
         Ok(())
     }
@@ -246,17 +236,7 @@ impl Store {
         dim: usize,
     ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        for (key, val) in [
-            ("embedding_provider", provider),
-            ("embedding_model", model),
-            ("embedding_dim", &dim.to_string() as &str),
-        ] {
-            tx.execute(
-                "INSERT INTO meta(key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, val],
-            )?;
-        }
+        write_fingerprint_in_tx(&tx, provider, model, dim)?;
         tx.commit()?;
         Ok(())
     }
@@ -806,6 +786,30 @@ pub struct HitRow {
     pub heading: String,
     pub heading_path: String,
     pub content: String,
+}
+
+/// Upsert the three embedding fingerprint keys inside an open transaction.
+/// Both `wipe_and_rebuild` and `set_fingerprint` share this body so the
+/// SQL and key names live in one place.
+fn write_fingerprint_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    provider: &str,
+    model: &str,
+    dim: usize,
+) -> Result<(), StoreError> {
+    let dim_str = dim.to_string();
+    for (key, val) in [
+        ("embedding_provider", provider),
+        ("embedding_model", model),
+        ("embedding_dim", dim_str.as_str()),
+    ] {
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, val],
+        )?;
+    }
+    Ok(())
 }
 
 fn null_if_empty(s: &str) -> Option<&str> {
