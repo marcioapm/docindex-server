@@ -1463,6 +1463,48 @@ mod tests {
         );
     }
 
+    /// When only 2 of the 3 fingerprint keys are present (`embedding_provider`
+    /// and `embedding_model` but not `embedding_dim`), `peek_fingerprint` must
+    /// return `None`. The partial-key branch is what `FingerprintOutcome::from_peek`
+    /// maps to `Fresh`, so a wrong return here would let a corrupted DB slip
+    /// through as a dim=0 Mismatch.
+    #[test]
+    fn peek_fingerprint_returns_none_for_partial_keys() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.db");
+        {
+            // open_for_reembed skips reconcile_embedding_dim, so embedding_dim
+            // is not written to meta. Write only provider and model manually.
+            let s = Store::open_for_reembed(&path, TEST_DIM).unwrap();
+            s.set_meta("embedding_provider", "gemini").unwrap();
+            s.set_meta("embedding_model", "gemini-embedding-001").unwrap();
+        }
+        let result = Store::peek_fingerprint(&path).unwrap();
+        assert!(
+            result.is_none(),
+            "2-of-3 fingerprint keys must return None, got: {result:?}"
+        );
+    }
+
+    /// When only 1 of the 3 fingerprint keys is present, `peek_fingerprint`
+    /// must also return `None`.
+    #[test]
+    fn peek_fingerprint_returns_none_for_single_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("x.db");
+        {
+            // open_for_reembed skips reconcile_embedding_dim so embedding_dim
+            // is absent; write only embedding_provider.
+            let s = Store::open_for_reembed(&path, TEST_DIM).unwrap();
+            s.set_meta("embedding_provider", "gemini").unwrap();
+        }
+        let result = Store::peek_fingerprint(&path).unwrap();
+        assert!(
+            result.is_none(),
+            "1-of-3 fingerprint keys must return None, got: {result:?}"
+        );
+    }
+
     // --- provider-only mismatch ------------------------------------------
 
     /// `check_fingerprint` must detect a provider change even when model and
