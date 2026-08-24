@@ -106,6 +106,8 @@ pub enum MediaPrepareError {
         start: usize,
         end: usize,
     },
+    #[error("media preparation for {path}: PDF render produced {pages} pages for a single chunk (max 6)")]
+    PdfChunkTooLarge { path: PathBuf, pages: usize },
     #[error("media preparation for {path}: PDF page {page} could not be rasterized")]
     PdfRender { path: PathBuf, page: usize },
 }
@@ -272,6 +274,15 @@ fn prepare_native_pdf(
     // extract_pages_to_bytes rewrites the object graph and xref table with no
     // semantic benefit and risks fidelity loss on complex single-page files.
     if ranges.len() == 1 && ranges[0] == (0, page_count) {
+        // Apply the per-chunk page-count guard even for the passthrough path:
+        // the whole document is sent as a single payload and must not exceed
+        // the provider's page-per-request limit.
+        if page_count > 6 {
+            return Err(MediaPrepareError::PdfChunkTooLarge {
+                path,
+                pages: page_count,
+            });
+        }
         let mime_type = "application/pdf";
         let input = media_input(mime_type, bytes.to_vec());
         let chunk = PreparedMediaChunk {
@@ -296,6 +307,17 @@ fn prepare_native_pdf(
         .into_iter()
         .enumerate()
         .map(|(chunk_index, (start, end))| {
+            // Never send more than 6 pages in a single native PDF payload.
+            // pdf_pages_per_chunk is validated 1..=6 at config time, but an
+            // explicit check here ensures a logic error in page_ranges never
+            // produces an over-limit request.
+            let page_count_in_chunk = end.saturating_sub(start);
+            if page_count_in_chunk > 6 {
+                return Err(MediaPrepareError::PdfChunkTooLarge {
+                    path: path.clone(),
+                    pages: page_count_in_chunk,
+                });
+            }
             let pages: Vec<_> = (start..end).collect();
             let prepared = editor.extract_pages_to_bytes(&pages).map_err(|_| {
                 MediaPrepareError::PdfExtract {
@@ -679,7 +701,6 @@ mod tests {
         assert!(display.contains("private/paper.pdf"));
         assert!(!display.contains("not-a-real-document"));
     }
-
     /// Build a minimal but structurally valid single-page PDF in memory.
     fn minimal_one_page_pdf() -> Vec<u8> {
         b"%PDF-1.4\n\
@@ -693,6 +714,57 @@ mod tests {
           0000000115 00000 n \n\
           trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n197\n%%EOF\n"
             .to_vec()
+    }
+
+    /// Build a minimal structurally valid PDF with `n` pages by generating
+    /// the page-tree objects programmatically.  Used to produce PDFs with
+    /// more pages than the 1- and 2-page helpers above.
+    fn minimal_n_page_pdf(n: usize) -> Vec<u8> {
+        assert!(n >= 1);
+        // Object layout:
+        //  1 0 Catalog → Pages=2
+        //  2 0 Pages   → Kids=[3..n+2], Count=n
+        //  3..n+2 Page objects
+        let mut body = String::from("%PDF-1.4\n");
+        let mut offsets: Vec<usize> = Vec::new();
+
+        let push_obj = |body: &mut String, offsets: &mut Vec<usize>, content: &str| {
+            offsets.push(body.len());
+            body.push_str(content);
+        };
+
+        // Object 1: Catalog
+        let kids: String = (3..=(n + 2)).map(|i| format!("{i} 0 R ")).collect();
+        push_obj(
+            &mut body,
+            &mut offsets,
+            &format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"),
+        );
+        // Object 2: Pages
+        push_obj(
+            &mut body,
+            &mut offsets,
+            &format!("2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {n} >>\nendobj\n"),
+        );
+        // Page objects 3..n+2
+        for _ in 0..n {
+            push_obj(
+                &mut body,
+                &mut offsets,
+                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+            );
+        }
+
+        let xref_offset = body.len();
+        let obj_count = offsets.len() + 1; // +1 for the free entry
+        body.push_str(&format!("xref\n0 {obj_count}\n0000000000 65535 f \n"));
+        for off in &offsets {
+            body.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        body.push_str(&format!(
+            "trailer\n<< /Size {obj_count} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        ));
+        body.into_bytes()
     }
 
     /// Build a minimal two-page PDF by cloning the one-page structure with two
@@ -766,5 +838,65 @@ mod tests {
             );
             assert_eq!(chunk.metadata.page_range, Some((i, i + 1)));
         }
+    }
+
+    /// A page-range chunk that would exceed 6 pages must be caught by the
+    /// explicit guard in prepare_native_pdf before any HTTP request.
+    /// pdf_pages_per_chunk is validated 1..=6 by config, but we bypass
+    /// validate_options here (which only rejects 0) to prove the in-function
+    /// guard is independent.
+    #[test]
+    fn native_pdf_chunk_too_large_returns_error() {
+        // A 7-page PDF with pdf_pages_per_chunk=7 produces a single (0,7)
+        // range — 7 pages in one chunk, which must be rejected.
+        let pdf = minimal_n_page_pdf(7);
+        let model = media_model(PdfMode::Native);
+        let opts = PrepareOptions {
+            pdf_pages_per_chunk: 7, // passes validate_options (only 0 rejected)
+            ..PrepareOptions::default()
+        };
+        let err = match prepare_media("big.pdf", &pdf, &model, opts) {
+            Err(e) => e,
+            Ok(_) => panic!("7-page single-chunk range must be rejected by the guard"),
+        };
+        assert!(
+            matches!(err, MediaPrepareError::PdfChunkTooLarge { pages: 7, .. }),
+            "expected PdfChunkTooLarge{{pages:7}}, got: {err}"
+        );
+        // Path must be in the error message.
+        assert!(
+            err.to_string().contains("big.pdf"),
+            "error must include the path: {err}"
+        );
+    }
+
+    /// A 7-page PDF with pdf_pages_per_chunk=6 produces two ranges: (0,6)
+    /// and (6,7).  The (0,6) range is exactly at the limit and must succeed.
+    #[test]
+    fn native_pdf_six_pages_per_chunk_is_within_limit() {
+        let pdf = minimal_n_page_pdf(7);
+        let model = media_model(PdfMode::Native);
+        let opts = PrepareOptions {
+            pdf_pages_per_chunk: 6,
+            ..PrepareOptions::default()
+        };
+        let prepared = prepare_media("doc.pdf", &pdf, &model, opts)
+            .expect("6-pages-per-chunk must succeed");
+        assert_eq!(prepared.chunks.len(), 2, "7 pages / 6 per chunk = 2 chunks");
+        assert_eq!(prepared.chunks[0].metadata.page_range, Some((0, 6)));
+        assert_eq!(prepared.chunks[1].metadata.page_range, Some((6, 7)));
+    }
+
+    /// page_ranges with pages_per_chunk=7 on a 7-page document would produce
+    /// a single (0,7) range, which the guard must reject.
+    #[test]
+    fn page_ranges_with_large_pages_per_chunk_produces_oversized_range() {
+        let ranges = page_ranges(7, 7);
+        assert_eq!(ranges, vec![(0, 7)]);
+        let (start, end) = ranges[0];
+        assert!(
+            end - start > 6,
+            "page_ranges correctly produces a >6-page range that the guard must catch"
+        );
     }
 }
