@@ -405,17 +405,24 @@ def test_search_returns_media_hits_and_media_only_excludes_text(
         )
         assert r2.status_code == 200, r2.text
         hits2 = r2.json()["hits"]
+        assert hits2, (
+            "media_only search must return media hits; fixture has one image "
+            "and one PDF"
+        )
         text_leaks = [h for h in hits2 if h["media_type"] == "text"]
         assert not text_leaks, (
             f"media_only returned text hits: {text_leaks}"
         )
+        media_only_paths = {h["path"] for h in hits2}
+        assert media_only_paths == {"photo.png", "report.pdf"}, (
+            f"media_only must return exactly the fixture media paths, got {media_only_paths}"
+        )
         # The media_only rank-1 hit must have score_normalized == 1.0 when
         # there is at least one media chunk.
-        if hits2:
-            top_norm = hits2[0]["score_normalized"]
-            assert abs(top_norm - 1.0) < 1e-9, (
-                f"media_only rank-1 score_normalized should be 1.0, got {top_norm}"
-            )
+        top_norm = hits2[0]["score_normalized"]
+        assert abs(top_norm - 1.0) < 1e-9, (
+            f"media_only rank-1 score_normalized should be 1.0, got {top_norm}"
+        )
 
         r3 = httpx.post(
             f"{base_url}/search",
