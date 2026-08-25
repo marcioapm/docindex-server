@@ -1315,6 +1315,52 @@ mod tests {
         assert_eq!(hit.mime_type.as_deref(), Some("image/png"));
     }
 
+    /// Two requested types must both bind into the fixed `?2..?5` slots. A
+    /// slot-indexing regression drops the second type while single-type
+    /// filtering still passes.
+    #[test]
+    fn media_vector_search_filters_on_multiple_requested_types() {
+        use crate::media::MediaType;
+
+        let (_d, s) = open_temp();
+        let text_id = s
+            .upsert_chunk(&sample_chunk(0, "text", "text-hash"), "note.md", 1)
+            .unwrap();
+        s.set_vector_for_chunk(text_id, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let mut image = sample_chunk(0, "image", "image-hash");
+        image.media_type = MediaType::Image;
+        let image_id = s.upsert_chunk(&image, "shot.png", 1).unwrap();
+        s.set_vector_for_chunk(image_id, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let mut pdf = sample_chunk(0, "pdf", "pdf-hash");
+        pdf.media_type = MediaType::Pdf;
+        let pdf_id = s.upsert_chunk(&pdf, "doc.pdf", 1).unwrap();
+        s.set_vector_for_chunk(pdf_id, &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let hits = s
+            .search_media_vec(&query, 10, &[MediaType::Image, MediaType::Pdf])
+            .unwrap();
+        let ids: std::collections::HashSet<i64> = hits.iter().map(|(id, _)| *id).collect();
+
+        assert!(
+            ids.contains(&image_id),
+            "first requested type must be returned: {ids:?}"
+        );
+        assert!(
+            ids.contains(&pdf_id),
+            "second requested type must be returned: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&text_id),
+            "text must never be returned by media search: {ids:?}"
+        );
+    }
+
     #[test]
     fn media_vector_search_filters_text_and_preserves_dense_media_order() {
         let (_d, s) = open_temp();

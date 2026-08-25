@@ -221,8 +221,18 @@ fn parse_media_types(value: &str) -> Result<Vec<String>, String> {
     let mut media_types = Vec::new();
     for media_type in value.split(',') {
         if MediaType::from_exclude_value(media_type).is_none() {
+            // A value containing whitespace is almost always the query text
+            // captured by `--media`, not a mistyped media type, so the hint
+            // names the orderings that keep the query positional.
+            let hint = if media_type.contains(char::is_whitespace) {
+                "; to search all media types put the query first \
+                 (`search \"<query>\" --media`) or separate it \
+                 (`search --media -- \"<query>\"`)"
+            } else {
+                ""
+            };
             return Err(format!(
-                "--media: unknown value {media_type:?}; valid: {}",
+                "--media: unknown value {media_type:?}; valid: {}{hint}",
                 MediaType::EXCLUDE_VALUES.join(", ")
             ));
         }
