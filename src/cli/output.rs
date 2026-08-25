@@ -114,7 +114,6 @@ pub fn terminal_width() -> usize {
 mod tests {
     use super::*;
 
-    /// Baseline text hit used to verify that text rendering is unchanged.
     fn sample_hit() -> Hit {
         Hit {
             path: "Rax/holdouts-prompt.md".into(),
@@ -172,12 +171,6 @@ mod tests {
         }
     }
 
-    // --- text hit: byte-identical output ---
-
-    /// The exact string produced for a text hit must never change.
-    ///
-    /// Mutation that falsifies: change `media_type` from `"text"` to `"image"`;
-    /// the output would gain an extra `[image]` line and the assertion fails.
     #[test]
     fn text_hit_output_is_unchanged() {
         let h = sample_hit();
@@ -188,12 +181,8 @@ mod tests {
         );
     }
 
-    // --- media tag helper ---
-
     #[test]
     fn image_hit_renders_image_tag() {
-        // Mutation: set `media_type = "text"` → `media_tag` returns `None` and no
-        // `[image]` line appears.
         let h = image_hit();
         let out = format_hit(1, &h, 200);
         assert!(
@@ -204,8 +193,6 @@ mod tests {
 
     #[test]
     fn single_page_pdf_renders_page_number() {
-        // Mutation: set `media_end = Some(3)` (two-page range) → tag becomes
-        // `[pdf p2-3]` and the single-page assertion fails.
         let h = pdf_hit(Some(1), Some(2), false);
         let out = format_hit(2, &h, 200);
         assert!(
@@ -214,8 +201,6 @@ mod tests {
         );
     }
 
-    /// Mutation that falsifies: change `media_end` from `Some(5)` to `Some(4)`
-    /// → tag becomes `[pdf p3-4]` and the `p3-5` assertion fails.
     #[test]
     fn multi_page_pdf_renders_page_range() {
         let h = pdf_hit(Some(2), Some(5), false);
@@ -228,8 +213,6 @@ mod tests {
 
     #[test]
     fn truncated_image_appends_truncated_in_tag() {
-        // Mutation: set `truncated = false` → tag becomes `[image]` and the
-        // `[image truncated]` assertion fails.
         let mut h = image_hit();
         h.truncated = true;
         let out = format_hit(1, &h, 200);
@@ -241,8 +224,6 @@ mod tests {
 
     #[test]
     fn pdf_with_no_range_renders_bare_pdf_tag() {
-        // Mutation: set `media_start = Some(0)` and `media_end = Some(1)` → tag
-        // becomes `[pdf p1]` and the bare `[pdf]` assertion fails.
         let h = pdf_hit(None, None, false);
         let out = format_hit(1, &h, 200);
         assert!(
@@ -250,8 +231,6 @@ mod tests {
             "expected bare [pdf] tag; got:\n{out}"
         );
     }
-
-    // --- pre-existing tests (kept for regression coverage) ---
 
     #[test]
     fn format_hit_includes_rank_score_path_heading() {
