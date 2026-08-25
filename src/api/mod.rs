@@ -110,6 +110,51 @@ mod tests {
         }
     }
 
+    /// Seed one text, one image, and one PDF chunk, each with a distinct
+    /// unit vector so the media vector search can find every one of them.
+    fn seed_text_image_pdf_chunks(state: &AppState) {
+        use crate::{chunk::Chunk, media::MediaType};
+
+        let guard = state.store.lock().unwrap();
+        for (idx, (path, content, media_type, mime_type)) in [
+            ("note.md", "market report notes", MediaType::Text, None),
+            (
+                "chart.png",
+                "chart image",
+                MediaType::Image,
+                Some("image/png"),
+            ),
+            (
+                "report.pdf",
+                "market report pdf",
+                MediaType::Pdf,
+                Some("application/pdf"),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let chunk = Chunk {
+                idx: 0,
+                heading: String::new(),
+                heading_path: String::new(),
+                content: content.into(),
+                content_hash: format!("hash-{idx}"),
+                tokens: 3,
+                media_type,
+                mime_type: mime_type.map(String::from),
+                media_start: None,
+                media_end: None,
+                media_unit: None,
+                truncated: false,
+            };
+            let id = guard.upsert_chunk(&chunk, path, 1).unwrap();
+            let mut vector = [0f32; 8];
+            vector[idx] = 1.0;
+            guard.set_vector_for_chunk(id, &vector).unwrap();
+        }
+    }
+
     async fn response_body(response: axum::response::Response) -> Vec<u8> {
         to_bytes(response.into_body(), usize::MAX)
             .await
@@ -203,6 +248,7 @@ mod tests {
     #[tokio::test]
     async fn search_accepts_media_only_request() {
         let (_dir, state) = test_state();
+        seed_text_image_pdf_chunks(&state);
         let response = build_router(state)
             .oneshot(
                 Request::builder()
@@ -221,7 +267,22 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body: serde_json::Value =
             serde_json::from_slice(&response_body(response).await).unwrap();
-        assert_eq!(body, serde_json::json!({ "hits": [] }));
+        let hits = body["hits"].as_array().expect("hits array");
+        assert!(
+            !hits.is_empty(),
+            "media_only + media_types=[pdf] must return the seeded PDF chunk"
+        );
+        let paths: Vec<&str> = hits.iter().map(|h| h["path"].as_str().unwrap()).collect();
+        assert_eq!(
+            paths,
+            ["report.pdf"],
+            "only the PDF chunk must be returned, not the text or image chunk"
+        );
+        let media_types: Vec<&str> = hits
+            .iter()
+            .map(|h| h["media_type"].as_str().unwrap())
+            .collect();
+        assert_eq!(media_types, ["pdf"]);
     }
 
     #[tokio::test]
