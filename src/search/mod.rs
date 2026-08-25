@@ -21,7 +21,10 @@ use crate::{
     store::{HitRow, Store, StoreError},
 };
 
-/// Candidate pool size for each ranker before fusion.
+/// Minimum candidate pool size for each ranker before fusion. The actual
+/// pool passed to each branch is `CANDIDATE_K.max(clamp_limit(limit))` so a
+/// request for more hits than this floor still gets a large enough pool to
+/// fill its `limit`.
 pub const CANDIDATE_K: usize = 30;
 /// RRF smoothing constant. 60 is the value from the original Cormack paper.
 pub const RRF_K: f64 = 60.0;
@@ -166,17 +169,22 @@ pub async fn search_with_options(
         });
     }
 
+    let clamped_limit = clamp_limit(limit);
+    let candidate_k = CANDIDATE_K.max(clamped_limit);
+
     if options.media_only {
         let media_hits =
-            run_media_candidate_query(store.clone(), q_vec, options.media_types).await?;
+            run_media_candidate_query(store.clone(), q_vec, candidate_k, options.media_types)
+                .await?;
         let fused = fuse_rrf_ranked(&rank_ids(&media_hits), &[], RRF_K);
-        return hydrate(store, &fused, clamp_limit(limit), None, display).await;
+        return hydrate(store, &fused, clamped_limit, None, display).await;
     }
 
     let fts_query = fts_query_from_user(query);
-    let (vec_hits, fts_hits) = run_candidate_queries(store.clone(), q_vec, fts_query).await?;
+    let (vec_hits, fts_hits) =
+        run_candidate_queries(store.clone(), q_vec, fts_query, candidate_k).await?;
     let fused = fuse_rrf_ranked(&rank_ids(&vec_hits), &rank_ids(&fts_hits), RRF_K);
-    hydrate(store, &fused, clamp_limit(limit), None, display).await
+    hydrate(store, &fused, clamped_limit, None, display).await
 }
 
 /// Find chunks similar to the stored content at `path`.
@@ -251,13 +259,16 @@ pub async fn similar(
         return Ok(Vec::new());
     };
 
+    let clamped_limit = clamp_limit(limit);
+    let candidate_k = CANDIDATE_K.max(clamped_limit);
     let fts_query = fts_query_from_user(&bag);
-    let (vec_hits, fts_hits) = run_candidate_queries(store.clone(), q_vec, fts_query).await?;
+    let (vec_hits, fts_hits) =
+        run_candidate_queries(store.clone(), q_vec, fts_query, candidate_k).await?;
     let fused = fuse_rrf_ranked(&rank_ids(&vec_hits), &rank_ids(&fts_hits), RRF_K);
     hydrate(
         store,
         &fused,
-        clamp_limit(limit),
+        clamped_limit,
         Some(path.to_string()),
         display,
     )
@@ -366,13 +377,14 @@ fn rank_ids<T>(hits: &[(i64, T)]) -> Vec<i64> {
 async fn run_media_candidate_query(
     store: Arc<Mutex<Store>>,
     q_vec: Vec<f32>,
+    candidate_k: usize,
     media_types: Vec<MediaType>,
 ) -> Result<Vec<(i64, f32)>, SearchError> {
     tokio::task::spawn_blocking(move || -> Result<_, SearchError> {
         let guard = store
             .lock()
             .map_err(|e| SearchError::Msg(format!("store lock: {e}")))?;
-        Ok(guard.search_media_vec(&q_vec, CANDIDATE_K, &media_types)?)
+        Ok(guard.search_media_vec(&q_vec, candidate_k, &media_types)?)
     })
     .await?
 }
@@ -381,6 +393,7 @@ async fn run_candidate_queries(
     store: Arc<Mutex<Store>>,
     q_vec: Vec<f32>,
     fts_query: String,
+    candidate_k: usize,
 ) -> Result<(Vec<(i64, f32)>, Vec<(i64, f64)>), SearchError> {
     let store_vec = store.clone();
     let store_fts = store.clone();
@@ -389,7 +402,7 @@ async fn run_candidate_queries(
         let guard = store_vec
             .lock()
             .map_err(|e| SearchError::Msg(format!("store lock: {e}")))?;
-        Ok(guard.search_vec(&q_vec, CANDIDATE_K)?)
+        Ok(guard.search_vec(&q_vec, candidate_k)?)
     });
     let fts_task = tokio::task::spawn_blocking(move || -> Result<_, SearchError> {
         let guard = store_fts
@@ -400,7 +413,7 @@ async fn run_candidate_queries(
         }
         // FTS MATCH will error on syntactically invalid queries — be
         // forgiving and fall back to empty so the semantic side still runs.
-        match guard.search_fts(&fts_query, CANDIDATE_K) {
+        match guard.search_fts(&fts_query, candidate_k) {
             Ok(v) => Ok(v),
             Err(StoreError::Sqlite(e)) => {
                 tracing::debug!(error = %e, query = %fts_query, "fts query failed; using empty candidate list");
@@ -836,5 +849,153 @@ mod tests {
         assert_eq!(d.w_vec, DEFAULT_WEIGHT_VEC);
         assert_eq!(d.w_bm25, DEFAULT_WEIGHT_BM25);
         assert!(approx(d.w_vec + d.w_bm25, 1.0));
+    }
+
+    // Candidate pool sizing: `limit` up to `LIMIT_MAX` (50) must not be
+    // silently truncated by the `CANDIDATE_K` (30) floor.
+
+    const CANDIDATE_TEST_DIM: usize = 8;
+    const ABOVE_CANDIDATE_K: usize = 40;
+
+    fn candidate_test_store() -> (tempfile::TempDir, Arc<Mutex<Store>>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("x.db"), CANDIDATE_TEST_DIM).unwrap();
+        (dir, Arc::new(Mutex::new(store)))
+    }
+
+    #[tokio::test]
+    async fn media_only_search_above_candidate_k_reaches_requested_limit() {
+        use crate::embed::{AnyEmbedder, Fake};
+
+        let (_dir, store) = candidate_test_store();
+        let embedder = AnyEmbedder::Fake(Arc::new(Fake::new(CANDIDATE_TEST_DIM)));
+        let q_vec = embedder.embed_query("photo").await.unwrap();
+
+        {
+            let guard = store.lock().unwrap();
+            for i in 0..ABOVE_CANDIDATE_K {
+                let chunk = crate::chunk::Chunk {
+                    idx: 0,
+                    heading: String::new(),
+                    heading_path: String::new(),
+                    content: format!("media chunk {i}"),
+                    content_hash: format!("media-hash-{i}"),
+                    tokens: 3,
+                    media_type: MediaType::Image,
+                    mime_type: Some("image/png".into()),
+                    media_start: None,
+                    media_end: None,
+                    media_unit: None,
+                    truncated: false,
+                };
+                let id = guard
+                    .upsert_chunk(&chunk, &format!("img{i}.png"), 1)
+                    .unwrap();
+                guard.set_vector_for_chunk(id, &q_vec).unwrap();
+            }
+        }
+
+        let hits = search_with_options(
+            store,
+            &embedder,
+            CANDIDATE_TEST_DIM,
+            "photo",
+            50,
+            DisplayScoring::default(),
+            SearchOptions {
+                media_only: true,
+                media_types: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            ABOVE_CANDIDATE_K,
+            "limit=50 with {ABOVE_CANDIDATE_K} eligible media chunks must not be capped at CANDIDATE_K"
+        );
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_with_full_overlap_above_candidate_k_reaches_requested_limit() {
+        use crate::embed::{AnyEmbedder, Fake};
+
+        let (_dir, store) = candidate_test_store();
+        let embedder = AnyEmbedder::Fake(Arc::new(Fake::new(CANDIDATE_TEST_DIM)));
+        let q_vec = embedder.embed_query("widget").await.unwrap();
+
+        // Build a unit vector orthogonal to `q_vec` via Gram-Schmidt so we
+        // can place chunk vectors at controlled angles from the query.
+        let mut raw = [0f32; CANDIDATE_TEST_DIM];
+        raw[0] = 1.0;
+        if q_vec[0].abs() > 0.9 {
+            raw = [0f32; CANDIDATE_TEST_DIM];
+            raw[1] = 1.0;
+        }
+        let dot: f32 = raw.iter().zip(&q_vec).map(|(a, b)| a * b).sum();
+        let mut orth: Vec<f32> = raw.iter().zip(&q_vec).map(|(a, b)| a - dot * b).collect();
+        let orth_norm: f32 = orth.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in orth.iter_mut() {
+            *x /= orth_norm;
+        }
+
+        {
+            let guard = store.lock().unwrap();
+            for i in 0..ABOVE_CANDIDATE_K {
+                // Cosine distance to `q_vec` increases with `i` (larger angle
+                // away from the query direction) and bm25 improves with more
+                // "widget" repeats for smaller `i`, so both branches rank
+                // chunks in the SAME order 0..39. This makes the two
+                // candidate lists identical rather than complementary, so a
+                // CANDIDATE_K=30 cap on each branch would cap the fused
+                // result at 30 regardless of `limit`.
+                let repeats = ABOVE_CANDIDATE_K - i;
+                let content = std::iter::repeat_n("widget", repeats)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let chunk = crate::chunk::Chunk {
+                    idx: 0,
+                    heading: String::new(),
+                    heading_path: String::new(),
+                    content,
+                    content_hash: format!("text-hash-{i}"),
+                    tokens: repeats,
+                    media_type: MediaType::Text,
+                    mime_type: None,
+                    media_start: None,
+                    media_end: None,
+                    media_unit: None,
+                    truncated: false,
+                };
+                let id = guard
+                    .upsert_chunk(&chunk, &format!("note{i}.md"), 1)
+                    .unwrap();
+                let theta = (i as f32 + 1.0) * 0.01;
+                let vector: Vec<f32> = q_vec
+                    .iter()
+                    .zip(&orth)
+                    .map(|(q, o)| theta.cos() * q + theta.sin() * o)
+                    .collect();
+                guard.set_vector_for_chunk(id, &vector).unwrap();
+            }
+        }
+
+        let hits = search(
+            store,
+            &embedder,
+            CANDIDATE_TEST_DIM,
+            "widget",
+            50,
+            DisplayScoring::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            ABOVE_CANDIDATE_K,
+            "limit=50 with {ABOVE_CANDIDATE_K} identically-ranked hybrid hits must not be capped at CANDIDATE_K"
+        );
     }
 }
