@@ -126,7 +126,7 @@ Obsidian mobile ──Tailscale──►  docindex-server  ──►  SQLite (in
 
 ```
 GET  /health                          → { ok, indexed_chunks, last_reindex_ms, embedding_model, dim }
-POST /search   { query, limit=10 }    → { hits: [{ path, title, heading_path, snippet, score, score_rrf, score_normalized, chunk_id }] }
+POST /search   { query, limit=10, media_only=false, media_types=[] } → { hits: [{ path, title, heading_path, snippet, score, score_rrf, score_normalized, chunk_id }] }
 POST /similar  { path,  limit=10 }    → same shape
 ```
 

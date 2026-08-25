@@ -609,19 +609,26 @@ impl Store {
     ///
     /// The returned order is dense over media only: rank-1 is the closest
     /// media chunk, regardless of where it would rank among all chunk types.
-    pub fn search_media_vec(&self, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>, StoreError> {
+    pub fn search_media_vec(
+        &self,
+        query: &[f32],
+        k: usize,
+        types: &[crate::media::MediaType],
+    ) -> Result<Vec<(i64, f32)>, StoreError> {
         use std::collections::BinaryHeap;
 
         if k == 0 {
             return Ok(Vec::new());
         }
 
-        // Stream media vectors via a join; never materialise all rows or ids.
+        // Type values are enum-validated at the API boundary, so this fixed
+        // predicate has at most four bound parameters.
         let mut stmt = self.conn.prepare(
             "SELECT v.rowid, v.embedding \
              FROM chunks_vec v \
              JOIN chunks c ON c.id = v.rowid \
-             WHERE c.media_type != 'text'",
+             WHERE c.media_type != 'text' \
+               AND (?1 = 0 OR c.media_type IN (?2, ?3, ?4, ?5))",
         )?;
 
         // Max-heap of (dist_bits, rowid): the root holds the LARGEST distance.
@@ -631,7 +638,19 @@ impl Store {
         // scanned (lowest rowid).
         let mut heap: BinaryHeap<(u32, i64)> = BinaryHeap::with_capacity(k + 1);
 
-        let mut rows = stmt.query([])?;
+        let type_values = [
+            types.first().map(|media_type| media_type.as_str()),
+            types.get(1).map(|media_type| media_type.as_str()),
+            types.get(2).map(|media_type| media_type.as_str()),
+            types.get(3).map(|media_type| media_type.as_str()),
+        ];
+        let mut rows = stmt.query(rusqlite::params![
+            types.len() as i64,
+            type_values[0],
+            type_values[1],
+            type_values[2],
+            type_values[3],
+        ])?;
         while let Some(row) = rows.next()? {
             let rowid: i64 = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
@@ -1317,11 +1336,35 @@ mod tests {
             .unwrap();
 
         let hits = s
-            .search_media_vec(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 10)
+            .search_media_vec(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 10, &[])
             .unwrap();
         assert_eq!(
             hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![image_id, pdf_id]
+        );
+
+        let pdf_hits = s
+            .search_media_vec(
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                10,
+                &[crate::media::MediaType::Pdf],
+            )
+            .unwrap();
+        assert_eq!(
+            pdf_hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [pdf_id]
+        );
+
+        let image_hits = s
+            .search_media_vec(
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                10,
+                &[crate::media::MediaType::Image],
+            )
+            .unwrap();
+        assert_eq!(
+            image_hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [image_id]
         );
     }
 
@@ -1368,7 +1411,7 @@ mod tests {
             .unwrap();
 
         let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let hits = s.search_media_vec(&query, CAP).unwrap();
+        let hits = s.search_media_vec(&query, CAP, &[]).unwrap();
 
         assert_eq!(
             hits.len(),
@@ -1447,7 +1490,7 @@ mod tests {
         s.set_vector_for_chunk(id_near1, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             .unwrap(); // dist ≈ 0.0
 
-        let hits = s.search_media_vec(&query, CAP).unwrap();
+        let hits = s.search_media_vec(&query, CAP, &[]).unwrap();
 
         assert_eq!(
             hits.len(),
@@ -1494,7 +1537,7 @@ mod tests {
 
         let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let hits = s
-            .search_media_vec(&query, 10)
+            .search_media_vec(&query, 10, &[])
             .expect("search must succeed with many media chunks");
         assert_eq!(
             hits.len(),

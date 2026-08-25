@@ -210,7 +210,9 @@ mod tests {
                     .uri("/search")
                     .header("authorization", "Bearer right-token")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"query":"image","media_only":true}"#))
+                    .body(Body::from(
+                        r#"{"query":"image","media_only":true,"media_types":["pdf"]}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -220,6 +222,28 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&response_body(response).await).unwrap();
         assert_eq!(body, serde_json::json!({ "hits": [] }));
+    }
+
+    #[tokio::test]
+    async fn search_rejects_media_types_without_media_only() {
+        let (_dir, state) = test_state();
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/search")
+                    .header("authorization", "Bearer right-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"report","media_types":["pdf"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response_body(response).await).unwrap();
+        assert_eq!(body["error"], "media_types requires media_only");
     }
 
     /// A vault path never carries surrounding whitespace, so a padded path must
