@@ -39,18 +39,19 @@ pub fn format_hit(rank: usize, hit: &Hit, width: usize) -> String {
     }
 }
 
+/// Upper bound on the media-type text inside a generic tag, so an unexpected
+/// server value cannot push the tag line past the terminal column budget.
+const MAX_TAG_TYPE_CHARS: usize = 24;
+
 /// Return a bracketed type tag for non-text hits, `None` for text hits.
 ///
 /// Tag grammar:
 /// - image:               `[image]`
 /// - image truncated:     `[image truncated]`
-/// - pdf single page:     `[pdf p{n}]`          where n = start+1 (1-based)
-/// - pdf page range:      `[pdf p{n}-{end}]`    where end is the exclusive 0-based bound
-/// - pdf no range:        `[pdf]`
+/// - pdf single page:     `[pdf p{first}]`
+/// - pdf page range:      `[pdf p{first}-{last}]`
+/// - pdf unusable range:  `[pdf]`
 /// - any + truncated:     ` truncated` appended inside the brackets
-///
-/// `media_start`/`media_end` are a 0-based half-open page range; display uses
-/// 1-based page numbers so `start=0, end=1` → `p1`.
 fn media_tag(hit: &Hit) -> Option<String> {
     let trunc = if hit.truncated { " truncated" } else { "" };
 
@@ -58,15 +59,35 @@ fn media_tag(hit: &Hit) -> Option<String> {
         "text" | "" => None,
         "image" => Some(format!("[image{trunc}]")),
         "pdf" => {
-            let range = match (hit.media_start, hit.media_end) {
-                (Some(s), Some(e)) if e == s + 1 => format!(" p{}", s + 1),
-                (Some(s), Some(e)) if e > s + 1 => format!(" p{}-{}", s + 1, e),
-                _ => String::new(),
-            };
+            let range = pdf_page_range(hit.media_start, hit.media_end);
             Some(format!("[pdf{range}{trunc}]"))
         }
-        // Unknown future media types fall through as a generic tag.
-        other => Some(format!("[{other}{trunc}]")),
+        other => Some(format!("[{}{trunc}]", truncate(other, MAX_TAG_TYPE_CHARS))),
+    }
+}
+
+/// Display suffix for a PDF page range stored as the 0-based half-open
+/// interval `[start, end)`, or an empty string when the interval is unusable.
+///
+/// Usable requires both bounds present, `start >= 0` and `end > start`; a
+/// malformed row (inverted, zero-length, negative) degrades to a bare `[pdf]`
+/// tag rather than a nonsensical page number. Display pages are 1-based and
+/// inclusive, so `[0, 1)` renders ` p1` and `[2, 5)` renders ` p3-5`.
+///
+/// `end > start` also bounds `start` below `i64::MAX`, so `start + 1` cannot
+/// overflow.
+fn pdf_page_range(start: Option<i64>, end: Option<i64>) -> String {
+    let (Some(start), Some(end)) = (start, end) else {
+        return String::new();
+    };
+    if start < 0 || end <= start {
+        return String::new();
+    }
+    let first = start + 1;
+    if end == first {
+        format!(" p{first}")
+    } else {
+        format!(" p{first}-{end}")
     }
 }
 
@@ -260,5 +281,96 @@ mod tests {
     #[test]
     fn truncate_short_string_unchanged() {
         assert_eq!(truncate("short", 200), "short");
+    }
+
+    #[test]
+    fn unknown_media_type_renders_generic_tag() {
+        let mut h = image_hit();
+        h.media_type = "audio".into();
+        let out = format_hit(1, &h, 200);
+        assert!(
+            out.contains("\n        [audio]\n"),
+            "unknown media type must still get a tag; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn unknown_media_type_carries_truncated_marker() {
+        let mut h = image_hit();
+        h.media_type = "audio".into();
+        h.truncated = true;
+        let out = format_hit(1, &h, 200);
+        assert!(
+            out.contains("\n        [audio truncated]\n"),
+            "expected [audio truncated]; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn overlong_media_type_is_clamped_in_tag() {
+        let mut h = image_hit();
+        h.media_type = "x".repeat(200);
+        let out = format_hit(1, &h, 200);
+        let tag_line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with('['))
+            .expect("tag line present");
+        assert!(
+            tag_line.trim().chars().count() <= MAX_TAG_TYPE_CHARS + 2,
+            "tag line must stay bounded, got {} chars: {tag_line}",
+            tag_line.trim().chars().count()
+        );
+    }
+
+    #[test]
+    fn zero_length_pdf_range_renders_bare_pdf_tag() {
+        let h = pdf_hit(Some(2), Some(2), false);
+        let out = format_hit(1, &h, 200);
+        assert!(
+            out.contains("\n        [pdf]\n"),
+            "zero-length range must degrade to bare [pdf]; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn inverted_pdf_range_renders_bare_pdf_tag() {
+        let h = pdf_hit(Some(5), Some(2), false);
+        let out = format_hit(1, &h, 200);
+        assert!(
+            out.contains("\n        [pdf]\n"),
+            "inverted range must degrade to bare [pdf]; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn negative_pdf_start_renders_bare_pdf_tag() {
+        let h = pdf_hit(Some(-1), Some(3), false);
+        let out = format_hit(1, &h, 200);
+        assert!(
+            out.contains("\n        [pdf]\n"),
+            "negative start must degrade to bare [pdf]; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pdf_start_at_i64_max_does_not_overflow() {
+        let h = pdf_hit(Some(i64::MAX), Some(i64::MAX), false);
+        let out = format_hit(1, &h, 200);
+        assert!(
+            out.contains("\n        [pdf]\n"),
+            "i64::MAX start must degrade to bare [pdf] without panicking; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pdf_range_with_only_one_bound_renders_bare_pdf_tag() {
+        for (start, end) in [(Some(1), None), (None, Some(3))] {
+            let h = pdf_hit(start, end, false);
+            let out = format_hit(1, &h, 200);
+            assert!(
+                out.contains("\n        [pdf]\n"),
+                "half-specified range {start:?}..{end:?} must degrade to bare [pdf]; got:\n{out}"
+            );
+        }
     }
 }
