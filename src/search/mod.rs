@@ -1610,15 +1610,59 @@ mod tests {
             lane,
             Some(&distances),
         );
-        assert_eq!(results.len(), 8);
         assert_eq!(
-            results
-                .iter()
-                .filter(|hit| hit.media_type == "image")
-                .count(),
-            1
+            results.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7, 99],
+            "one admission into two reserved slots must evict only the last text entry"
         );
-        assert!(results.iter().any(|hit| hit.chunk_id == 7));
+    }
+
+    #[tokio::test]
+    async fn media_absent_from_the_distance_map_keeps_the_rank_derived_score() {
+        let (_dir, store, embedder, q_vec, _orth) = candidate_test_fixture("widget").await;
+        {
+            let guard = store.lock().unwrap();
+            let chunk = crate::chunk::Chunk {
+                idx: 0,
+                heading: String::new(),
+                heading_path: String::new(),
+                content: String::new(),
+                content_hash: "solo-image".into(),
+                tokens: 0,
+                media_type: MediaType::Image,
+                mime_type: Some("image/png".into()),
+                media_start: None,
+                media_end: None,
+                media_unit: None,
+                truncated: false,
+            };
+            let id = guard.upsert_chunk(&chunk, "solo.png", 1).unwrap();
+            guard.set_vector_for_chunk(id, &q_vec).unwrap();
+        }
+
+        // media_only hydration passes no distance map while the lane is off, so
+        // the rank-derived score stands: rank 1 scores (k+1)/(k+1) = 1.0.
+        let hits = search_with_options(
+            store,
+            &embedder,
+            CANDIDATE_TEST_DIM,
+            "widget",
+            10,
+            DisplayScoring::default(),
+            SearchOptions {
+                media_only: true,
+                media_types: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert!(
+            (hits[0].score_normalized - 1.0).abs() < 1e-9,
+            "expected the rank-derived fallback, got {}",
+            hits[0].score_normalized
+        );
     }
 
     #[test]

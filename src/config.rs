@@ -927,6 +927,41 @@ mod tests {
     }
 
     #[test]
+    fn media_lane_reads_every_field_from_its_own_toml_key() {
+        let dir = TempDir::new().unwrap();
+        let d = dir.path().display();
+        // Deliberately distinct values: a transposed assignment between any two
+        // fields changes which number lands where.
+        let files = HashMap::from([(
+            PathBuf::from("/search.toml"),
+            file::FileContent {
+                text: format!(
+                    "vault_dir = \"{d}\"\ndb_path = \"{d}/index.db\"\nlisten = \"100.64.0.1:7777\"\nbearer = \"secret\"\n[embed]\nprovider = \"fake\"\n[search]\nmedia_lane_enabled = true\nmedia_lane_fraction = 0.11\nmedia_gate_image = 0.22\nmedia_gate_pdf = 0.33\nmedia_display_image_best = 0.44\nmedia_display_image_worst = 0.55\nmedia_display_pdf_best = 0.66\nmedia_display_pdf_worst = 0.77\n"
+                ),
+                mode: None,
+            },
+        )]);
+        let reader = file_reader_for(files);
+        let flags = ConfigFlags {
+            config_path: Some(PathBuf::from("/search.toml")),
+            reembed: false,
+        };
+
+        let lane = Config::load(&empty_lookup(), &reader, &flags)
+            .expect("valid")
+            .media_lane;
+
+        assert!(lane.enabled);
+        assert_eq!(lane.fraction, 0.11);
+        assert_eq!(lane.gate_image, 0.22);
+        assert_eq!(lane.gate_pdf, 0.33);
+        assert_eq!(lane.display_image_best, 0.44);
+        assert_eq!(lane.display_image_worst, 0.55);
+        assert_eq!(lane.display_pdf_best, 0.66);
+        assert_eq!(lane.display_pdf_worst, 0.77);
+    }
+
+    #[test]
     fn media_lane_rejects_invalid_fraction_endpoints_and_non_finite_values() {
         let dir = TempDir::new().unwrap();
         let d = dir.path().display();
