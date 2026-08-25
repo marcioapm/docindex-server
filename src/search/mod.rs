@@ -295,7 +295,7 @@ pub async fn search_with_options(
         media_distances.clone(),
     )
     .await?;
-    if let Some(media_hits) = media_hits {
+    if let Some((media_hits, media_distances)) = media_hits.zip(media_distances) {
         let media_fused = fuse_rrf_ranked(&rank_ids(&media_hits), &[], RRF_K);
         let media_hydrated = hydrate(
             store,
@@ -303,7 +303,7 @@ pub async fn search_with_options(
             candidate_k,
             None,
             display,
-            media_distances.clone(),
+            Some(media_distances.clone()),
         )
         .await?;
         insert_media_lane(
@@ -311,7 +311,7 @@ pub async fn search_with_options(
             media_hydrated,
             clamped_limit,
             display.media_lane,
-            media_distances.as_ref(),
+            &media_distances,
         );
     }
     Ok(hydrated)
@@ -519,7 +519,7 @@ fn insert_media_lane(
     candidates: Vec<Hit>,
     limit: usize,
     lane: MediaLaneScoring,
-    distances: Option<&HashMap<i64, f32>>,
+    distances: &HashMap<i64, f32>,
 ) {
     let slots = (limit as f64 * lane.fraction).floor() as usize;
     if slots == 0 {
@@ -530,19 +530,12 @@ fn insert_media_lane(
         .into_iter()
         .filter(|hit| {
             lane.gate_for(&hit.media_type)
-                .zip(
-                    distances
-                        .and_then(|distances| distances.get(&hit.chunk_id))
-                        .copied(),
-                )
+                .zip(distances.get(&hit.chunk_id).copied())
                 .is_some_and(|(gate, distance)| distance <= gate as f32)
                 && !present.contains(&hit.chunk_id)
         })
         .take(slots)
         .collect();
-    if inserted.is_empty() {
-        return;
-    }
     // Spacing must follow the count that can actually be admitted: free
     // capacity plus the text entries available to displace. Deriving it from
     // the candidate count instead would bunch a partial admission at the front.
@@ -556,7 +549,7 @@ fn insert_media_lane(
     }
     inserted.truncate(admissible);
     let stride = limit.div_ceil(inserted.len());
-    for (i, hit) in inserted.drain(..).enumerate() {
+    for (i, hit) in inserted.into_iter().enumerate() {
         if results.len() >= limit {
             // Only text entries are displaceable. A result with none left is
             // already all media, so admitting more would evict media.
@@ -1350,6 +1343,29 @@ mod tests {
         }
     }
 
+    fn lane_ids(hits: &[Hit]) -> Vec<i64> {
+        hits.iter().map(|hit| hit.chunk_id).collect()
+    }
+
+    fn seed_image_chunk(store: &Store, path: &str, content_hash: String, vector: &[f32]) {
+        let chunk = crate::chunk::Chunk {
+            idx: 0,
+            heading: String::new(),
+            heading_path: String::new(),
+            content: String::new(),
+            content_hash,
+            tokens: 0,
+            media_type: MediaType::Image,
+            mime_type: Some("image/png".into()),
+            media_start: None,
+            media_end: None,
+            media_unit: None,
+            truncated: false,
+        };
+        let id = store.upsert_chunk(&chunk, path, 1).unwrap();
+        store.set_vector_for_chunk(id, vector).unwrap();
+    }
+
     /// Seeds `text_count` text chunks nearer the query than a single image at
     /// `image_theta` radians, so the image falls outside the vector candidate
     /// window and has no FTS content to reach the lexical branch.
@@ -1375,27 +1391,12 @@ mod tests {
                     (i as f32 + 1.0) * 0.001,
                 );
             }
-            let chunk = crate::chunk::Chunk {
-                idx: 0,
-                heading: String::new(),
-                heading_path: String::new(),
-                content: String::new(),
-                content_hash: "image-hash".into(),
-                tokens: 0,
-                media_type: MediaType::Image,
-                mime_type: Some("image/png".into()),
-                media_start: None,
-                media_end: None,
-                media_unit: None,
-                truncated: false,
-            };
-            let id = guard.upsert_chunk(&chunk, "photo.png", 1).unwrap();
             let vector: Vec<f32> = q_vec
                 .iter()
                 .zip(&orth)
                 .map(|(q, o)| image_theta.cos() * q + image_theta.sin() * o)
                 .collect();
-            guard.set_vector_for_chunk(id, &vector).unwrap();
+            seed_image_chunk(&guard, "photo.png", "image-hash".into(), &vector);
         }
         (dir, store, embedder)
     }
@@ -1483,30 +1484,18 @@ mod tests {
                 );
             }
             for i in 0..40 {
-                let chunk = crate::chunk::Chunk {
-                    idx: 0,
-                    heading: String::new(),
-                    heading_path: String::new(),
-                    content: String::new(),
-                    content_hash: format!("image-hash-{i}"),
-                    tokens: 0,
-                    media_type: MediaType::Image,
-                    mime_type: Some("image/png".into()),
-                    media_start: None,
-                    media_end: None,
-                    media_unit: None,
-                    truncated: false,
-                };
-                let id = guard
-                    .upsert_chunk(&chunk, &format!("photo{i}.png"), 1)
-                    .unwrap();
                 let theta = 0.80 + i as f32 * 0.001;
                 let vector: Vec<f32> = q_vec
                     .iter()
                     .zip(&orth)
                     .map(|(q, o)| theta.cos() * q + theta.sin() * o)
                     .collect();
-                guard.set_vector_for_chunk(id, &vector).unwrap();
+                seed_image_chunk(
+                    &guard,
+                    &format!("photo{i}.png"),
+                    format!("image-hash-{i}"),
+                    &vector,
+                );
             }
         }
 
@@ -1542,14 +1531,14 @@ mod tests {
                 vec![lane_hit(99, media_type)],
                 4,
                 lane,
-                Some(&HashMap::from([(99, threshold)])),
+                &HashMap::from([(99, threshold)]),
             );
             insert_media_lane(
                 &mut rejected,
                 vec![lane_hit(99, media_type)],
                 4,
                 lane,
-                Some(&HashMap::from([(99, threshold + 0.000_001)])),
+                &HashMap::from([(99, threshold + 0.000_001)]),
             );
             assert!(
                 admitted.iter().any(|hit| hit.chunk_id == 99),
@@ -1568,7 +1557,7 @@ mod tests {
         let mut results = (1..=20).map(|id| lane_hit(id, "text")).collect();
         let media = vec![lane_hit(99, "image")];
         let distances = HashMap::from([(99, 0.40)]);
-        insert_media_lane(&mut results, media, 20, lane, Some(&distances));
+        insert_media_lane(&mut results, media, 20, lane, &distances);
         assert!(results.iter().any(|hit| hit.chunk_id == 99));
         assert_eq!(results.len(), 20);
     }
@@ -1588,7 +1577,7 @@ mod tests {
             vec![lane_hit(4, "image")],
             20,
             lane,
-            Some(&distances),
+            &distances,
         );
         assert_eq!(results.iter().filter(|hit| hit.chunk_id == 4).count(), 1);
         assert_eq!(results[1].chunk_id, 4);
@@ -1605,7 +1594,7 @@ mod tests {
             vec![lane_hit(99, "image")],
             20,
             lane,
-            Some(&distances),
+            &distances,
         );
         assert_eq!(results, baseline);
     }
@@ -1620,10 +1609,10 @@ mod tests {
             vec![lane_hit(99, "image")],
             8,
             lane,
-            Some(&distances),
+            &distances,
         );
         assert_eq!(
-            results.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
+            lane_ids(&results),
             [1, 2, 3, 4, 5, 6, 7, 99],
             "one admission into two reserved slots must evict only the last text entry"
         );
@@ -1634,22 +1623,7 @@ mod tests {
         let (_dir, store, embedder, q_vec, _orth) = candidate_test_fixture("widget").await;
         {
             let guard = store.lock().unwrap();
-            let chunk = crate::chunk::Chunk {
-                idx: 0,
-                heading: String::new(),
-                heading_path: String::new(),
-                content: String::new(),
-                content_hash: "solo-image".into(),
-                tokens: 0,
-                media_type: MediaType::Image,
-                mime_type: Some("image/png".into()),
-                media_start: None,
-                media_end: None,
-                media_unit: None,
-                truncated: false,
-            };
-            let id = guard.upsert_chunk(&chunk, "solo.png", 1).unwrap();
-            guard.set_vector_for_chunk(id, &q_vec).unwrap();
+            seed_image_chunk(&guard, "solo.png", "solo-image".into(), &q_vec);
         }
 
         // media_only hydration passes no distance map while the lane is off, so
@@ -1691,10 +1665,10 @@ mod tests {
         let candidates: Vec<_> = (91..=94).map(|id| lane_hit(id, "image")).collect();
         let distances: HashMap<i64, f32> = (91..=94).map(|id| (id, 0.20)).collect();
 
-        insert_media_lane(&mut results, candidates, 8, lane, Some(&distances));
+        insert_media_lane(&mut results, candidates, 8, lane, &distances);
 
         assert_eq!(
-            results.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
+            lane_ids(&results),
             [1, 2, 3, 4, 5, 6, 7, 91],
             "the single admissible candidate must take the freed tail slot"
         );
@@ -1714,12 +1688,9 @@ mod tests {
             vec![lane_hit(91, "image"), lane_hit(92, "image")],
             8,
             lane,
-            Some(&distances),
+            &distances,
         );
-        assert_eq!(
-            results.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
-            [1, 2, 3, 91, 4, 5, 6, 92]
-        );
+        assert_eq!(lane_ids(&results), [1, 2, 3, 91, 4, 5, 6, 92]);
     }
 
     #[test]
