@@ -139,7 +139,7 @@ POST /similar  { path,  limit=10 }    → same shape
 Every hit carries three scores:
 - `score` — the RRF fusion score (kept for back-compat with older plugin versions).
 - `score_rrf` — same value as `score`. This is the field the ranker orders on.
-- `score_normalized` — 0..1, query-independent, derived from per-branch ranks via `W_VEC * branch_norm(v_rank, K) + W_BM25 * branch_norm(b_rank, K)` where `branch_norm(r, K) = (K+1)/(K+r)` (or 0 if absent from that branch). Used by the plugin for "% relevance" and threshold filtering. Defaults: `K = DOCINDEX_DISPLAY_K = 10`, `W_VEC = DOCINDEX_WEIGHT_VEC = 0.55`, `W_BM25 = DOCINDEX_WEIGHT_BM25 = 0.45`.
+- `score_normalized` — 0..1, query-independent, derived from per-branch ranks via `W_VEC * branch_norm(v_rank, K) + W_BM25 * branch_norm(b_rank, K)` where `branch_norm(r, K) = (K+1)/(K+r)` (or 0 if absent from that branch). With `[search].media_lane_enabled`, media uses its configured type-specific raw-distance map instead. Used by the plugin for "% relevance" and threshold filtering. Defaults: `K = DOCINDEX_DISPLAY_K = 10`, `W_VEC = DOCINDEX_WEIGHT_VEC = 0.55`, `W_BM25 = DOCINDEX_WEIGHT_BM25 = 0.45`.
 
 `score_rrf` is what the server ranks on; `score_normalized` is what the plugin displays + thresholds. See `docs/ARCHITECTURE.md` ("Ranking") and `docs/deployment.md` ("Tuning display + threshold") for the rationale behind two `k`s (ranking k=60, display k=10).
 
@@ -164,6 +164,8 @@ Every hit carries three scores:
 3. Top-30 via BM25 (`FTS5`, `bm25(chunks_fts)`).
 4. **Reciprocal Rank Fusion** (k=60, `search::RRF_K`) over the two lists. Ties broken by id ascending (deterministic).
 5. Return top-N (clamped 1..=50) with snippet + metadata.
+
+When `[search].media_lane_enabled = true`, blended search also queries the top-30 all-media vector candidates independently. Candidates pass only at or below their image/PDF raw cosine-distance gate; up to `floor(limit * media_lane_fraction)` previously absent candidates are evenly inserted without moving already-ranked media. Unused slots remain text. Audio/video use image gate/display settings until calibrated.
 
 Don't normalize raw scores across the two lists — RRF avoids that rabbit hole.
 
