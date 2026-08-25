@@ -75,6 +75,41 @@ mod tests {
         (dir, state)
     }
 
+    /// Insert chunks with distinct unit vectors so a change in the query vector
+    /// is observable as a change in hit order.
+    fn seed_scored_chunks(state: &AppState) {
+        use crate::{chunk::Chunk, media::MediaType};
+
+        let guard = state.store.lock().unwrap();
+        for (idx, (path, content)) in [
+            ("soup.md", "carrot soup recipe"),
+            ("stew.md", "beef stew recipe"),
+            ("bread.md", "sourdough bread notes"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let chunk = Chunk {
+                idx: 0,
+                heading: String::new(),
+                heading_path: String::new(),
+                content: content.into(),
+                content_hash: format!("hash-{idx}"),
+                tokens: 3,
+                media_type: MediaType::Text,
+                mime_type: None,
+                media_start: None,
+                media_end: None,
+                media_unit: None,
+                truncated: false,
+            };
+            let id = guard.upsert_chunk(&chunk, path, 1).unwrap();
+            let mut vector = [0f32; 8];
+            vector[idx] = 1.0;
+            guard.set_vector_for_chunk(id, &vector).unwrap();
+        }
+    }
+
     async fn response_body(response: axum::response::Response) -> Vec<u8> {
         to_bytes(response.into_body(), usize::MAX)
             .await
@@ -185,6 +220,79 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&response_body(response).await).unwrap();
         assert_eq!(body, serde_json::json!({ "hits": [] }));
+    }
+
+    /// A vault path never carries surrounding whitespace, so a padded path must
+    /// resolve to the same indexed file rather than falling through to 404.
+    #[tokio::test]
+    async fn similar_trims_surrounding_whitespace_in_path() {
+        let (_dir, state) = test_state();
+        state
+            .store
+            .lock()
+            .unwrap()
+            .set_file_state("empty.md", "hash", 123)
+            .unwrap();
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/similar")
+                    .header("authorization", "Bearer right-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"path":"  empty.md  "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "padded path must resolve to the indexed file, not 404"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&response_body(response).await).unwrap();
+        assert_eq!(body, serde_json::json!({ "hits": [] }));
+    }
+
+    /// Surrounding whitespace changes the embedding and therefore hit order, so
+    /// a padded query must produce byte-identical results to the bare one.
+    #[tokio::test]
+    async fn search_trims_surrounding_whitespace_in_query() {
+        async fn hits_for(state: AppState, raw_query: &str) -> serde_json::Value {
+            let body = serde_json::json!({ "query": raw_query, "limit": 10 }).to_string();
+            let response = build_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/search")
+                        .header("authorization", "Bearer right-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice(&response_body(response).await).unwrap()
+        }
+
+        let (_dir, state) = test_state();
+        seed_scored_chunks(&state);
+
+        let bare = hits_for(state.clone(), "carrot soup").await;
+        let padded = hits_for(state.clone(), "  carrot soup  ").await;
+
+        assert_ne!(
+            bare,
+            serde_json::json!({ "hits": [] }),
+            "fixture must return hits or the comparison below is vacuous"
+        );
+        assert_eq!(
+            bare, padded,
+            "padded query must rank identically to the bare query"
+        );
     }
 
     #[tokio::test]
