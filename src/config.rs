@@ -928,7 +928,6 @@ mod tests {
 
     #[test]
     fn media_lane_rejects_invalid_fraction_endpoints_and_non_finite_values() {
-        // Mutation: removing media-lane validation accepts values that invert or disable its bounds.
         let dir = TempDir::new().unwrap();
         let d = dir.path().display();
         for (key, value) in [

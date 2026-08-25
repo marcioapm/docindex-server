@@ -1519,7 +1519,7 @@ mod tests {
 
     #[test]
     fn media_gate_includes_threshold_and_rejects_past_it_per_type() {
-        // Mutation: changing <= to < or removing per-type gates admits/rejects a boundary candidate.
+        // The gate is inclusive, and each media type carries its own threshold.
         let lane = MediaLaneScoring::default();
         for (media_type, threshold) in [("image", 0.40), ("pdf", 0.45)] {
             let base: Vec<_> = (1..=4).map(|id| lane_hit(id, "text")).collect();
@@ -1552,7 +1552,6 @@ mod tests {
 
     #[test]
     fn media_lane_adds_candidate_outside_text_window() {
-        // Mutation: omitting the independent media candidate query leaves id 99 absent.
         let lane = MediaLaneScoring::default();
         let mut results = (1..=20).map(|id| lane_hit(id, "text")).collect();
         let media = vec![lane_hit(99, "image")];
@@ -1564,7 +1563,6 @@ mod tests {
 
     #[test]
     fn media_lane_does_not_duplicate_already_ranked_media() {
-        // Mutation: removing the present-id filter duplicates id 4.
         let lane = MediaLaneScoring::default();
         let mut results = vec![lane_hit(1, "text"), lane_hit(4, "image")];
         results.extend(
@@ -1586,7 +1584,6 @@ mod tests {
 
     #[test]
     fn media_lane_borrows_slots_when_no_candidate_passes_gate() {
-        // Mutation: inserting gate-failing media changes this byte-for-byte baseline result.
         let lane = MediaLaneScoring::default();
         let mut results: Vec<_> = (1..=20).map(|id| lane_hit(id, "text")).collect();
         let baseline = results.clone();
@@ -1603,7 +1600,6 @@ mod tests {
 
     #[test]
     fn media_lane_borrows_unfilled_reserved_slots() {
-        // Mutation: padding the reservation with media changes text ids or result length.
         let lane = MediaLaneScoring::default();
         let mut results: Vec<_> = (1..=8).map(|id| lane_hit(id, "text")).collect();
         let distances = HashMap::from([(99, 0.20)]);
@@ -1627,7 +1623,7 @@ mod tests {
 
     #[test]
     fn media_lane_uses_evenly_spaced_insert_positions() {
-        // Mutation: changing stride or the first insertion index moves ids 91 and 92.
+        // Two admissions into eight slots land at indices 3 and 7.
         let lane = MediaLaneScoring {
             fraction: 0.5,
             ..MediaLaneScoring::default()
@@ -1649,7 +1645,6 @@ mod tests {
 
     #[test]
     fn media_display_score_clamps_decreases_and_uses_pdf_map() {
-        // Mutation: using the image map for PDFs makes the invoice score fall below 0.4.
         let lane = MediaLaneScoring::default();
         assert_eq!(media_display_score(0.20, "image", lane), Some(1.0));
         assert_eq!(media_display_score(0.60, "image", lane), Some(0.0));

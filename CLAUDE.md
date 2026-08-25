@@ -165,7 +165,7 @@ Every hit carries three scores:
 4. **Reciprocal Rank Fusion** (k=60, `search::RRF_K`) over the two lists. Ties broken by id ascending (deterministic).
 5. Return top-N (clamped 1..=50) with snippet + metadata.
 
-When `[search].media_lane_enabled = true`, blended search also queries the top-30 all-media vector candidates independently. Candidates pass only at or below their image/PDF raw cosine-distance gate; up to `floor(limit * media_lane_fraction)` previously absent candidates are evenly inserted without moving already-ranked media. Unused slots remain text. Audio/video use image gate/display settings until calibrated.
+When `[search].media_lane_enabled = true`, blended search also queries `max(30, limit)` all-media vector candidates independently. Candidates pass only at or below their image/PDF raw cosine-distance gate; up to `floor(limit * media_lane_fraction)` previously absent candidates are evenly inserted; already-ranked media is never duplicated or evicted. Unused slots remain text. PDF values are provisional (five files); audio/video reuse image gate/display settings until calibrated.
 
 Don't normalize raw scores across the two lists — RRF avoids that rabbit hole.
 
