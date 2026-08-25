@@ -917,6 +917,184 @@ mod tests {
         );
     }
 
+    /// Unit vector orthogonal to `q_vec`, used to place chunk vectors at
+    /// controlled angles from the query direction.
+    fn orthogonal_unit(q_vec: &[f32]) -> Vec<f32> {
+        let mut raw = vec![0f32; q_vec.len()];
+        if q_vec[0].abs() > 0.9 {
+            raw[1] = 1.0;
+        } else {
+            raw[0] = 1.0;
+        }
+        let dot: f32 = raw.iter().zip(q_vec).map(|(a, b)| a * b).sum();
+        let mut orth: Vec<f32> = raw.iter().zip(q_vec).map(|(a, b)| a - dot * b).collect();
+        let norm: f32 = orth.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in orth.iter_mut() {
+            *x /= norm;
+        }
+        orth
+    }
+
+    /// Seeds one text chunk whose vector sits `theta` radians from `q_vec` in
+    /// the plane spanned by `q_vec` and `orth`, so a larger `theta` means a
+    /// greater cosine distance and a worse vector rank.
+    fn seed_text_chunk(
+        guard: &Store,
+        q_vec: &[f32],
+        orth: &[f32],
+        path: &str,
+        content: String,
+        tokens: usize,
+        theta: f32,
+    ) {
+        let chunk = crate::chunk::Chunk {
+            idx: 0,
+            heading: String::new(),
+            heading_path: String::new(),
+            content,
+            content_hash: format!("hash-{path}"),
+            tokens,
+            media_type: MediaType::Text,
+            mime_type: None,
+            media_start: None,
+            media_end: None,
+            media_unit: None,
+            truncated: false,
+        };
+        let id = guard.upsert_chunk(&chunk, path, 1).unwrap();
+        let vector: Vec<f32> = q_vec
+            .iter()
+            .zip(orth)
+            .map(|(q, o)| theta.cos() * q + theta.sin() * o)
+            .collect();
+        guard.set_vector_for_chunk(id, &vector).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_reaches_requested_limit_when_only_the_vector_branch_supplies_the_tail() {
+        use crate::embed::{AnyEmbedder, Fake};
+
+        let (_dir, store) = candidate_test_store();
+        let embedder = AnyEmbedder::Fake(Arc::new(Fake::new(CANDIDATE_TEST_DIM)));
+        let q_vec = embedder.embed_query("widget").await.unwrap();
+        let orth = orthogonal_unit(&q_vec);
+
+        // All 40 chunks are vector-ranked by increasing angle, but only the
+        // first CANDIDATE_K carry the query term, so ids CANDIDATE_K..39 are
+        // reachable from the vector branch alone.
+        {
+            let guard = store.lock().unwrap();
+            for i in 0..ABOVE_CANDIDATE_K {
+                let word = if i < CANDIDATE_K { "widget" } else { "gadget" };
+                let repeats = ABOVE_CANDIDATE_K - i;
+                let content = std::iter::repeat_n(word, repeats)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                seed_text_chunk(
+                    &guard,
+                    &q_vec,
+                    &orth,
+                    &format!("note{i}.md"),
+                    content,
+                    repeats,
+                    (i as f32 + 1.0) * 0.01,
+                );
+            }
+        }
+
+        let hits = search(
+            store,
+            &embedder,
+            CANDIDATE_TEST_DIM,
+            "widget",
+            50,
+            DisplayScoring::default(),
+        )
+        .await
+        .unwrap();
+
+        let paths: std::collections::HashSet<&str> =
+            hits.iter().map(|hit| hit.path.as_str()).collect();
+        for i in CANDIDATE_K..ABOVE_CANDIDATE_K {
+            let path = format!("note{i}.md");
+            assert!(
+                paths.contains(path.as_str()),
+                "{path} is reachable only from the vector branch and must survive a limit=50 search"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_reaches_requested_limit_when_only_the_fts_branch_supplies_the_tail() {
+        use crate::embed::{AnyEmbedder, Fake};
+
+        let (_dir, store) = candidate_test_store();
+        let embedder = AnyEmbedder::Fake(Arc::new(Fake::new(CANDIDATE_TEST_DIM)));
+        let q_vec = embedder.embed_query("widget").await.unwrap();
+        let orth = orthogonal_unit(&q_vec);
+
+        // Term chunks 0..29 sit nearest the query and 30..39 farthest, with 20
+        // decoys lacking the term in between. The vector window (50) therefore
+        // holds the 30 near term chunks plus all decoys, pushing term chunks
+        // 30..39 out of it; BM25 still ranks all 40, so those ids are reachable
+        // from the FTS branch alone.
+        {
+            let guard = store.lock().unwrap();
+            for i in 0..ABOVE_CANDIDATE_K {
+                let repeats = ABOVE_CANDIDATE_K - i;
+                let content = std::iter::repeat_n("widget", repeats)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let theta = if i < CANDIDATE_K {
+                    (i as f32 + 1.0) * 0.01
+                } else {
+                    0.61 + (i - CANDIDATE_K) as f32 * 0.01
+                };
+                seed_text_chunk(
+                    &guard,
+                    &q_vec,
+                    &orth,
+                    &format!("note{i}.md"),
+                    content,
+                    repeats,
+                    theta,
+                );
+            }
+            for j in 0..20 {
+                seed_text_chunk(
+                    &guard,
+                    &q_vec,
+                    &orth,
+                    &format!("decoy{j}.md"),
+                    "gadget gadget gadget".to_string(),
+                    3,
+                    0.31 + j as f32 * 0.01,
+                );
+            }
+        }
+
+        let hits = search(
+            store,
+            &embedder,
+            CANDIDATE_TEST_DIM,
+            "widget",
+            50,
+            DisplayScoring::default(),
+        )
+        .await
+        .unwrap();
+
+        let paths: std::collections::HashSet<&str> =
+            hits.iter().map(|hit| hit.path.as_str()).collect();
+        for i in CANDIDATE_K..ABOVE_CANDIDATE_K {
+            let path = format!("note{i}.md");
+            assert!(
+                paths.contains(path.as_str()),
+                "{path} is reachable only from the FTS branch and must survive a limit=50 search"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn hybrid_search_with_full_overlap_above_candidate_k_reaches_requested_limit() {
         use crate::embed::{AnyEmbedder, Fake};
