@@ -545,16 +545,19 @@ fn insert_media_lane(
     }
     let stride = limit.div_ceil(inserted.len());
     for (i, hit) in inserted.drain(..).enumerate() {
-        if results.len() >= limit
-            && let Some(index) = results
+        if results.len() >= limit {
+            // Only text entries are displaceable. A result with none left is
+            // already all media, so admitting more would evict media.
+            let Some(index) = results
                 .iter()
                 .rposition(|result| result.media_type == "text")
-        {
+            else {
+                return;
+            };
             results.remove(index);
         }
         results.insert((stride * (i + 1) - 1).min(results.len()), hit);
     }
-    results.truncate(limit);
 }
 
 async fn run_media_candidate_query(
@@ -1333,6 +1336,185 @@ mod tests {
             media_unit: None,
             truncated: false,
         }
+    }
+
+    /// Seeds `text_count` text chunks nearer the query than a single image at
+    /// `image_theta` radians, so the image falls outside the vector candidate
+    /// window and has no FTS content to reach the lexical branch.
+    async fn media_lane_search_fixture(
+        text_count: usize,
+        image_theta: f32,
+    ) -> (
+        tempfile::TempDir,
+        Arc<Mutex<Store>>,
+        crate::embed::AnyEmbedder,
+    ) {
+        let (dir, store, embedder, q_vec, orth) = candidate_test_fixture("widget").await;
+        {
+            let guard = store.lock().unwrap();
+            for i in 0..text_count {
+                seed_text_chunk(
+                    &guard,
+                    &q_vec,
+                    &orth,
+                    &format!("note{i}.md"),
+                    "widget widget widget".to_string(),
+                    3,
+                    (i as f32 + 1.0) * 0.001,
+                );
+            }
+            let chunk = crate::chunk::Chunk {
+                idx: 0,
+                heading: String::new(),
+                heading_path: String::new(),
+                content: String::new(),
+                content_hash: "image-hash".into(),
+                tokens: 0,
+                media_type: MediaType::Image,
+                mime_type: Some("image/png".into()),
+                media_start: None,
+                media_end: None,
+                media_unit: None,
+                truncated: false,
+            };
+            let id = guard.upsert_chunk(&chunk, "photo.png", 1).unwrap();
+            let vector: Vec<f32> = q_vec
+                .iter()
+                .zip(&orth)
+                .map(|(q, o)| image_theta.cos() * q + image_theta.sin() * o)
+                .collect();
+            guard.set_vector_for_chunk(id, &vector).unwrap();
+        }
+        (dir, store, embedder)
+    }
+
+    fn lane_enabled_display() -> DisplayScoring {
+        DisplayScoring {
+            media_lane: MediaLaneScoring {
+                enabled: true,
+                ..MediaLaneScoring::default()
+            },
+            ..DisplayScoring::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_lane_surfaces_media_the_blended_window_cannot_reach() {
+        // cos(0.863) ~ 0.65, so the image sits at distance ~0.35: inside the
+        // 0.40 image gate, and far enough that a rank-derived score would read
+        // 1.0 while the distance map yields 0.6.
+        let (_dir, store, embedder) = media_lane_search_fixture(40, 0.863).await;
+
+        let hits = search(
+            store,
+            &embedder,
+            CANDIDATE_TEST_DIM,
+            "widget",
+            20,
+            lane_enabled_display(),
+        )
+        .await
+        .unwrap();
+
+        let image = hits
+            .iter()
+            .find(|hit| hit.path == "photo.png")
+            .expect("the lane must surface an image outside the blended candidate window");
+        assert_eq!(hits.len(), 20);
+        assert!(
+            (image.score_normalized - 0.6).abs() < 0.02,
+            "expected the distance-derived score, got {}",
+            image.score_normalized
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_lane_leaves_that_media_unreachable() {
+        let (_dir, store, embedder) = media_lane_search_fixture(40, 0.863).await;
+
+        let hits = search(
+            store,
+            &embedder,
+            CANDIDATE_TEST_DIM,
+            "widget",
+            20,
+            DisplayScoring::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !hits.iter().any(|hit| hit.path == "photo.png"),
+            "the image is only reachable through the lane"
+        );
+        assert_eq!(hits.len(), 20);
+    }
+
+    #[tokio::test]
+    async fn lane_pool_follows_the_clamped_limit_not_the_candidate_floor() {
+        let (_dir, store, embedder, q_vec, orth) = candidate_test_fixture("widget").await;
+
+        // 40 text chunks nearest the query, then 40 images just behind them.
+        // Every image clears the 0.40 gate, so the number admitted is bounded
+        // by the media candidate pool rather than by the gate.
+        {
+            let guard = store.lock().unwrap();
+            for i in 0..40 {
+                seed_text_chunk(
+                    &guard,
+                    &q_vec,
+                    &orth,
+                    &format!("note{i}.md"),
+                    "widget widget widget".to_string(),
+                    3,
+                    (i as f32 + 1.0) * 0.001,
+                );
+            }
+            for i in 0..40 {
+                let chunk = crate::chunk::Chunk {
+                    idx: 0,
+                    heading: String::new(),
+                    heading_path: String::new(),
+                    content: String::new(),
+                    content_hash: format!("image-hash-{i}"),
+                    tokens: 0,
+                    media_type: MediaType::Image,
+                    mime_type: Some("image/png".into()),
+                    media_start: None,
+                    media_end: None,
+                    media_unit: None,
+                    truncated: false,
+                };
+                let id = guard
+                    .upsert_chunk(&chunk, &format!("photo{i}.png"), 1)
+                    .unwrap();
+                let theta = 0.80 + i as f32 * 0.001;
+                let vector: Vec<f32> = q_vec
+                    .iter()
+                    .zip(&orth)
+                    .map(|(q, o)| theta.cos() * q + theta.sin() * o)
+                    .collect();
+                guard.set_vector_for_chunk(id, &vector).unwrap();
+            }
+        }
+
+        let display = DisplayScoring {
+            media_lane: MediaLaneScoring {
+                enabled: true,
+                fraction: 1.0,
+                ..MediaLaneScoring::default()
+            },
+            ..DisplayScoring::default()
+        };
+        let hits = search(store, &embedder, CANDIDATE_TEST_DIM, "widget", 50, display)
+            .await
+            .unwrap();
+
+        let images = hits.iter().filter(|hit| hit.media_type == "image").count();
+        assert_eq!(
+            images, 40,
+            "a limit=50 search must draw media from a 50-candidate pool, not the 30 floor"
+        );
     }
 
     #[test]
