@@ -605,19 +605,8 @@ impl Store {
         Ok(out)
     }
 
-    /// Top-`k` media chunk rowids by cosine distance to `query` (ascending
-    /// distance). Streams every `(rowid, embedding)` pair from `chunks_vec`
-    /// joined to `chunks` on the media-type predicate and retains only the
-    /// best `k` results in a bounded max-heap — no `IN (…)` with unbounded
-    /// placeholders, no materialisation of all vectors.
-    ///
-    /// The returned order is dense over media only: rank-1 is the closest
-    /// media chunk, regardless of where it would rank among all chunk types.
-    ///
-    /// `types` selects which non-text media types to include (empty = all
-    /// non-text types). At most 4 slots are bound to the query, matching the
-    /// number of media types below `Text`; more than 4 entries or a `Text`
-    /// entry is rejected rather than silently dropped.
+    /// Top-`k` media chunks by cosine distance, retaining `O(k)` rows while
+    /// scanning. An empty `types` slice includes every non-text media type.
     pub fn search_media_vec(
         &self,
         query: &[f32],
@@ -636,7 +625,6 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        // Keep type filtering to four fixed slots to bound SQL parameters.
         let mut stmt = self.conn.prepare(
             "SELECT v.rowid, v.embedding \
              FROM chunks_vec v \
@@ -1137,18 +1125,10 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     (1.0 - dot).clamp(0.0, 2.0)
 }
 
-/// Bounded max-heap over `(distance, rowid)` pairs that retains only the
-/// `k` lowest at any time, so auxiliary memory stays `O(k)` regardless of
-/// how many candidates are admitted. Ties on distance are broken by the
-/// lower rowid, independent of admission order — this is what lets callers
-/// rely on a deterministic result set when more than `k` candidates share a
-/// distance.
+/// Retains the `k` lowest `(distance, rowid)` pairs in `O(k)` memory.
 struct TopKByDistance {
     k: usize,
-    // Max-heap of (dist_bits, rowid): the root holds the worst admitted
-    // candidate, ordered by (largest distance, largest rowid). IEEE 754
-    // positive floats compare correctly by bit representation; cosine
-    // distance is ≥ 0, so this encoding is safe.
+    // Non-negative cosine distances preserve their order as IEEE 754 bits.
     heap: std::collections::BinaryHeap<(u32, i64)>,
 }
 
@@ -1160,10 +1140,6 @@ impl TopKByDistance {
         }
     }
 
-    /// Admit one `(rowid, distance)` candidate, keeping the heap at or
-    /// below `k` entries. Replacement compares the full `(dist_bits,
-    /// rowid)` tuple so an equal-distance candidate with a lower rowid
-    /// still displaces the current worst.
     fn admit(&mut self, rowid: i64, dist: f32) {
         if self.k == 0 {
             return;
@@ -1179,7 +1155,6 @@ impl TopKByDistance {
         }
     }
 
-    /// Drain into ascending `(distance, rowid)` order.
     fn into_sorted_vec(self) -> Vec<(i64, f32)> {
         let mut results: Vec<(i64, f32)> = self
             .heap
@@ -1191,11 +1166,6 @@ impl TopKByDistance {
     }
 }
 
-/// Retain the `k` candidates with the lowest `(distance, rowid)` out of an
-/// unordered stream, using [`TopKByDistance`] so memory stays `O(k)`
-/// regardless of input size.
-///
-/// Returned in ascending `(distance, rowid)` order.
 #[cfg(test)]
 fn select_top_k_by_distance(candidates: Vec<(i64, f32)>, k: usize) -> Vec<(i64, f32)> {
     let mut heap = TopKByDistance::new(k);
@@ -1643,13 +1613,9 @@ mod tests {
         );
     }
 
-    /// `k + 1` equal-distance candidates supplied in non-ascending rowid
-    /// order must still yield the `k` lowest rowids, ascending.
     #[test]
     fn select_top_k_by_distance_breaks_equal_distance_ties_by_lowest_rowid() {
         const K: usize = 5;
-        // Descending rowid order so a naive "first scanned wins" tie-break
-        // would retain the highest rowids instead of the lowest.
         let candidates: Vec<(i64, f32)> = (1..=(K as i64 + 1)).rev().map(|id| (id, 0.5)).collect();
 
         let results = select_top_k_by_distance(candidates, K);
@@ -1663,8 +1629,6 @@ mod tests {
 
     #[test]
     fn select_top_k_by_distance_prefers_closer_over_lower_rowid() {
-        // A closer candidate with a higher rowid must still win over a
-        // farther candidate with a lower rowid.
         let candidates = vec![(1, 0.9_f32), (2, 0.1_f32)];
         let results = select_top_k_by_distance(candidates, 1);
         assert_eq!(results, vec![(2, 0.1)]);

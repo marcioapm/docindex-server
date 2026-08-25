@@ -851,9 +851,6 @@ mod tests {
         assert!(approx(d.w_vec + d.w_bm25, 1.0));
     }
 
-    // Candidate pool sizing: `limit` up to `LIMIT_MAX` (50) must not be
-    // silently truncated by the `CANDIDATE_K` (30) floor.
-
     const CANDIDATE_TEST_DIM: usize = 8;
     const ABOVE_CANDIDATE_K: usize = 40;
 
@@ -863,13 +860,26 @@ mod tests {
         (dir, Arc::new(Mutex::new(store)))
     }
 
+    async fn candidate_test_fixture(
+        query: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<Mutex<Store>>,
+        crate::embed::AnyEmbedder,
+        Vec<f32>,
+        Vec<f32>,
+    ) {
+        let (dir, store) = candidate_test_store();
+        let embedder =
+            crate::embed::AnyEmbedder::Fake(Arc::new(crate::embed::Fake::new(CANDIDATE_TEST_DIM)));
+        let q_vec = embedder.embed_query(query).await.unwrap();
+        let orth = orthogonal_unit(&q_vec);
+        (dir, store, embedder, q_vec, orth)
+    }
+
     #[tokio::test]
     async fn media_only_search_above_candidate_k_reaches_requested_limit() {
-        use crate::embed::{AnyEmbedder, Fake};
-
-        let (_dir, store) = candidate_test_store();
-        let embedder = AnyEmbedder::Fake(Arc::new(Fake::new(CANDIDATE_TEST_DIM)));
-        let q_vec = embedder.embed_query("photo").await.unwrap();
+        let (_dir, store, embedder, q_vec, _) = candidate_test_fixture("photo").await;
 
         {
             let guard = store.lock().unwrap();
@@ -917,8 +927,6 @@ mod tests {
         );
     }
 
-    /// Unit vector orthogonal to `q_vec`, used to place chunk vectors at
-    /// controlled angles from the query direction.
     fn orthogonal_unit(q_vec: &[f32]) -> Vec<f32> {
         let mut raw = vec![0f32; q_vec.len()];
         if q_vec[0].abs() > 0.9 {
@@ -935,9 +943,6 @@ mod tests {
         orth
     }
 
-    /// Seeds one text chunk whose vector sits `theta` radians from `q_vec` in
-    /// the plane spanned by `q_vec` and `orth`, so a larger `theta` means a
-    /// greater cosine distance and a worse vector rank.
     fn seed_text_chunk(
         guard: &Store,
         q_vec: &[f32],
@@ -972,16 +977,9 @@ mod tests {
 
     #[tokio::test]
     async fn hybrid_search_reaches_requested_limit_when_only_the_vector_branch_supplies_the_tail() {
-        use crate::embed::{AnyEmbedder, Fake};
+        let (_dir, store, embedder, q_vec, orth) = candidate_test_fixture("widget").await;
 
-        let (_dir, store) = candidate_test_store();
-        let embedder = AnyEmbedder::Fake(Arc::new(Fake::new(CANDIDATE_TEST_DIM)));
-        let q_vec = embedder.embed_query("widget").await.unwrap();
-        let orth = orthogonal_unit(&q_vec);
-
-        // All 40 chunks are vector-ranked by increasing angle, but only the
-        // first CANDIDATE_K carry the query term, so ids CANDIDATE_K..39 are
-        // reachable from the vector branch alone.
+        // Only the first CANDIDATE_K vector-ranked chunks match FTS.
         {
             let guard = store.lock().unwrap();
             for i in 0..ABOVE_CANDIDATE_K {
@@ -1026,18 +1024,10 @@ mod tests {
 
     #[tokio::test]
     async fn hybrid_search_reaches_requested_limit_when_only_the_fts_branch_supplies_the_tail() {
-        use crate::embed::{AnyEmbedder, Fake};
+        let (_dir, store, embedder, q_vec, orth) = candidate_test_fixture("widget").await;
 
-        let (_dir, store) = candidate_test_store();
-        let embedder = AnyEmbedder::Fake(Arc::new(Fake::new(CANDIDATE_TEST_DIM)));
-        let q_vec = embedder.embed_query("widget").await.unwrap();
-        let orth = orthogonal_unit(&q_vec);
-
-        // Term chunks 0..29 sit nearest the query and 30..39 farthest, with 20
-        // decoys lacking the term in between. The vector window (50) therefore
-        // holds the 30 near term chunks plus all decoys, pushing term chunks
-        // 30..39 out of it; BM25 still ranks all 40, so those ids are reachable
-        // from the FTS branch alone.
+        // The 20 decoys at angles 0.31..0.50 push the FTS tail outside the
+        // 50-entry vector window.
         {
             let guard = store.lock().unwrap();
             for i in 0..ABOVE_CANDIDATE_K {
@@ -1097,65 +1087,24 @@ mod tests {
 
     #[tokio::test]
     async fn hybrid_search_with_full_overlap_above_candidate_k_reaches_requested_limit() {
-        use crate::embed::{AnyEmbedder, Fake};
-
-        let (_dir, store) = candidate_test_store();
-        let embedder = AnyEmbedder::Fake(Arc::new(Fake::new(CANDIDATE_TEST_DIM)));
-        let q_vec = embedder.embed_query("widget").await.unwrap();
-
-        // Build a unit vector orthogonal to `q_vec` via Gram-Schmidt so we
-        // can place chunk vectors at controlled angles from the query.
-        let mut raw = [0f32; CANDIDATE_TEST_DIM];
-        raw[0] = 1.0;
-        if q_vec[0].abs() > 0.9 {
-            raw = [0f32; CANDIDATE_TEST_DIM];
-            raw[1] = 1.0;
-        }
-        let dot: f32 = raw.iter().zip(&q_vec).map(|(a, b)| a * b).sum();
-        let mut orth: Vec<f32> = raw.iter().zip(&q_vec).map(|(a, b)| a - dot * b).collect();
-        let orth_norm: f32 = orth.iter().map(|x| x * x).sum::<f32>().sqrt();
-        for x in orth.iter_mut() {
-            *x /= orth_norm;
-        }
+        let (_dir, store, embedder, q_vec, orth) = candidate_test_fixture("widget").await;
 
         {
             let guard = store.lock().unwrap();
             for i in 0..ABOVE_CANDIDATE_K {
-                // Cosine distance to `q_vec` increases with `i` (larger angle
-                // away from the query direction) and bm25 improves with more
-                // "widget" repeats for smaller `i`, so both branches rank
-                // chunks in the SAME order 0..39. This makes the two
-                // candidate lists identical rather than complementary, so a
-                // CANDIDATE_K=30 cap on each branch would cap the fused
-                // result at 30 regardless of `limit`.
                 let repeats = ABOVE_CANDIDATE_K - i;
                 let content = std::iter::repeat_n("widget", repeats)
                     .collect::<Vec<_>>()
                     .join(" ");
-                let chunk = crate::chunk::Chunk {
-                    idx: 0,
-                    heading: String::new(),
-                    heading_path: String::new(),
+                seed_text_chunk(
+                    &guard,
+                    &q_vec,
+                    &orth,
+                    &format!("note{i}.md"),
                     content,
-                    content_hash: format!("text-hash-{i}"),
-                    tokens: repeats,
-                    media_type: MediaType::Text,
-                    mime_type: None,
-                    media_start: None,
-                    media_end: None,
-                    media_unit: None,
-                    truncated: false,
-                };
-                let id = guard
-                    .upsert_chunk(&chunk, &format!("note{i}.md"), 1)
-                    .unwrap();
-                let theta = (i as f32 + 1.0) * 0.01;
-                let vector: Vec<f32> = q_vec
-                    .iter()
-                    .zip(&orth)
-                    .map(|(q, o)| theta.cos() * q + theta.sin() * o)
-                    .collect();
-                guard.set_vector_for_chunk(id, &vector).unwrap();
+                    repeats,
+                    (i as f32 + 1.0) * 0.01,
+                );
             }
         }
 

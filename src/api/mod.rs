@@ -110,8 +110,6 @@ mod tests {
         }
     }
 
-    /// Seed one text, one image, and one PDF chunk, each with a distinct
-    /// unit vector so the media vector search can find every one of them.
     fn seed_text_image_pdf_chunks(state: &AppState) {
         use crate::{chunk::Chunk, media::MediaType};
 
@@ -268,11 +266,10 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&response_body(response).await).unwrap();
         let hits = body["hits"].as_array().expect("hits array");
-        assert!(
-            !hits.is_empty(),
-            "media_only + media_types=[pdf] must return the seeded PDF chunk"
-        );
-        let paths: Vec<&str> = hits.iter().map(|h| h["path"].as_str().unwrap()).collect();
+        let paths: Vec<&str> = hits
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap())
+            .collect();
         assert_eq!(
             paths,
             ["report.pdf"],
