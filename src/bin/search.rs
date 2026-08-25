@@ -154,15 +154,13 @@ async fn run(cli: Cli) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let media_types = match global.media.as_deref() {
-        Some(value) => match parse_media_types(value) {
-            Ok(types) => types,
-            Err(message) => {
-                eprintln!("docindex-search: {message}");
-                return ExitCode::from(1);
-            }
-        },
-        None => Vec::new(),
+    let media_types = match global.media.as_deref().map(parse_media_types).transpose() {
+        Ok(Some(types)) => types,
+        Ok(None) => Vec::new(),
+        Err(message) => {
+            eprintln!("docindex-search: {message}");
+            return ExitCode::from(1);
+        }
     };
 
     let flags = CliFlags {
@@ -221,9 +219,7 @@ fn parse_media_types(value: &str) -> Result<Vec<String>, String> {
     let mut media_types = Vec::new();
     for media_type in value.split(',') {
         if MediaType::from_exclude_value(media_type).is_none() {
-            // A value containing whitespace is almost always the query text
-            // captured by `--media`, not a mistyped media type, so the hint
-            // names the orderings that keep the query positional.
+            // Whitespace indicates that `--media` consumed the positional query.
             let hint = if media_type.contains(char::is_whitespace) {
                 "; to search all media types put the query first \
                  (`search \"<query>\" --media`) or separate it \

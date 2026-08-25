@@ -621,8 +621,7 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        // Type values are enum-validated at the API boundary, so this fixed
-        // predicate has at most four bound parameters.
+        // Keep type filtering to four fixed slots to bound SQL parameters.
         let mut stmt = self.conn.prepare(
             "SELECT v.rowid, v.embedding \
              FROM chunks_vec v \
@@ -1224,6 +1223,21 @@ mod tests {
         }
     }
 
+    fn insert_chunk_with_vector(
+        store: &Store,
+        path: &str,
+        content: &str,
+        hash: &str,
+        media_type: crate::media::MediaType,
+        vector: &[f32; TEST_DIM],
+    ) -> i64 {
+        let mut chunk = sample_chunk(0, content, hash);
+        chunk.media_type = media_type;
+        let id = store.upsert_chunk(&chunk, path, 1).unwrap();
+        store.set_vector_for_chunk(id, vector).unwrap();
+        id
+    }
+
     #[test]
     fn migrates_v2_text_rows_additively_and_preserves_fts_search() {
         let dir = TempDir::new().unwrap();
@@ -1315,33 +1329,30 @@ mod tests {
         assert_eq!(hit.mime_type.as_deref(), Some("image/png"));
     }
 
-    /// Two requested types must both bind into the fixed `?2..?5` slots. A
-    /// slot-indexing regression drops the second type while single-type
-    /// filtering still passes.
     #[test]
     fn media_vector_search_filters_on_multiple_requested_types() {
         use crate::media::MediaType;
 
         let (_d, s) = open_temp();
-        let text_id = s
-            .upsert_chunk(&sample_chunk(0, "text", "text-hash"), "note.md", 1)
-            .unwrap();
-        s.set_vector_for_chunk(text_id, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            .unwrap();
-
-        let mut image = sample_chunk(0, "image", "image-hash");
-        image.media_type = MediaType::Image;
-        let image_id = s.upsert_chunk(&image, "shot.png", 1).unwrap();
-        s.set_vector_for_chunk(image_id, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            .unwrap();
-
-        let mut pdf = sample_chunk(0, "pdf", "pdf-hash");
-        pdf.media_type = MediaType::Pdf;
-        let pdf_id = s.upsert_chunk(&pdf, "doc.pdf", 1).unwrap();
-        s.set_vector_for_chunk(pdf_id, &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            .unwrap();
-
-        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let text_id =
+            insert_chunk_with_vector(&s, "note.md", "text", "text-hash", MediaType::Text, &query);
+        let image_id = insert_chunk_with_vector(
+            &s,
+            "shot.png",
+            "image",
+            "image-hash",
+            MediaType::Image,
+            &query,
+        );
+        let pdf_id = insert_chunk_with_vector(
+            &s,
+            "doc.pdf",
+            "pdf",
+            "pdf-hash",
+            MediaType::Pdf,
+            &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
         let hits = s
             .search_media_vec(&query, 10, &[MediaType::Image, MediaType::Pdf])
             .unwrap();
@@ -1363,55 +1374,36 @@ mod tests {
 
     #[test]
     fn media_vector_search_filters_text_and_preserves_dense_media_order() {
+        use crate::media::MediaType;
+
         let (_d, s) = open_temp();
-        let text_id = s
-            .upsert_chunk(&sample_chunk(0, "text", "text-hash"), "note.md", 1)
-            .unwrap();
-        let mut image = sample_chunk(0, "image", "image-hash");
-        image.media_type = crate::media::MediaType::Image;
-        let image_id = s.upsert_chunk(&image, "image.png", 1).unwrap();
-        let mut pdf = sample_chunk(0, "pdf", "pdf-hash");
-        pdf.media_type = crate::media::MediaType::Pdf;
-        let pdf_id = s.upsert_chunk(&pdf, "paper.pdf", 1).unwrap();
-
-        s.set_vector_for_chunk(text_id, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            .unwrap();
-        s.set_vector_for_chunk(image_id, &[0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            .unwrap();
-        s.set_vector_for_chunk(pdf_id, &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            .unwrap();
-
-        let hits = s
-            .search_media_vec(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 10, &[])
-            .unwrap();
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let _text_id =
+            insert_chunk_with_vector(&s, "note.md", "text", "text-hash", MediaType::Text, &query);
+        let image_id = insert_chunk_with_vector(
+            &s,
+            "image.png",
+            "image",
+            "image-hash",
+            MediaType::Image,
+            &[0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let pdf_id = insert_chunk_with_vector(
+            &s,
+            "paper.pdf",
+            "pdf",
+            "pdf-hash",
+            MediaType::Pdf,
+            &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let hits = s.search_media_vec(&query, 10, &[]).unwrap();
         assert_eq!(
             hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![image_id, pdf_id]
         );
 
-        let pdf_hits = s
-            .search_media_vec(
-                &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                10,
-                &[crate::media::MediaType::Pdf],
-            )
-            .unwrap();
-        assert_eq!(
-            pdf_hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            [pdf_id]
-        );
-
-        let image_hits = s
-            .search_media_vec(
-                &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                10,
-                &[crate::media::MediaType::Image],
-            )
-            .unwrap();
-        assert_eq!(
-            image_hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            [image_id]
-        );
+        let pdf_hits = s.search_media_vec(&query, 10, &[MediaType::Pdf]).unwrap();
+        assert_eq!(pdf_hits, [(pdf_id, 1.0)]);
     }
 
     /// `search_media_vec` with cap `k` returns exactly the `k` closest media
