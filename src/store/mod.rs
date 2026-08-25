@@ -39,6 +39,10 @@ pub enum StoreError {
         "store: embedding_dim on disk is {stored}, config says {config} — run with --reembed to reindex at the new dim, or delete the index DB as a fallback."
     )]
     SchemaDimMismatch { stored: usize, config: usize },
+    #[error("store: search_media_vec: got {got} media types, max 4 supported")]
+    TooManyMediaTypes { got: usize },
+    #[error("store: search_media_vec: MediaType::Text is not a valid media-only filter value")]
+    TextNotAMediaFilter,
 }
 
 /// Wraps a `rusqlite::Connection` with the docindex schema applied and
@@ -609,16 +613,27 @@ impl Store {
     ///
     /// The returned order is dense over media only: rank-1 is the closest
     /// media chunk, regardless of where it would rank among all chunk types.
+    ///
+    /// `types` selects which non-text media types to include (empty = all
+    /// non-text types). At most 4 slots are bound to the query, matching the
+    /// number of media types below `Text`; more than 4 entries or a `Text`
+    /// entry is rejected rather than silently dropped.
     pub fn search_media_vec(
         &self,
         query: &[f32],
         k: usize,
         types: &[crate::media::MediaType],
     ) -> Result<Vec<(i64, f32)>, StoreError> {
-        use std::collections::BinaryHeap;
+        use crate::media::MediaType;
 
         if k == 0 {
             return Ok(Vec::new());
+        }
+        if types.len() > 4 {
+            return Err(StoreError::TooManyMediaTypes { got: types.len() });
+        }
+        if types.contains(&MediaType::Text) {
+            return Err(StoreError::TextNotAMediaFilter);
         }
 
         // Keep type filtering to four fixed slots to bound SQL parameters.
@@ -629,13 +644,6 @@ impl Store {
              WHERE c.media_type != 'text' \
                AND (?1 = 0 OR c.media_type IN (?2, ?3, ?4, ?5))",
         )?;
-
-        // Max-heap of (dist_bits, rowid): the root holds the LARGEST distance.
-        // When full, evict the worst to admit a closer candidate. IEEE 754
-        // positive floats compare correctly by bit representation; cosine
-        // distance is ≥ 0, so this encoding is safe. Ties retain the first
-        // scanned (lowest rowid).
-        let mut heap: BinaryHeap<(u32, i64)> = BinaryHeap::with_capacity(k + 1);
 
         let type_values = [
             types.first().map(|media_type| media_type.as_str()),
@@ -650,32 +658,15 @@ impl Store {
             type_values[2],
             type_values[3],
         ])?;
+        let mut candidates = Vec::new();
         while let Some(row) = rows.next()? {
             let rowid: i64 = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
             let embedding =
                 decode_f32(&blob).map_err(|e| StoreError::Msg(format!("decode vec: {e}")))?;
-            let dist = cosine_distance(query, &embedding);
-            let dist_bits = dist.to_bits();
-
-            if heap.len() < k {
-                heap.push((dist_bits, rowid));
-            } else if let Some(&(top_bits, _)) = heap.peek()
-                && dist_bits < top_bits
-            {
-                // New entry is closer than the current worst; replace it.
-                heap.pop();
-                heap.push((dist_bits, rowid));
-            }
+            candidates.push((rowid, cosine_distance(query, &embedding)));
         }
-
-        let mut results: Vec<(i64, f32)> = heap
-            .into_iter()
-            .map(|(bits, id)| (id, f32::from_bits(bits)))
-            .collect();
-        // Sort ascending by distance, then ascending by rowid for determinism.
-        results.sort_by(|(id_a, d_a), (id_b, d_b)| d_a.total_cmp(d_b).then(id_a.cmp(id_b)));
-        Ok(results)
+        Ok(select_top_k_by_distance(candidates, k))
     }
 
     /// Top-`k` chunk rowids by BM25 over `chunks_fts` for the raw FTS5
@@ -1146,6 +1137,48 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     (1.0 - dot).clamp(0.0, 2.0)
 }
 
+/// Retain the `k` candidates with the lowest `(distance, rowid)` out of an
+/// unordered stream, using a bounded max-heap so memory stays `O(k)`
+/// regardless of input size. Ties on distance are broken by the lower
+/// rowid, independent of input order — this is what lets callers rely on a
+/// deterministic result set when more than `k` candidates share a distance.
+///
+/// Returned in ascending `(distance, rowid)` order.
+fn select_top_k_by_distance(candidates: Vec<(i64, f32)>, k: usize) -> Vec<(i64, f32)> {
+    use std::collections::BinaryHeap;
+
+    if k == 0 {
+        return Vec::new();
+    }
+
+    // Max-heap of (dist_bits, rowid): the root holds the worst candidate,
+    // ordered by (largest distance, largest rowid). IEEE 754 positive
+    // floats compare correctly by bit representation; cosine distance is
+    // ≥ 0, so this encoding is safe. Replacement compares the full tuple so
+    // an equal-distance candidate with a lower rowid still displaces the
+    // root.
+    let mut heap: BinaryHeap<(u32, i64)> = BinaryHeap::with_capacity(k + 1);
+    for (rowid, dist) in candidates {
+        let dist_bits = dist.to_bits();
+        if heap.len() < k {
+            heap.push((dist_bits, rowid));
+        } else if let Some(&top) = heap.peek()
+            && (dist_bits, rowid) < top
+        {
+            heap.pop();
+            heap.push((dist_bits, rowid));
+        }
+    }
+
+    let mut results: Vec<(i64, f32)> = heap
+        .into_iter()
+        .map(|(bits, id)| (id, f32::from_bits(bits)))
+        .collect();
+    // Sort ascending by distance, then ascending by rowid for determinism.
+    results.sort_by(|(id_a, d_a), (id_b, d_b)| d_a.total_cmp(d_b).then(id_a.cmp(id_b)));
+    results
+}
+
 fn null_if_empty(s: &str) -> Option<&str> {
     if s.is_empty() { None } else { Some(s) }
 }
@@ -1581,6 +1614,92 @@ mod tests {
             hits.len(),
             10,
             "result count must equal the requested cap when candidates exceed it"
+        );
+    }
+
+    /// `k + 1` equal-distance candidates supplied in non-ascending rowid
+    /// order must still yield the `k` lowest rowids, ascending.
+    #[test]
+    fn select_top_k_by_distance_breaks_equal_distance_ties_by_lowest_rowid() {
+        const K: usize = 5;
+        // Descending rowid order so a naive "first scanned wins" tie-break
+        // would retain the highest rowids instead of the lowest.
+        let candidates: Vec<(i64, f32)> = (1..=(K as i64 + 1)).rev().map(|id| (id, 0.5)).collect();
+
+        let results = select_top_k_by_distance(candidates, K);
+
+        assert_eq!(
+            results.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5],
+            "must keep the K lowest rowids among equal-distance candidates"
+        );
+    }
+
+    #[test]
+    fn select_top_k_by_distance_prefers_closer_over_lower_rowid() {
+        // A closer candidate with a higher rowid must still win over a
+        // farther candidate with a lower rowid.
+        let candidates = vec![(1, 0.9_f32), (2, 0.1_f32)];
+        let results = select_top_k_by_distance(candidates, 1);
+        assert_eq!(results, vec![(2, 0.1)]);
+    }
+
+    #[test]
+    fn search_media_vec_accepts_maximum_four_type_filter() {
+        use crate::media::MediaType;
+
+        let (_d, s) = open_temp();
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let result = s.search_media_vec(
+            &query,
+            10,
+            &[
+                MediaType::Image,
+                MediaType::Pdf,
+                MediaType::Audio,
+                MediaType::Video,
+            ],
+        );
+        assert!(result.is_ok(), "4-type filter must be accepted: {result:?}");
+    }
+
+    #[test]
+    fn search_media_vec_rejects_more_than_four_types() {
+        use crate::media::MediaType;
+
+        let (_d, s) = open_temp();
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let err = s
+            .search_media_vec(
+                &query,
+                10,
+                &[
+                    MediaType::Text,
+                    MediaType::Image,
+                    MediaType::Pdf,
+                    MediaType::Audio,
+                    MediaType::Video,
+                ],
+            )
+            .expect_err("5-type filter must be rejected, not silently truncated");
+        assert!(
+            matches!(err, StoreError::TooManyMediaTypes { got: 5 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn search_media_vec_rejects_text_as_a_filter_value() {
+        use crate::media::MediaType;
+
+        let (_d, s) = open_temp();
+        let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let err = s
+            .search_media_vec(&query, 10, &[MediaType::Text])
+            .expect_err("Text is not a valid media-only filter value");
+        assert!(
+            matches!(err, StoreError::TextNotAMediaFilter),
+            "got {err:?}"
         );
     }
 
