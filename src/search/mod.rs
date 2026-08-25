@@ -543,6 +543,18 @@ fn insert_media_lane(
     if inserted.is_empty() {
         return;
     }
+    // Spacing must follow the count that can actually be admitted: free
+    // capacity plus the text entries available to displace. Deriving it from
+    // the candidate count instead would bunch a partial admission at the front.
+    let displaceable = results
+        .iter()
+        .filter(|result| result.media_type == "text")
+        .count();
+    let admissible = (limit.saturating_sub(results.len()) + displaceable).min(inserted.len());
+    if admissible == 0 {
+        return;
+    }
+    inserted.truncate(admissible);
     let stride = limit.div_ceil(inserted.len());
     for (i, hit) in inserted.drain(..).enumerate() {
         if results.len() >= limit {
@@ -1662,6 +1674,29 @@ mod tests {
             (hits[0].score_normalized - 1.0).abs() < 1e-9,
             "expected the rank-derived fallback, got {}",
             hits[0].score_normalized
+        );
+    }
+
+    #[test]
+    fn media_heavy_result_spaces_the_admissions_it_can_actually_make() {
+        // Seven media hits and one text hit: only one candidate can be admitted
+        // regardless of the four-slot reservation, so it belongs at the end
+        // rather than at the position four admissions would have used.
+        let lane = MediaLaneScoring {
+            fraction: 0.5,
+            ..MediaLaneScoring::default()
+        };
+        let mut results: Vec<_> = (1..=7).map(|id| lane_hit(id, "image")).collect();
+        results.push(lane_hit(8, "text"));
+        let candidates: Vec<_> = (91..=94).map(|id| lane_hit(id, "image")).collect();
+        let distances: HashMap<i64, f32> = (91..=94).map(|id| (id, 0.20)).collect();
+
+        insert_media_lane(&mut results, candidates, 8, lane, Some(&distances));
+
+        assert_eq!(
+            results.iter().map(|hit| hit.chunk_id).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7, 91],
+            "the single admissible candidate must take the freed tail slot"
         );
     }
 
