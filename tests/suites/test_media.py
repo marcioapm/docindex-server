@@ -417,6 +417,24 @@ def test_search_returns_media_hits_and_media_only_excludes_text(
                 f"media_only rank-1 score_normalized should be 1.0, got {top_norm}"
             )
 
+        r3 = httpx.post(
+            f"{base_url}/search",
+            json={
+                "query": "sphinx quokka photo",
+                "limit": 10,
+                "media_only": True,
+                "media_types": ["pdf"],
+            },
+            headers=hdrs,
+            timeout=10.0,
+        )
+        assert r3.status_code == 200, r3.text
+        pdf_hits = r3.json()["hits"]
+        assert pdf_hits, "PDF filter fixture must return at least one PDF hit"
+        assert {hit["media_type"] for hit in pdf_hits} == {"pdf"}, pdf_hits
+        assert "report.pdf" in {hit["path"] for hit in pdf_hits}, pdf_hits
+        assert "photo.png" not in {hit["path"] for hit in pdf_hits}, pdf_hits
+
     finally:
         _stop(proc, log_f)
 

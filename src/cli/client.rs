@@ -71,16 +71,21 @@ impl Client {
         query: &str,
         limit: usize,
         media_only: bool,
+        media_types: &[String],
     ) -> Result<SearchResponse, ClientError> {
+        let mut body = serde_json::json!({
+            "query": query,
+            "limit": limit,
+            "media_only": media_only
+        });
+        if !media_types.is_empty() {
+            body["media_types"] = serde_json::json!(media_types);
+        }
         let resp = self
             .http
             .post(format!("{}/search", self.base_url))
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({
-                "query": query,
-                "limit": limit,
-                "media_only": media_only
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
@@ -163,15 +168,18 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let client = Client::new(format!("http://{address}"), "token").unwrap();
-        let media_response = client.search("sunset", 7, true).await.unwrap();
-        let default_response = client.search("notes", 3, false).await.unwrap();
+        let media_response = client
+            .search("sunset", 7, true, &["pdf".into()])
+            .await
+            .unwrap();
+        let default_response = client.search("notes", 3, false, &[]).await.unwrap();
 
         assert!(media_response.hits.is_empty());
         assert!(default_response.hits.is_empty());
         assert_eq!(
             bodies.lock().unwrap().as_slice(),
             [
-                json!({ "query": "sunset", "limit": 7, "media_only": true }),
+                json!({ "query": "sunset", "limit": 7, "media_only": true, "media_types": ["pdf"] }),
                 json!({ "query": "notes", "limit": 3, "media_only": false }),
             ]
         );

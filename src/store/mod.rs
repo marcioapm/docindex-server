@@ -609,19 +609,25 @@ impl Store {
     ///
     /// The returned order is dense over media only: rank-1 is the closest
     /// media chunk, regardless of where it would rank among all chunk types.
-    pub fn search_media_vec(&self, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>, StoreError> {
+    pub fn search_media_vec(
+        &self,
+        query: &[f32],
+        k: usize,
+        types: &[crate::media::MediaType],
+    ) -> Result<Vec<(i64, f32)>, StoreError> {
         use std::collections::BinaryHeap;
 
         if k == 0 {
             return Ok(Vec::new());
         }
 
-        // Stream media vectors via a join; never materialise all rows or ids.
+        // Keep type filtering to four fixed slots to bound SQL parameters.
         let mut stmt = self.conn.prepare(
             "SELECT v.rowid, v.embedding \
              FROM chunks_vec v \
              JOIN chunks c ON c.id = v.rowid \
-             WHERE c.media_type != 'text'",
+             WHERE c.media_type != 'text' \
+               AND (?1 = 0 OR c.media_type IN (?2, ?3, ?4, ?5))",
         )?;
 
         // Max-heap of (dist_bits, rowid): the root holds the LARGEST distance.
@@ -631,7 +637,19 @@ impl Store {
         // scanned (lowest rowid).
         let mut heap: BinaryHeap<(u32, i64)> = BinaryHeap::with_capacity(k + 1);
 
-        let mut rows = stmt.query([])?;
+        let type_values = [
+            types.first().map(|media_type| media_type.as_str()),
+            types.get(1).map(|media_type| media_type.as_str()),
+            types.get(2).map(|media_type| media_type.as_str()),
+            types.get(3).map(|media_type| media_type.as_str()),
+        ];
+        let mut rows = stmt.query(rusqlite::params![
+            types.len() as i64,
+            type_values[0],
+            type_values[1],
+            type_values[2],
+            type_values[3],
+        ])?;
         while let Some(row) = rows.next()? {
             let rowid: i64 = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
@@ -1205,6 +1223,21 @@ mod tests {
         }
     }
 
+    fn insert_chunk_with_vector(
+        store: &Store,
+        path: &str,
+        content: &str,
+        hash: &str,
+        media_type: crate::media::MediaType,
+        vector: &[f32; TEST_DIM],
+    ) -> i64 {
+        let mut chunk = sample_chunk(0, content, hash);
+        chunk.media_type = media_type;
+        let id = store.upsert_chunk(&chunk, path, 1).unwrap();
+        store.set_vector_for_chunk(id, vector).unwrap();
+        id
+    }
+
     #[test]
     fn migrates_v2_text_rows_additively_and_preserves_fts_search() {
         let dir = TempDir::new().unwrap();
@@ -1297,32 +1330,80 @@ mod tests {
     }
 
     #[test]
-    fn media_vector_search_filters_text_and_preserves_dense_media_order() {
+    fn media_vector_search_filters_on_multiple_requested_types() {
+        use crate::media::MediaType;
+
         let (_d, s) = open_temp();
-        let text_id = s
-            .upsert_chunk(&sample_chunk(0, "text", "text-hash"), "note.md", 1)
-            .unwrap();
-        let mut image = sample_chunk(0, "image", "image-hash");
-        image.media_type = crate::media::MediaType::Image;
-        let image_id = s.upsert_chunk(&image, "image.png", 1).unwrap();
-        let mut pdf = sample_chunk(0, "pdf", "pdf-hash");
-        pdf.media_type = crate::media::MediaType::Pdf;
-        let pdf_id = s.upsert_chunk(&pdf, "paper.pdf", 1).unwrap();
-
-        s.set_vector_for_chunk(text_id, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            .unwrap();
-        s.set_vector_for_chunk(image_id, &[0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            .unwrap();
-        s.set_vector_for_chunk(pdf_id, &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            .unwrap();
-
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let text_id =
+            insert_chunk_with_vector(&s, "note.md", "text", "text-hash", MediaType::Text, &query);
+        let image_id = insert_chunk_with_vector(
+            &s,
+            "shot.png",
+            "image",
+            "image-hash",
+            MediaType::Image,
+            &query,
+        );
+        let pdf_id = insert_chunk_with_vector(
+            &s,
+            "doc.pdf",
+            "pdf",
+            "pdf-hash",
+            MediaType::Pdf,
+            &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
         let hits = s
-            .search_media_vec(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 10)
+            .search_media_vec(&query, 10, &[MediaType::Image, MediaType::Pdf])
             .unwrap();
+        let ids: std::collections::HashSet<i64> = hits.iter().map(|(id, _)| *id).collect();
+
+        assert!(
+            ids.contains(&image_id),
+            "first requested type must be returned: {ids:?}"
+        );
+        assert!(
+            ids.contains(&pdf_id),
+            "second requested type must be returned: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&text_id),
+            "text must never be returned by media search: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn media_vector_search_filters_text_and_preserves_dense_media_order() {
+        use crate::media::MediaType;
+
+        let (_d, s) = open_temp();
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let _text_id =
+            insert_chunk_with_vector(&s, "note.md", "text", "text-hash", MediaType::Text, &query);
+        let image_id = insert_chunk_with_vector(
+            &s,
+            "image.png",
+            "image",
+            "image-hash",
+            MediaType::Image,
+            &[0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let pdf_id = insert_chunk_with_vector(
+            &s,
+            "paper.pdf",
+            "pdf",
+            "pdf-hash",
+            MediaType::Pdf,
+            &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let hits = s.search_media_vec(&query, 10, &[]).unwrap();
         assert_eq!(
             hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![image_id, pdf_id]
         );
+
+        let pdf_hits = s.search_media_vec(&query, 10, &[MediaType::Pdf]).unwrap();
+        assert_eq!(pdf_hits, [(pdf_id, 1.0)]);
     }
 
     /// `search_media_vec` with cap `k` returns exactly the `k` closest media
@@ -1368,7 +1449,7 @@ mod tests {
             .unwrap();
 
         let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let hits = s.search_media_vec(&query, CAP).unwrap();
+        let hits = s.search_media_vec(&query, CAP, &[]).unwrap();
 
         assert_eq!(
             hits.len(),
@@ -1447,7 +1528,7 @@ mod tests {
         s.set_vector_for_chunk(id_near1, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             .unwrap(); // dist ≈ 0.0
 
-        let hits = s.search_media_vec(&query, CAP).unwrap();
+        let hits = s.search_media_vec(&query, CAP, &[]).unwrap();
 
         assert_eq!(
             hits.len(),
@@ -1494,7 +1575,7 @@ mod tests {
 
         let query = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let hits = s
-            .search_media_vec(&query, 10)
+            .search_media_vec(&query, 10, &[])
             .expect("search must succeed with many media chunks");
         assert_eq!(
             hits.len(),

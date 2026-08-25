@@ -16,6 +16,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use docindex::cli::{CliConfig, CliFlags, Client, ClientError, OutputFormat, config, output};
+use docindex::media::MediaType;
 use docindex::search::Hit;
 
 #[derive(Parser)]
@@ -64,9 +65,9 @@ struct GlobalArgs {
     /// Path to a CLI TOML config file.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-    /// Return only image/PDF results using server-side dense media ranking.
-    #[arg(long, global = true)]
-    media: bool,
+    /// Return only media results, optionally restricted to comma-separated types.
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
+    media: Option<String>,
     /// Client-side filter: only show hits whose path starts with this
     /// prefix.
     #[arg(long, global = true)]
@@ -115,7 +116,7 @@ fn merge(base: GlobalArgs, over: GlobalArgs) -> GlobalArgs {
         server: over.server.or(base.server),
         token: over.token.or(base.token),
         config: over.config.or(base.config),
-        media: over.media || base.media,
+        media: over.media.or(base.media),
         path_filter: over.path_filter.or(base.path_filter),
     }
 }
@@ -148,10 +149,19 @@ async fn run(cli: Cli) -> ExitCode {
         }
     };
 
-    if global.media && verb != "search" {
+    if global.media.is_some() && verb != "search" {
         eprintln!("docindex-search: --media is valid only with a search query");
         return ExitCode::from(1);
     }
+
+    let media_types = match global.media.as_deref().map(parse_media_types).transpose() {
+        Ok(Some(types)) => types,
+        Ok(None) => Vec::new(),
+        Err(message) => {
+            eprintln!("docindex-search: {message}");
+            return ExitCode::from(1);
+        }
+    };
 
     let flags = CliFlags {
         config_path: global.config.clone(),
@@ -194,11 +204,39 @@ async fn run(cli: Cli) -> ExitCode {
                 return ExitCode::from(1);
             }
             run_search_like(cfg.format, global.path_filter.as_deref(), || {
-                client.search(&arg, cfg.limit, global.media)
+                client.search(&arg, cfg.limit, global.media.is_some(), &media_types)
             })
             .await
         }
     }
+}
+
+fn parse_media_types(value: &str) -> Result<Vec<String>, String> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut media_types = Vec::new();
+    for media_type in value.split(',') {
+        if MediaType::from_exclude_value(media_type).is_none() {
+            // Whitespace indicates that `--media` consumed the positional query.
+            let hint = if media_type.contains(char::is_whitespace) {
+                "; to search all media types put the query first \
+                 (`search \"<query>\" --media`) or separate it \
+                 (`search --media -- \"<query>\"`)"
+            } else {
+                ""
+            };
+            return Err(format!(
+                "--media: unknown value {media_type:?}; valid: {}{hint}",
+                MediaType::EXCLUDE_VALUES.join(", ")
+            ));
+        }
+        if !media_types.iter().any(|known| known == media_type) {
+            media_types.push(media_type.to_string());
+        }
+    }
+    Ok(media_types)
 }
 
 async fn run_health(client: &Client, format: OutputFormat) -> ExitCode {
@@ -329,17 +367,46 @@ mod tests {
         let cli = Cli::try_parse_from(["docindex-search", "search", "sunset", "--media"]).unwrap();
 
         match cli.command {
-            Some(Command::Search { args, .. }) => assert!(args.media),
+            Some(Command::Search { args, .. }) => assert_eq!(args.media.as_deref(), Some("")),
             _ => panic!("expected search command"),
         }
     }
 
     #[test]
     fn media_flag_parses_for_bare_query() {
-        let cli = Cli::try_parse_from(["docindex-search", "--media", "sunset"]).unwrap();
+        let cli = Cli::try_parse_from(["docindex-search", "sunset", "--media"]).unwrap();
 
-        assert!(cli.global.media);
+        assert_eq!(cli.global.media.as_deref(), Some(""));
         assert_eq!(cli.bare_query, ["sunset"]);
+    }
+
+    #[test]
+    fn media_flag_parses_types() {
+        let cli = Cli::try_parse_from([
+            "docindex-search",
+            "search",
+            "sunset",
+            "--media",
+            "pdf,image",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Command::Search { args, .. }) => {
+                assert_eq!(args.media.as_deref(), Some("pdf,image"));
+            }
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn parse_media_types_rejects_unknown_type() {
+        let error = parse_media_types("jpeg").unwrap_err();
+
+        assert_eq!(
+            error,
+            "--media: unknown value \"jpeg\"; valid: image, pdf, audio, video"
+        );
     }
 
     #[tokio::test]

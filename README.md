@@ -104,13 +104,14 @@ See `.env.example` for the full list. Provider/model/dim: `DOCINDEX_EMBED` (`gem
 
 ```sh
 docindex-search "some query"              # default subcommand = search
-docindex-search "diagram architecture" --media # server-side image/PDF-only search
+docindex-search "diagram architecture" --media # server-side all-media search
+docindex-search "invoice total due" --media pdf # server-side PDF-only search
 docindex-search search "q" -n 5 --json
 docindex-search similar path/to/note.md
 docindex-search health
 ```
 
-Flags: `-n/--limit`, `--media` (server-side image/PDF-only ranking; search queries only), `--json` (emit the server response verbatim), `--server <url>`, `--token <tok>`, `--config <path>`, `--path-filter <prefix>` (client-side filter on returned `path`).
+Flags: `-n/--limit`, `--media [image,pdf,audio,video]` (server-side media ranking; omit its value for all media; search queries only), `--json` (emit the server response verbatim), `--server <url>`, `--token <tok>`, `--config <path>`, `--path-filter <prefix>` (client-side filter on returned `path`).
 
 Human output, one hit per line, snippet truncated to terminal width (or 200 chars):
 ```
@@ -124,10 +125,12 @@ Human output, one hit per line, snippet truncated to terminal width (or 200 char
 ```
 GET  /health                          -> without/invalid bearer: { ok, authenticated: false }
                                       -> valid bearer: { ok, authenticated: true, indexed_chunks, last_reindex_ms, embedding_model, dim }
-POST /search   { query, limit=10, media_only=false } -> { hits: [{ path, title, heading_path, snippet, score, score_rrf, score_normalized, chunk_id, media_type, mime_type, media_start, media_end, media_unit, truncated }] }
+POST /search   { query, limit=10, media_only=false, media_types=[] } -> { hits: [{ path, title, heading_path, snippet, score, score_rrf, score_normalized, chunk_id, media_type, mime_type, media_start, media_end, media_unit, truncated }] }
 POST /similar  { path,  limit=10 }                    -> same shape
 ```
 `/health` always returns `200 OK`: without a valid bearer it is a liveness probe only and must not be used to verify credentials; with `Authorization: Bearer $DOCINDEX_BEARER`, it returns operational detail and `authenticated: true`. `/search` and `/similar` require the bearer and return `401` for missing or invalid credentials. `limit` is clamped to [1, 50]. Errors return `{error, code}` JSON.
+
+`media_types` is optional and valid only with `media_only=true`. It accepts `image`, `pdf`, `audio`, and `video`; an empty list preserves all-media search.
 
 Every `hit.path` (and the `path` accepted by `/similar`) is **vault-relative** — e.g. `"notes/foo.md"`, never `/home/…/vault/notes/foo.md`. This matches Obsidian's `TFile.path` so the plugin can feed paths straight into `openLinkText()` / `getAbstractFileByPath()` without rewriting. Databases created before v0.2.0 are migrated in place on first open: any `chunks.path` / `files.path` that are absolute but still inside the vault dir get rewritten atomically, and rows pointing outside the vault cause the migration to refuse (logged, not fatal) so operators can reconcile. Once complete, `meta.path_schema_version = 1` short-circuits the scan on every subsequent boot.
 

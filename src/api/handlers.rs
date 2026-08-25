@@ -3,7 +3,10 @@
 use axum::{Json, extract::State, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 
-use crate::search::{self, Hit, SearchOptions};
+use crate::{
+    media::MediaType,
+    search::{self, Hit, SearchOptions},
+};
 
 use super::{AppState, auth, error::ApiError};
 
@@ -68,6 +71,8 @@ pub struct SearchRequest {
     pub limit: usize,
     #[serde(default)]
     pub media_only: bool,
+    #[serde(default)]
+    pub media_types: Vec<String>,
 }
 
 fn default_limit() -> usize {
@@ -90,6 +95,7 @@ pub async fn search(
     if query.is_empty() {
         return Err(ApiError::BadRequest("query must not be empty".into()));
     }
+    let media_types = media_types_for_request(req.media_only, &req.media_types)?;
     let hits = search::search_with_options(
         state.store.clone(),
         &state.embedder,
@@ -99,15 +105,43 @@ pub async fn search(
         state.display_scoring,
         SearchOptions {
             media_only: req.media_only,
+            media_types,
         },
     )
     .await?;
     Ok(Json(SearchResponse { hits }))
 }
 
+fn media_types_for_request(
+    media_only: bool,
+    values: &[String],
+) -> Result<Vec<MediaType>, ApiError> {
+    if !media_only && !values.is_empty() {
+        return Err(ApiError::BadRequest(
+            "media_types requires media_only".into(),
+        ));
+    }
+
+    let mut media_types = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(media_type) = MediaType::from_exclude_value(value) else {
+            return Err(ApiError::BadRequest(format!(
+                "media_types: unknown value {value:?}; valid: {}",
+                MediaType::EXCLUDE_VALUES.join(", ")
+            )));
+        };
+        if !media_types.contains(&media_type) {
+            media_types.push(media_type);
+        }
+    }
+    Ok(media_types)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SearchRequest;
+    use crate::media::MediaType;
+
+    use super::{SearchRequest, media_types_for_request};
 
     #[test]
     fn search_request_defaults_media_only_to_false() {
@@ -116,6 +150,7 @@ mod tests {
         assert_eq!(request.query, "cats");
         assert_eq!(request.limit, 10);
         assert!(!request.media_only);
+        assert!(request.media_types.is_empty());
     }
 
     #[test]
@@ -125,6 +160,41 @@ mod tests {
 
         assert_eq!(request.limit, 4);
         assert!(request.media_only);
+    }
+
+    #[test]
+    fn search_request_defaults_media_types_to_empty() {
+        let request: SearchRequest = serde_json::from_str(r#"{"query":"cats"}"#).unwrap();
+
+        assert!(request.media_types.is_empty());
+    }
+
+    #[test]
+    fn media_types_rejects_hybrid_search() {
+        let error = media_types_for_request(false, &["pdf".into()]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "bad request: media_types requires media_only"
+        );
+    }
+
+    #[test]
+    fn media_types_validates_and_deduplicates() {
+        let types =
+            media_types_for_request(true, &["pdf".into(), "image".into(), "pdf".into()]).unwrap();
+
+        assert_eq!(types, [MediaType::Pdf, MediaType::Image]);
+    }
+
+    #[test]
+    fn media_types_names_invalid_value() {
+        let error = media_types_for_request(true, &["jpeg".into()]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "bad request: media_types: unknown value \"jpeg\"; valid: image, pdf, audio, video"
+        );
     }
 }
 

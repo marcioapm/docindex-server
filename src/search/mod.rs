@@ -17,6 +17,7 @@ use thiserror::Error;
 
 use crate::{
     embed::{AnyEmbedder, EmbedError},
+    media::MediaType,
     store::{HitRow, Store, StoreError},
 };
 
@@ -117,9 +118,10 @@ pub fn clamp_limit(n: usize) -> usize {
 /// The default preserves hybrid text-and-media search. Set `media_only` to
 /// search only non-text chunks with the vector ranker; media is intentionally
 /// absent from FTS.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchOptions {
     pub media_only: bool,
+    pub media_types: Vec<MediaType>,
 }
 
 /// Run a query against the index using the default hybrid corpus.
@@ -165,7 +167,8 @@ pub async fn search_with_options(
     }
 
     if options.media_only {
-        let media_hits = run_media_candidate_query(store.clone(), q_vec).await?;
+        let media_hits =
+            run_media_candidate_query(store.clone(), q_vec, options.media_types).await?;
         let fused = fuse_rrf_ranked(&rank_ids(&media_hits), &[], RRF_K);
         return hydrate(store, &fused, clamp_limit(limit), None, display).await;
     }
@@ -363,12 +366,13 @@ fn rank_ids<T>(hits: &[(i64, T)]) -> Vec<i64> {
 async fn run_media_candidate_query(
     store: Arc<Mutex<Store>>,
     q_vec: Vec<f32>,
+    media_types: Vec<MediaType>,
 ) -> Result<Vec<(i64, f32)>, SearchError> {
     tokio::task::spawn_blocking(move || -> Result<_, SearchError> {
         let guard = store
             .lock()
             .map_err(|e| SearchError::Msg(format!("store lock: {e}")))?;
-        Ok(guard.search_media_vec(&q_vec, CANDIDATE_K)?)
+        Ok(guard.search_media_vec(&q_vec, CANDIDATE_K, &media_types)?)
     })
     .await?
 }
