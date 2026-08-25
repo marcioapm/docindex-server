@@ -84,14 +84,17 @@ pub async fn search(
     body: Result<Json<SearchRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<SearchResponse>, ApiError> {
     let Json(req) = body?;
-    if req.query.trim().is_empty() {
+    // Surrounding whitespace changes the embedding and therefore hit order, so
+    // trim once here and use the trimmed value for both the guard and the query.
+    let query = req.query.trim();
+    if query.is_empty() {
         return Err(ApiError::BadRequest("query must not be empty".into()));
     }
     let hits = search::search_with_options(
         state.store.clone(),
         &state.embedder,
         state.embed_dim,
-        &req.query,
+        query,
         req.limit,
         state.display_scoring,
         SearchOptions {
@@ -137,13 +140,16 @@ pub async fn similar(
     body: Result<Json<SimilarRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<SearchResponse>, ApiError> {
     let Json(req) = body?;
-    if req.path.trim().is_empty() {
+    // Path lookup is exact-match, so surrounding whitespace would turn a valid
+    // vault path into a not-found.
+    let path = req.path.trim();
+    if path.is_empty() {
         return Err(ApiError::BadRequest("path must not be empty".into()));
     }
     let hits = search::similar(
         state.store.clone(),
         state.embed_dim,
-        &req.path,
+        path,
         req.limit,
         state.display_scoring,
     )
