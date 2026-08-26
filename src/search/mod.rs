@@ -10,7 +10,10 @@
 //! All SQL runs inside `spawn_blocking` — `rusqlite` is sync and we do not
 //! want to block the async runtime's worker threads.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -53,6 +56,7 @@ pub struct DisplayScoring {
     pub k: f64,
     pub w_vec: f64,
     pub w_bm25: f64,
+    pub media_lane: MediaLaneScoring,
 }
 
 impl Default for DisplayScoring {
@@ -61,6 +65,89 @@ impl Default for DisplayScoring {
             k: DEFAULT_DISPLAY_K,
             w_vec: DEFAULT_WEIGHT_VEC,
             w_bm25: DEFAULT_WEIGHT_BM25,
+            media_lane: MediaLaneScoring::default(),
+        }
+    }
+}
+
+/// Blended-search media admission and distance-derived display score settings.
+#[derive(Debug, Clone, Copy)]
+pub struct MediaLaneScoring {
+    pub enabled: bool,
+    pub fraction: f64,
+    pub gate_image: f64,
+    pub gate_pdf: f64,
+    pub display_image_best: f64,
+    pub display_image_worst: f64,
+    pub display_pdf_best: f64,
+    pub display_pdf_worst: f64,
+}
+
+impl Default for MediaLaneScoring {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fraction: 0.25,
+            gate_image: 0.40,
+            gate_pdf: 0.45,
+            display_image_best: 0.25,
+            display_image_worst: 0.50,
+            display_pdf_best: 0.35,
+            display_pdf_worst: 0.60,
+        }
+    }
+}
+
+impl MediaLaneScoring {
+    pub fn validate(self) -> Result<(), String> {
+        if !self.fraction.is_finite() || !(0.0..=1.0).contains(&self.fraction) {
+            return Err(format!(
+                "search.media_lane_fraction {}: must be finite and in [0, 1]",
+                self.fraction
+            ));
+        }
+        for (name, value) in [
+            ("search.media_gate_image", self.gate_image),
+            ("search.media_gate_pdf", self.gate_pdf),
+            ("search.media_display_image_best", self.display_image_best),
+            ("search.media_display_image_worst", self.display_image_worst),
+            ("search.media_display_pdf_best", self.display_pdf_best),
+            ("search.media_display_pdf_worst", self.display_pdf_worst),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!("{name} {value}: must be finite and > 0"));
+            }
+        }
+        if self.display_image_best >= self.display_image_worst {
+            return Err(
+                "search.media_display_image_best must be < search.media_display_image_worst".into(),
+            );
+        }
+        if self.display_pdf_best >= self.display_pdf_worst {
+            return Err(
+                "search.media_display_pdf_best must be < search.media_display_pdf_worst".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn gate_for(self, media_type: &str) -> Option<f64> {
+        match media_type {
+            "image" => Some(self.gate_image),
+            "pdf" => Some(self.gate_pdf),
+            // Audio and video are uncalibrated until corpus measurements exist.
+            "audio" | "video" => Some(self.gate_image),
+            _ => None,
+        }
+    }
+
+    fn display_endpoints_for(self, media_type: &str) -> Option<(f64, f64)> {
+        match media_type {
+            "image" => Some((self.display_image_best, self.display_image_worst)),
+            "pdf" => Some((self.display_pdf_best, self.display_pdf_worst)),
+            // Audio and video are uncalibrated until corpus measurements exist.
+            "audio" | "video" => Some((self.display_image_best, self.display_image_worst)),
+            _ => None,
         }
     }
 }
@@ -177,14 +264,57 @@ pub async fn search_with_options(
             run_media_candidate_query(store.clone(), q_vec, candidate_k, options.media_types)
                 .await?;
         let fused = fuse_rrf_ranked(&rank_ids(&media_hits), &[], RRF_K);
-        return hydrate(store, &fused, clamped_limit, None, display).await;
+        let media_distances = display
+            .media_lane
+            .enabled
+            .then(|| media_distance_map(&media_hits));
+        return hydrate(store, &fused, clamped_limit, None, display, media_distances).await;
     }
 
     let fts_query = fts_query_from_user(query);
-    let (vec_hits, fts_hits) =
-        run_candidate_queries(store.clone(), q_vec, fts_query, candidate_k).await?;
+    let (vec_hits, fts_hits, media_hits) = if display.media_lane.enabled {
+        let (text, media) = tokio::join!(
+            run_candidate_queries(store.clone(), q_vec.clone(), fts_query, candidate_k),
+            run_media_candidate_query(store.clone(), q_vec, candidate_k, Vec::new())
+        );
+        let (vec_hits, fts_hits) = text?;
+        (vec_hits, fts_hits, Some(media?))
+    } else {
+        let (vec_hits, fts_hits) =
+            run_candidate_queries(store.clone(), q_vec, fts_query, candidate_k).await?;
+        (vec_hits, fts_hits, None)
+    };
     let fused = fuse_rrf_ranked(&rank_ids(&vec_hits), &rank_ids(&fts_hits), RRF_K);
-    hydrate(store, &fused, clamped_limit, None, display).await
+    let media_distances = media_hits.as_ref().map(|hits| media_distance_map(hits));
+    let mut hydrated = hydrate(
+        store.clone(),
+        &fused,
+        clamped_limit,
+        None,
+        display,
+        media_distances.clone(),
+    )
+    .await?;
+    if let Some((media_hits, media_distances)) = media_hits.zip(media_distances) {
+        let media_fused = fuse_rrf_ranked(&rank_ids(&media_hits), &[], RRF_K);
+        let media_hydrated = hydrate(
+            store,
+            &media_fused,
+            candidate_k,
+            None,
+            display,
+            Some(media_distances.clone()),
+        )
+        .await?;
+        insert_media_lane(
+            &mut hydrated,
+            media_hydrated,
+            clamped_limit,
+            display.media_lane,
+            &media_distances,
+        );
+    }
+    Ok(hydrated)
 }
 
 /// Find chunks similar to the stored content at `path`.
@@ -271,6 +401,7 @@ pub async fn similar(
         clamped_limit,
         Some(path.to_string()),
         display,
+        None,
     )
     .await
 }
@@ -374,6 +505,66 @@ fn rank_ids<T>(hits: &[(i64, T)]) -> Vec<i64> {
     hits.iter().map(|(id, _)| *id).collect()
 }
 
+fn media_distance_map(hits: &[(i64, f32)]) -> HashMap<i64, f32> {
+    hits.iter().copied().collect()
+}
+
+fn media_display_score(distance: f32, media_type: &str, lane: MediaLaneScoring) -> Option<f64> {
+    let (best, worst) = lane.display_endpoints_for(media_type)?;
+    Some(((worst - f64::from(distance)) / (worst - best)).clamp(0.0, 1.0))
+}
+
+fn insert_media_lane(
+    results: &mut Vec<Hit>,
+    candidates: Vec<Hit>,
+    limit: usize,
+    lane: MediaLaneScoring,
+    distances: &HashMap<i64, f32>,
+) {
+    let slots = (limit as f64 * lane.fraction).floor() as usize;
+    if slots == 0 {
+        return;
+    }
+    let present: std::collections::HashSet<i64> = results.iter().map(|hit| hit.chunk_id).collect();
+    let mut inserted: Vec<Hit> = candidates
+        .into_iter()
+        .filter(|hit| {
+            lane.gate_for(&hit.media_type)
+                .zip(distances.get(&hit.chunk_id).copied())
+                .is_some_and(|(gate, distance)| distance <= gate as f32)
+                && !present.contains(&hit.chunk_id)
+        })
+        .take(slots)
+        .collect();
+    // Spacing must follow the count that can actually be admitted: free
+    // capacity plus the text entries available to displace. Deriving it from
+    // the candidate count instead would bunch a partial admission at the front.
+    let displaceable = results
+        .iter()
+        .filter(|result| result.media_type == "text")
+        .count();
+    let admissible = (limit.saturating_sub(results.len()) + displaceable).min(inserted.len());
+    if admissible == 0 {
+        return;
+    }
+    inserted.truncate(admissible);
+    let stride = limit.div_ceil(inserted.len());
+    for (i, hit) in inserted.into_iter().enumerate() {
+        if results.len() >= limit {
+            // Only text entries are displaceable. A result with none left is
+            // already all media, so admitting more would evict media.
+            let Some(index) = results
+                .iter()
+                .rposition(|result| result.media_type == "text")
+            else {
+                return;
+            };
+            results.remove(index);
+        }
+        results.insert((stride * (i + 1) - 1).min(results.len()), hit);
+    }
+}
+
 async fn run_media_candidate_query(
     store: Arc<Mutex<Store>>,
     q_vec: Vec<f32>,
@@ -432,6 +623,7 @@ async fn hydrate(
     limit: usize,
     exclude_path: Option<String>,
     display: DisplayScoring,
+    media_distances: Option<HashMap<i64, f32>>,
 ) -> Result<Vec<Hit>, SearchError> {
     let fused = fused.to_vec();
     tokio::task::spawn_blocking(move || -> Result<Vec<Hit>, SearchError> {
@@ -454,7 +646,13 @@ async fn hydrate(
             let norm = if row.media_type == "text" {
                 normalize_score(f.v_rank, f.b_rank, display.k, display.w_vec, display.w_bm25)
             } else {
-                vector_only_media_score(f.v_rank, display.k)
+                media_distances
+                    .as_ref()
+                    .and_then(|distances| distances.get(&f.id))
+                    .and_then(|distance| {
+                        media_display_score(*distance, &row.media_type, display.media_lane)
+                    })
+                    .unwrap_or_else(|| vector_only_media_score(f.v_rank, display.k))
             };
             out.push(to_hit(&row, f.score_rrf, norm));
         }
@@ -1124,5 +1322,388 @@ mod tests {
             ABOVE_CANDIDATE_K,
             "limit=50 with {ABOVE_CANDIDATE_K} identically-ranked hybrid hits must not be capped at CANDIDATE_K"
         );
+    }
+
+    fn lane_hit(id: i64, media_type: &str) -> Hit {
+        Hit {
+            path: format!("{id}"),
+            title: String::new(),
+            heading_path: String::new(),
+            snippet: String::new(),
+            score: 0.0,
+            score_rrf: 0.0,
+            score_normalized: 0.0,
+            chunk_id: id,
+            media_type: media_type.into(),
+            mime_type: None,
+            media_start: None,
+            media_end: None,
+            media_unit: None,
+            truncated: false,
+        }
+    }
+
+    fn lane_ids(hits: &[Hit]) -> Vec<i64> {
+        hits.iter().map(|hit| hit.chunk_id).collect()
+    }
+
+    fn seed_image_chunk(store: &Store, path: &str, content_hash: String, vector: &[f32]) {
+        let chunk = crate::chunk::Chunk {
+            idx: 0,
+            heading: String::new(),
+            heading_path: String::new(),
+            content: String::new(),
+            content_hash,
+            tokens: 0,
+            media_type: MediaType::Image,
+            mime_type: Some("image/png".into()),
+            media_start: None,
+            media_end: None,
+            media_unit: None,
+            truncated: false,
+        };
+        let id = store.upsert_chunk(&chunk, path, 1).unwrap();
+        store.set_vector_for_chunk(id, vector).unwrap();
+    }
+
+    /// Seeds `text_count` text chunks nearer the query than a single image at
+    /// `image_theta` radians, so the image falls outside the vector candidate
+    /// window and has no FTS content to reach the lexical branch.
+    async fn media_lane_search_fixture(
+        text_count: usize,
+        image_theta: f32,
+    ) -> (
+        tempfile::TempDir,
+        Arc<Mutex<Store>>,
+        crate::embed::AnyEmbedder,
+    ) {
+        let (dir, store, embedder, q_vec, orth) = candidate_test_fixture("widget").await;
+        {
+            let guard = store.lock().unwrap();
+            for i in 0..text_count {
+                seed_text_chunk(
+                    &guard,
+                    &q_vec,
+                    &orth,
+                    &format!("note{i}.md"),
+                    "widget widget widget".to_string(),
+                    3,
+                    (i as f32 + 1.0) * 0.001,
+                );
+            }
+            let vector: Vec<f32> = q_vec
+                .iter()
+                .zip(&orth)
+                .map(|(q, o)| image_theta.cos() * q + image_theta.sin() * o)
+                .collect();
+            seed_image_chunk(&guard, "photo.png", "image-hash".into(), &vector);
+        }
+        (dir, store, embedder)
+    }
+
+    fn lane_enabled_display() -> DisplayScoring {
+        DisplayScoring {
+            media_lane: MediaLaneScoring {
+                enabled: true,
+                ..MediaLaneScoring::default()
+            },
+            ..DisplayScoring::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_lane_surfaces_media_the_blended_window_cannot_reach() {
+        // cos(0.863) ~ 0.65, so the image sits at distance ~0.35: inside the
+        // 0.40 image gate, and far enough that a rank-derived score would read
+        // 1.0 while the distance map yields 0.6.
+        let (_dir, store, embedder) = media_lane_search_fixture(40, 0.863).await;
+
+        let hits = search(
+            store,
+            &embedder,
+            CANDIDATE_TEST_DIM,
+            "widget",
+            20,
+            lane_enabled_display(),
+        )
+        .await
+        .unwrap();
+
+        let image = hits
+            .iter()
+            .find(|hit| hit.path == "photo.png")
+            .expect("the lane must surface an image outside the blended candidate window");
+        assert_eq!(hits.len(), 20);
+        assert!(
+            (image.score_normalized - 0.6).abs() < 0.02,
+            "expected the distance-derived score, got {}",
+            image.score_normalized
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_lane_leaves_that_media_unreachable() {
+        let (_dir, store, embedder) = media_lane_search_fixture(40, 0.863).await;
+
+        let hits = search(
+            store,
+            &embedder,
+            CANDIDATE_TEST_DIM,
+            "widget",
+            20,
+            DisplayScoring::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !hits.iter().any(|hit| hit.path == "photo.png"),
+            "the image is only reachable through the lane"
+        );
+        assert_eq!(hits.len(), 20);
+    }
+
+    #[tokio::test]
+    async fn lane_pool_follows_the_clamped_limit_not_the_candidate_floor() {
+        let (_dir, store, embedder, q_vec, orth) = candidate_test_fixture("widget").await;
+
+        // 40 text chunks nearest the query, then 40 images just behind them.
+        // Every image clears the 0.40 gate, so the number admitted is bounded
+        // by the media candidate pool rather than by the gate.
+        {
+            let guard = store.lock().unwrap();
+            for i in 0..40 {
+                seed_text_chunk(
+                    &guard,
+                    &q_vec,
+                    &orth,
+                    &format!("note{i}.md"),
+                    "widget widget widget".to_string(),
+                    3,
+                    (i as f32 + 1.0) * 0.001,
+                );
+            }
+            for i in 0..40 {
+                let theta = 0.80 + i as f32 * 0.001;
+                let vector: Vec<f32> = q_vec
+                    .iter()
+                    .zip(&orth)
+                    .map(|(q, o)| theta.cos() * q + theta.sin() * o)
+                    .collect();
+                seed_image_chunk(
+                    &guard,
+                    &format!("photo{i}.png"),
+                    format!("image-hash-{i}"),
+                    &vector,
+                );
+            }
+        }
+
+        let display = DisplayScoring {
+            media_lane: MediaLaneScoring {
+                enabled: true,
+                fraction: 1.0,
+                ..MediaLaneScoring::default()
+            },
+            ..DisplayScoring::default()
+        };
+        let hits = search(store, &embedder, CANDIDATE_TEST_DIM, "widget", 50, display)
+            .await
+            .unwrap();
+
+        let images = hits.iter().filter(|hit| hit.media_type == "image").count();
+        assert_eq!(
+            images, 40,
+            "a limit=50 search must draw media from a 50-candidate pool, not the 30 floor"
+        );
+    }
+
+    #[test]
+    fn media_gate_includes_threshold_and_rejects_past_it_per_type() {
+        // The gate is inclusive, and each media type carries its own threshold.
+        let lane = MediaLaneScoring::default();
+        for (media_type, threshold) in [("image", 0.40), ("pdf", 0.45)] {
+            let base: Vec<_> = (1..=4).map(|id| lane_hit(id, "text")).collect();
+            let mut admitted = base.clone();
+            let mut rejected = base;
+            insert_media_lane(
+                &mut admitted,
+                vec![lane_hit(99, media_type)],
+                4,
+                lane,
+                &HashMap::from([(99, threshold)]),
+            );
+            insert_media_lane(
+                &mut rejected,
+                vec![lane_hit(99, media_type)],
+                4,
+                lane,
+                &HashMap::from([(99, threshold + 0.000_001)]),
+            );
+            assert!(
+                admitted.iter().any(|hit| hit.chunk_id == 99),
+                "{media_type}"
+            );
+            assert!(
+                !rejected.iter().any(|hit| hit.chunk_id == 99),
+                "{media_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_lane_adds_candidate_outside_text_window() {
+        let lane = MediaLaneScoring::default();
+        let mut results = (1..=20).map(|id| lane_hit(id, "text")).collect();
+        let media = vec![lane_hit(99, "image")];
+        let distances = HashMap::from([(99, 0.40)]);
+        insert_media_lane(&mut results, media, 20, lane, &distances);
+        assert!(results.iter().any(|hit| hit.chunk_id == 99));
+        assert_eq!(results.len(), 20);
+    }
+
+    #[test]
+    fn media_lane_does_not_duplicate_already_ranked_media() {
+        let lane = MediaLaneScoring::default();
+        let mut results = vec![lane_hit(1, "text"), lane_hit(4, "image")];
+        results.extend(
+            (2..=20)
+                .filter(|id| *id != 4)
+                .map(|id| lane_hit(id, "text")),
+        );
+        let distances = HashMap::from([(4, 0.20)]);
+        insert_media_lane(
+            &mut results,
+            vec![lane_hit(4, "image")],
+            20,
+            lane,
+            &distances,
+        );
+        assert_eq!(results.iter().filter(|hit| hit.chunk_id == 4).count(), 1);
+        assert_eq!(results[1].chunk_id, 4);
+    }
+
+    #[test]
+    fn media_lane_borrows_slots_when_no_candidate_passes_gate() {
+        let lane = MediaLaneScoring::default();
+        let mut results: Vec<_> = (1..=20).map(|id| lane_hit(id, "text")).collect();
+        let baseline = results.clone();
+        let distances = HashMap::from([(99, 0.400_001)]);
+        insert_media_lane(
+            &mut results,
+            vec![lane_hit(99, "image")],
+            20,
+            lane,
+            &distances,
+        );
+        assert_eq!(results, baseline);
+    }
+
+    #[test]
+    fn media_lane_borrows_unfilled_reserved_slots() {
+        let lane = MediaLaneScoring::default();
+        let mut results: Vec<_> = (1..=8).map(|id| lane_hit(id, "text")).collect();
+        let distances = HashMap::from([(99, 0.20)]);
+        insert_media_lane(
+            &mut results,
+            vec![lane_hit(99, "image")],
+            8,
+            lane,
+            &distances,
+        );
+        assert_eq!(
+            lane_ids(&results),
+            [1, 2, 3, 4, 5, 6, 7, 99],
+            "one admission into two reserved slots must evict only the last text entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_absent_from_the_distance_map_keeps_the_rank_derived_score() {
+        let (_dir, store, embedder, q_vec, _orth) = candidate_test_fixture("widget").await;
+        {
+            let guard = store.lock().unwrap();
+            seed_image_chunk(&guard, "solo.png", "solo-image".into(), &q_vec);
+        }
+
+        // media_only hydration passes no distance map while the lane is off, so
+        // the rank-derived score stands: rank 1 scores (k+1)/(k+1) = 1.0.
+        let hits = search_with_options(
+            store,
+            &embedder,
+            CANDIDATE_TEST_DIM,
+            "widget",
+            10,
+            DisplayScoring::default(),
+            SearchOptions {
+                media_only: true,
+                media_types: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert!(
+            (hits[0].score_normalized - 1.0).abs() < 1e-9,
+            "expected the rank-derived fallback, got {}",
+            hits[0].score_normalized
+        );
+    }
+
+    #[test]
+    fn media_heavy_result_spaces_the_admissions_it_can_actually_make() {
+        // Seven media hits and one text hit: only one candidate can be admitted
+        // regardless of the four-slot reservation, so it belongs at the end
+        // rather than at the position four admissions would have used.
+        let lane = MediaLaneScoring {
+            fraction: 0.5,
+            ..MediaLaneScoring::default()
+        };
+        let mut results: Vec<_> = (1..=7).map(|id| lane_hit(id, "image")).collect();
+        results.push(lane_hit(8, "text"));
+        let candidates: Vec<_> = (91..=94).map(|id| lane_hit(id, "image")).collect();
+        let distances: HashMap<i64, f32> = (91..=94).map(|id| (id, 0.20)).collect();
+
+        insert_media_lane(&mut results, candidates, 8, lane, &distances);
+
+        assert_eq!(
+            lane_ids(&results),
+            [1, 2, 3, 4, 5, 6, 7, 91],
+            "the single admissible candidate must take the freed tail slot"
+        );
+    }
+
+    #[test]
+    fn media_lane_uses_evenly_spaced_insert_positions() {
+        // Two admissions into eight slots land at indices 3 and 7.
+        let lane = MediaLaneScoring {
+            fraction: 0.5,
+            ..MediaLaneScoring::default()
+        };
+        let mut results: Vec<_> = (1..=8).map(|id| lane_hit(id, "text")).collect();
+        let distances = HashMap::from([(91, 0.20), (92, 0.20)]);
+        insert_media_lane(
+            &mut results,
+            vec![lane_hit(91, "image"), lane_hit(92, "image")],
+            8,
+            lane,
+            &distances,
+        );
+        assert_eq!(lane_ids(&results), [1, 2, 3, 91, 4, 5, 6, 92]);
+    }
+
+    #[test]
+    fn media_display_score_clamps_decreases_and_uses_pdf_map() {
+        let lane = MediaLaneScoring::default();
+        assert_eq!(media_display_score(0.20, "image", lane), Some(1.0));
+        assert_eq!(media_display_score(0.60, "image", lane), Some(0.0));
+        let near = media_display_score(0.30, "image", lane).unwrap();
+        let far = media_display_score(0.40, "image", lane).unwrap();
+        assert!(near > far);
+        let pdf = media_display_score(0.4211, "pdf", lane).unwrap();
+        let image = media_display_score(0.4211, "image", lane).unwrap();
+        assert!(pdf > 0.4, "{pdf}");
+        assert!(image < 0.4, "{image}");
     }
 }

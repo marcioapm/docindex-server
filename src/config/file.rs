@@ -75,6 +75,8 @@ pub struct ServerFile {
     pub embed: EmbedFile,
     #[serde(default)]
     pub media: MediaFile,
+    #[serde(default)]
+    pub search: SearchFile,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +110,19 @@ impl Default for MediaFile {
             pdf_dpi: default_pdf_dpi(),
         }
     }
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchFile {
+    pub media_lane_enabled: Option<bool>,
+    pub media_lane_fraction: Option<f64>,
+    pub media_gate_image: Option<f64>,
+    pub media_gate_pdf: Option<f64>,
+    pub media_display_image_best: Option<f64>,
+    pub media_display_image_worst: Option<f64>,
+    pub media_display_pdf_best: Option<f64>,
+    pub media_display_pdf_worst: Option<f64>,
 }
 
 const fn default_max_file_mb() -> u64 {

@@ -73,6 +73,17 @@ exclude_types = ["audio", "video"] # image | pdf | audio | video
 max_file_mb = 20
 pdf_pages_per_chunk = 1              # Google recommends one PDF page for quality
 pdf_dpi = 150
+
+[search]
+# Disabled preserves the existing hybrid ranking exactly.
+media_lane_enabled = false
+media_lane_fraction = 0.25
+media_gate_image = 0.40
+media_gate_pdf = 0.45
+media_display_image_best = 0.25
+media_display_image_worst = 0.50
+media_display_pdf_best = 0.35
+media_display_pdf_worst = 0.60
 ```
 
 ### Media indexing
@@ -136,6 +147,8 @@ Every `hit.path` (and the `path` accepted by `/similar`) is **vault-relative** â
 
 ## Ranking
 Hybrid: top-30 cosine (sqlite-vec `chunks_vec` cosine) + top-30 BM25 (FTS5), fused with Reciprocal Rank Fusion (`k=60`). Every hit also carries `score_normalized` (0..1, query-independent) for display + threshold filtering â€” see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and the `DOCINDEX_DISPLAY_K` / `DOCINDEX_WEIGHT_VEC` / `DOCINDEX_WEIGHT_BM25` env vars.
+
+When `[search].media_lane_enabled = true`, blended search also fetches an independent all-media vector candidate pool of `max(30, limit)` candidates. Image/PDF candidates must meet their type-specific raw cosine-distance gate, then up to `floor(limit * media_lane_fraction)` previously absent media hits are inserted at evenly spaced positions. Media already in the blended result is never duplicated and never evicted to make room; insertion shifts later entries down as any insertion does. Unused reservation stays with text. Enabled media display scores are distance-derived from the type-specific best/worst endpoints. The PDF gate and endpoints are provisional, calibrated on five files; `audio` and `video` reuse the image settings until calibration data exists. The reserved-slot fraction bounds the cost of that imprecision. All lane values are validated at startup: the fraction is in `[0, 1]`, gates and endpoints are finite and positive, and each best endpoint is below its worst endpoint.
 
 ## Chunking
 Heading-aware (H1/H2/H3), ~500-token fallback, 50-token overlap. Stored per chunk: `(path, chunk_idx, heading_path, content, content_hash, mtime_ns)`.

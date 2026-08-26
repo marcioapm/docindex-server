@@ -58,6 +58,8 @@ pub struct Config {
     /// Weight of the BM25 branch in `score_normalized`. `weight_vec + weight_bm25`
     /// is validated to sum to 1.0 (± 0.01).
     pub weight_bm25: f64,
+    /// Media candidate admission and display scoring for blended search.
+    pub media_lane: crate::search::MediaLaneScoring,
     /// `--reembed`: wipe chunks/vectors/FTS and rebuild when the index
     /// fingerprint (provider/model/dim) no longer matches this config.
     pub reembed: bool,
@@ -86,6 +88,7 @@ impl std::fmt::Debug for Config {
             .field("display_k", &self.display_k)
             .field("weight_vec", &self.weight_vec)
             .field("weight_bm25", &self.weight_bm25)
+            .field("media_lane", &self.media_lane)
             .field("reembed", &self.reembed)
             .field("config_path", &self.config_path)
             .finish()
@@ -265,6 +268,19 @@ impl Config {
                 MediaPolicy::default()
             }
         };
+        let media_lane = crate::search::MediaLaneScoring {
+            enabled: file.search.media_lane_enabled.unwrap_or(false),
+            fraction: file.search.media_lane_fraction.unwrap_or(0.25),
+            gate_image: file.search.media_gate_image.unwrap_or(0.40),
+            gate_pdf: file.search.media_gate_pdf.unwrap_or(0.45),
+            display_image_best: file.search.media_display_image_best.unwrap_or(0.25),
+            display_image_worst: file.search.media_display_image_worst.unwrap_or(0.50),
+            display_pdf_best: file.search.media_display_pdf_best.unwrap_or(0.35),
+            display_pdf_worst: file.search.media_display_pdf_worst.unwrap_or(0.60),
+        };
+        if let Err(error) = media_lane.validate() {
+            errs.push(error);
+        }
 
         if media_policy.is_enabled() {
             match registry::lookup(embed_provider, &embed_model) {
@@ -298,6 +314,7 @@ impl Config {
             display_k,
             weight_vec,
             weight_bm25,
+            media_lane,
             reembed: flags.reembed,
             config_path,
         })
@@ -907,6 +924,74 @@ mod tests {
         env.insert("DOCINDEX_DISPLAY_K".into(), "20".into());
         let c = Config::from_lookup(&lookup(&env)).expect("valid");
         assert_eq!(c.display_k, 20.0);
+    }
+
+    #[test]
+    fn media_lane_reads_every_field_from_its_own_toml_key() {
+        let dir = TempDir::new().unwrap();
+        let d = dir.path().display();
+        // Deliberately distinct values: a transposed assignment between any two
+        // fields changes which number lands where.
+        let files = HashMap::from([(
+            PathBuf::from("/search.toml"),
+            file::FileContent {
+                text: format!(
+                    "vault_dir = \"{d}\"\ndb_path = \"{d}/index.db\"\nlisten = \"100.64.0.1:7777\"\nbearer = \"secret\"\n[embed]\nprovider = \"fake\"\n[search]\nmedia_lane_enabled = true\nmedia_lane_fraction = 0.11\nmedia_gate_image = 0.22\nmedia_gate_pdf = 0.33\nmedia_display_image_best = 0.44\nmedia_display_image_worst = 0.55\nmedia_display_pdf_best = 0.66\nmedia_display_pdf_worst = 0.77\n"
+                ),
+                mode: None,
+            },
+        )]);
+        let reader = file_reader_for(files);
+        let flags = ConfigFlags {
+            config_path: Some(PathBuf::from("/search.toml")),
+            reembed: false,
+        };
+
+        let lane = Config::load(&empty_lookup(), &reader, &flags)
+            .expect("valid")
+            .media_lane;
+
+        assert!(lane.enabled);
+        assert_eq!(lane.fraction, 0.11);
+        assert_eq!(lane.gate_image, 0.22);
+        assert_eq!(lane.gate_pdf, 0.33);
+        assert_eq!(lane.display_image_best, 0.44);
+        assert_eq!(lane.display_image_worst, 0.55);
+        assert_eq!(lane.display_pdf_best, 0.66);
+        assert_eq!(lane.display_pdf_worst, 0.77);
+    }
+
+    #[test]
+    fn media_lane_rejects_invalid_fraction_endpoints_and_non_finite_values() {
+        let dir = TempDir::new().unwrap();
+        let d = dir.path().display();
+        for (key, value) in [
+            ("media_lane_fraction", "1.1"),
+            (
+                "media_display_image_best",
+                "0.50\nmedia_display_image_worst = 0.50",
+            ),
+            ("media_gate_pdf", "nan"),
+        ] {
+            let files = HashMap::from([(
+                PathBuf::from("/search.toml"),
+                file::FileContent {
+                    text: format!(
+                        "vault_dir = \"{d}\"\ndb_path = \"{d}/index.db\"\nlisten = \"100.64.0.1:7777\"\nbearer = \"secret\"\n[embed]\nprovider = \"fake\"\n[search]\n{key} = {value}\n"
+                    ),
+                    mode: None,
+                },
+            )]);
+            let reader = file_reader_for(files);
+            let flags = ConfigFlags {
+                config_path: Some(PathBuf::from("/search.toml")),
+                reembed: false,
+            };
+            assert!(
+                Config::load(&empty_lookup(), &reader, &flags).is_err(),
+                "{key}"
+            );
+        }
     }
 
     #[test]

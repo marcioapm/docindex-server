@@ -51,6 +51,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             k: cfg.display_k,
             w_vec: cfg.weight_vec,
             w_bm25: cfg.weight_bm25,
+            media_lane: cfg.media_lane,
         },
     };
 
